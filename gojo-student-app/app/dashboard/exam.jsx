@@ -1,3 +1,4 @@
+// app/dashboard/exam.jsx
 import React, { useEffect, useState, useCallback, useRef } from "react";
 import {
   View,
@@ -10,6 +11,7 @@ import {
   Dimensions,
   Platform,
   SafeAreaView,
+  ScrollView,
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { ref, get } from "firebase/database";
@@ -19,34 +21,47 @@ import { useRouter } from "expo-router";
 import { queryUserByUsernameInSchool, queryUserByChildInSchool } from "../lib/userHelpers";
 
 /**
- * Modern, clean Top-5 leaderboard with pagination dots
- * - Wide cards (same width) so layout doesn't elongate or overflow.
- * - Dots indicator below the list to show there are more entries and current position.
- * - Top-1 visually emphasized but all cards keep same width (consistent snapping).
+ * Exams screen (dashboard)
+ * - Top: compact Top-5 leaderboard (horizontal carousel + dots)
+ * - Middle: Company rounds presented as a horizontal carousel of round cards
+ *   - Each round card shows metadata and a horizontal list of exam chips inside it
+ * - Below: (kept simple) placeholder for school-level tasks if needed
+ *
+ * Design goals: simple, modern, professional, responsive.
+ * The UI uses data from Platform1/companyExams/rounds and Platform1/rankings.
  */
 
 const SCREEN_W = Dimensions.get("window").width;
-const CARD_WIDTH = Math.round(Math.min(760, SCREEN_W * 0.92)); // wide but within screen
-const CARD_HEIGHT = 180;
+const LEADER_CARD_W = Math.round(Math.min(720, SCREEN_W * 0.86));
+const LEADER_CARD_H = 160;
+const ROUND_CARD_W = Math.round(Math.min(640, SCREEN_W * 0.78));
+const ROUND_CARD_H = 190;
 const PRIMARY = "#0B72FF";
 const MUTED = "#6B78A8";
 const GOLD = "#F2C94C";
-const CARD_SPACING = 14;
+const SPACING = 14;
 
-async function resolveSchoolKeyForPrefix(prefix) {
-  try {
-    const snap = await get(ref(database, `Platform1/schoolCodeIndex/${prefix}`));
-    if (snap.exists()) return snap.val();
-  } catch (e) {
-    // ignore
+async function tryGet(pathVariants) {
+  for (const p of pathVariants) {
+    try {
+      const snap = await get(ref(database, p));
+      if (snap && snap.exists()) return snap;
+    } catch (e) {
+      // ignore and try next
+    }
   }
   return null;
 }
 
-async function fetchProfileAndSchoolForUser(userId) {
+async function resolveSchoolKeyForPrefix(prefix) {
+  const snap = await tryGet([`Platform1/schoolCodeIndex/${prefix}`, `schoolCodeIndex/${prefix}`]);
+  return snap && snap.exists() ? snap.val() : null;
+}
+
+async function queryUserProfile(userId) {
   if (!userId) return {};
   try {
-    const prefix = userId.substr(0, 3).toUpperCase();
+    const prefix = (userId.substr(0, 3) || "").toUpperCase();
     const schoolKey = await resolveSchoolKeyForPrefix(prefix);
 
     let profile = null;
@@ -62,9 +77,7 @@ async function fetchProfileAndSchoolForUser(userId) {
             return true;
           });
         }
-      } catch (e) {
-        // fallback below
-      }
+      } catch {}
     }
 
     if (!profile) {
@@ -77,59 +90,78 @@ async function fetchProfileAndSchoolForUser(userId) {
             return true;
           });
         }
-      } catch (e) {
-        // ignore
-      }
+      } catch {}
     }
 
     let schoolInfo = null;
     if (schoolKey) {
       try {
-        const sSnap = await get(ref(database, `Platform1/Schools/${schoolKey}/schoolInfo`));
-        if (sSnap.exists()) schoolInfo = sSnap.val();
-      } catch (e) {}
+        const sSnap = await tryGet([`Platform1/Schools/${schoolKey}/schoolInfo`, `Schools/${schoolKey}/schoolInfo`]);
+        if (sSnap && sSnap.exists()) schoolInfo = sSnap.val();
+      } catch {}
     }
 
-    return { profile, schoolInfo, schoolKey, userNodeKey };
-  } catch (err) {
+    return { profile, schoolInfo, userNodeKey, schoolKey };
+  } catch {
     return {};
   }
 }
 
-export default function ExamLeaderboard() {
-  const router = useRouter();
-  const [loading, setLoading] = useState(true);
-  const [items, setItems] = useState([]); // enriched top5
-  const listRef = useRef(null);
-  const [activeIndex, setActiveIndex] = useState(0);
+function fmtDate(ts) {
+  if (!ts) return "";
+  try {
+    const d = new Date(Number(ts));
+    return d.toLocaleString();
+  } catch {
+    return "";
+  }
+}
 
-  // content padding left/right so first card can be centered visually
-  const contentPadding = Math.round((SCREEN_W - CARD_WIDTH) / 2);
+export default function ExamScreen() {
+  const router = useRouter();
+
+  // Leaderboard state
+  const [loadingLeaders, setLoadingLeaders] = useState(true);
+  const [leaders, setLeaders] = useState([]);
+  const [leaderIndex, setLeaderIndex] = useState(0);
+  const leaderRef = useRef(null);
+  const leaderPadding = Math.round((SCREEN_W - LEADER_CARD_W) / 2);
+
+  // Rounds state
+  const [loadingRounds, setLoadingRounds] = useState(true);
+  const [rounds, setRounds] = useState([]);
+  const [roundIndex, setRoundIndex] = useState(0);
+  const roundsRef = useRef(null);
+  const roundPadding = Math.round((SCREEN_W - ROUND_CARD_W) / 2);
 
   useEffect(() => {
-    loadTop5();
+    (async () => {
+      setLoadingLeaders(true);
+      setLoadingRounds(true);
+      await Promise.all([loadLeaders(), loadRounds()]);
+      setLoadingLeaders(false);
+      setLoadingRounds(false);
+    })();
   }, []);
 
-  const loadTop5 = useCallback(async () => {
-    setLoading(true);
+  // Load top-5 leaders (enriched)
+  const loadLeaders = useCallback(async () => {
     try {
-      const countrySnap = await get(ref(database, `Platform1/country`));
-      const country = (countrySnap && countrySnap.exists()) ? countrySnap.val() : "Ethiopia";
-
+      const countrySnap = await tryGet([`Platform1/country`, `country`]);
+      const country = countrySnap && countrySnap.exists() ? countrySnap.val() : "Ethiopia";
       const grade = (await AsyncStorage.getItem("studentGrade")) || "9";
       const gradeKey = `grade${grade}`;
-      const snap = await get(ref(database, `Platform1/rankings/country/${country}/${gradeKey}/leaderboard`));
+
+      const snap = await tryGet([
+        `Platform1/rankings/country/${country}/${gradeKey}/leaderboard`,
+        `rankings/country/${country}/${gradeKey}/leaderboard`,
+      ]);
 
       const raw = [];
       if (snap && snap.exists()) {
         snap.forEach((c) => {
           const v = c.val() || {};
-          raw.push({
-            userId: c.key,
-            rank: v.rank || 999,
-            totalPoints: v.totalPoints || 0,
-            badge: v.badge || null,
-          });
+          raw.push({ userId: c.key, rank: v.rank || 999, totalPoints: v.totalPoints || 0, badge: v.badge || null });
         });
       }
 
@@ -138,208 +170,318 @@ export default function ExamLeaderboard() {
 
       const enriched = await Promise.all(
         top5.map(async (entry) => {
-          const resolved = await fetchProfileAndSchoolForUser(entry.userId);
-          return {
-            ...entry,
-            profile: resolved.profile || null,
-            schoolInfo: resolved.schoolInfo || null,
-          };
+          const resolved = await queryUserProfile(entry.userId);
+          return { ...entry, profile: resolved.profile || null, schoolInfo: resolved.schoolInfo || null };
         })
       );
 
-      setItems(enriched);
-
-      // ensure list starts with the first item nicely positioned
-      setTimeout(() => {
-        if (listRef.current && enriched.length > 0) {
-          listRef.current.scrollToOffset({ offset: 0, animated: true });
-          setActiveIndex(0);
-        }
-      }, 200);
+      setLeaders(enriched);
+      setLeaderIndex(0);
+      setTimeout(() => leaderRef.current && enriched.length && leaderRef.current.scrollToOffset({ offset: 0, animated: true }), 150);
     } catch (err) {
-      console.warn("loadTop5 error", err);
-    } finally {
-      setLoading(false);
+      console.warn("loadLeaders", err);
+      setLeaders([]);
     }
   }, []);
 
-  const onMomentumScrollEnd = (e) => {
+  // Load company rounds
+  const loadRounds = useCallback(async () => {
+    try {
+      const snap = await tryGet([`Platform1/companyExams/rounds`, `companyExams/rounds`]);
+      const arr = [];
+      if (snap && snap.exists()) {
+        snap.forEach((c) => {
+          const v = c.val() || {};
+          arr.push({ id: c.key, ...v });
+        });
+      }
+      arr.sort((a, b) => (b.startTimestamp || 0) - (a.startTimestamp || 0));
+      setRounds(arr);
+      setRoundIndex(0);
+      setTimeout(() => roundsRef.current && arr.length && roundsRef.current.scrollToOffset({ offset: 0, animated: true }), 150);
+    } catch (err) {
+      console.warn("loadRounds", err);
+      setRounds([]);
+    }
+  }, []);
+
+  // Handlers for snapping indices
+  const onLeaderScrollEnd = (e) => {
     const offsetX = e.nativeEvent.contentOffset.x || 0;
-    const idx = Math.round(offsetX / (CARD_WIDTH + CARD_SPACING));
-    const bounded = Math.max(0, Math.min(items.length - 1, idx));
-    setActiveIndex(bounded);
+    const idx = Math.round(offsetX / (LEADER_CARD_W + SPACING));
+    setLeaderIndex(Math.max(0, Math.min(leaders.length - 1, idx)));
+  };
+  const onRoundScrollEnd = (e) => {
+    const offsetX = e.nativeEvent.contentOffset.x || 0;
+    const idx = Math.round(offsetX / (ROUND_CARD_W + SPACING));
+    setRoundIndex(Math.max(0, Math.min(rounds.length - 1, idx)));
   };
 
-  const renderCard = ({ item, index }) => {
-    const isTop = Number(item.rank) === 1 || index === 0; // emphasize first
+  function LeaderCard({ item, index }) {
+    const isTop = index === 0 || Number(item.rank) === 1;
     const displayName = item.profile?.name || item.profile?.username || item.userId;
     const avatar = item.profile?.profileImage || item.schoolInfo?.logoUrl || null;
     const school = item.schoolInfo?.name || item.profile?.schoolName || item.schoolInfo?.city || "";
 
     return (
-      <View style={{ width: CARD_WIDTH, height: CARD_HEIGHT, marginRight: CARD_SPACING }}>
+      <View style={{ width: LEADER_CARD_W, height: LEADER_CARD_H, marginRight: SPACING }}>
         <TouchableOpacity
           activeOpacity={0.92}
           onPress={() => router.push({ pathname: "/exam/profile", params: { userId: item.userId } })}
-          style={[styles.card, isTop ? styles.cardTop : styles.cardNormal]}
+          style={[styles.leaderCard, isTop ? styles.leaderCardTop : styles.leaderCardNormal]}
         >
-          <View style={styles.cardHeader}>
-            <View style={[styles.rankWrap, isTop && styles.rankWrapTop]}>
-              <Text style={[styles.rankText, isTop && styles.rankTextTop]}>{item.rank}</Text>
+          <View style={styles.leaderRow}>
+            <View style={styles.leaderLeft}>
+              <View style={[styles.rankCircle, isTop && styles.rankCircleTop]}>
+                <Text style={[styles.rankText, isTop && styles.rankTextTop]}>{item.rank}</Text>
+              </View>
+              <View style={{ marginLeft: 12, flex: 1 }}>
+                <Text numberOfLines={1} style={[styles.leaderName, isTop && styles.leaderNameTop]}>{displayName}</Text>
+                <Text numberOfLines={1} style={styles.leaderSub}>{school}{item.schoolInfo?.region ? ` • ${item.schoolInfo.region}` : ""}</Text>
+              </View>
             </View>
 
-            <View style={{ marginLeft: 12, flex: 1 }}>
-              <Text numberOfLines={2} style={[styles.name, isTop && styles.nameTop]}>{displayName}</Text>
-              <Text numberOfLines={1} style={styles.schoolText}>{school} {item.schoolInfo?.region ? `• ${item.schoolInfo.region}` : ""}</Text>
-            </View>
-          </View>
-
-          <View style={styles.cardFooter}>
-            <View style={{ flexDirection: "row", alignItems: "center" }}>
-              {avatar ? (
-                <Image source={{ uri: avatar }} style={[styles.avatar, isTop && styles.avatarTop]} />
-              ) : (
-                <View style={[styles.avatarPlaceholder, isTop && styles.avatarTop]}>
-                  <Text style={styles.avatarPlaceholderText}>{(displayName || "U").slice(0, 1)}</Text>
+            <View style={styles.leaderRight}>
+              {avatar ? <Image source={{ uri: avatar }} style={[styles.leaderAvatar, isTop && styles.leaderAvatarTop]} /> : (
+                <View style={[styles.avatarPlaceholderSmall, isTop && styles.leaderAvatarTop]}>
+                  <Text style={styles.avatarPlaceholderTextSmall}>{(displayName || "U").slice(0, 1)}</Text>
                 </View>
               )}
-
-              <View style={{ marginLeft: 12 }}>
-                <Text style={styles.pointsLabel}>Points</Text>
-                <Text style={[styles.pointsValue, isTop && styles.pointsValueTop]}>{item.totalPoints}</Text>
-              </View>
-            </View>
-
-            <View style={{ alignItems: "center", justifyContent: "center" }}>
-              <View style={styles.trophyWrap}>
-                <Ionicons name="trophy" size={26} color={GOLD} />
-              </View>
+              <View style={{ height: 8 }} />
+              <Text style={styles.pointsLabel}>Points</Text>
+              <Text style={[styles.pointsValue, isTop && styles.pointsValueTop]}>{item.totalPoints}</Text>
             </View>
           </View>
         </TouchableOpacity>
       </View>
     );
-  };
+  }
 
-  return (
-    <SafeAreaView style={styles.screen}>
-      <View style={styles.header}>
-        <View>
-          <Text style={styles.title}>LeaderBoard</Text>
-        </View>
+  function RoundCard({ item }) {
+    const exams = item.exams ? Object.keys(item.exams).map((k) => ({ id: k, ...item.exams[k] })) : [];
+    const status = item.status || "upcoming";
+    const typeLabel = (item.type || "round").toUpperCase();
 
-        <TouchableOpacity style={styles.cta} onPress={() => router.push("/exam/leaderboard")}>
-          <Ionicons name="trophy" size={18} color="#fff" />
-          <Text style={styles.ctaText}>See leaderboard</Text>
-        </TouchableOpacity>
-      </View>
+    return (
+      <View style={{ width: ROUND_CARD_W, height: ROUND_CARD_H, marginRight: SPACING }}>
+        <View style={styles.roundCard}>
+          <View style={styles.roundHeader}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.roundName} numberOfLines={2}>{item.name || item.id}</Text>
+              <Text style={styles.roundMeta}>{typeLabel} • {status}</Text>
+              <Text style={styles.roundTime}>{fmtDate(item.startTimestamp)} — {fmtDate(item.endTimestamp)}</Text>
+            </View>
 
-      {loading ? (
-        <View style={styles.loaderWrap}>
-          <ActivityIndicator size="large" color={PRIMARY} />
-        </View>
-      ) : items.length === 0 ? (
-        <View style={styles.emptyWrap}>
-          <Text style={styles.emptyText}>No leaderboard data yet.</Text>
-        </View>
-      ) : (
-        <>
+            <View style={{ marginLeft: 10, alignItems: "flex-end" }}>
+              <TouchableOpacity style={[styles.typePill, status === "active" ? styles.typeActive : styles.typeMuted]}>
+                <Text style={[styles.typePillText, status === "active" ? styles.typePillTextActive : null]}>{status.toUpperCase()}</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+
           <FlatList
-            ref={listRef}
-            data={items}
+            data={exams}
             horizontal
             showsHorizontalScrollIndicator={false}
-            keyExtractor={(i) => i.userId}
-            renderItem={renderCard}
-            contentContainerStyle={{ paddingHorizontal: contentPadding }}
-            snapToInterval={CARD_WIDTH + CARD_SPACING}
-            decelerationRate={Platform.OS === "ios" ? 0.92 : 0.98}
-            onMomentumScrollEnd={onMomentumScrollEnd}
+            keyExtractor={(e) => e.id}
+            contentContainerStyle={{ paddingTop: 12 }}
+            renderItem={({ item: e }) => (
+              <View style={styles.examChip}>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.examTitle}>{(e.subject || e.id).toUpperCase()}</Text>
+                  <Text style={styles.examSub}>{e.chapter} • Grade {String(e.grade || "").replace("grade", "")}</Text>
+                </View>
+                <TouchableOpacity
+                  style={[styles.examAction, e.scoringEnabled ? styles.examActionPrimary : styles.examActionMuted]}
+                  onPress={() => router.push({ pathname: "/exam/rules", params: { roundId: item.id, examId: e.id } })}
+                >
+                  <Text style={styles.examActionText}>{e.scoringEnabled ? "Enter" : "Practice"}</Text>
+                </TouchableOpacity>
+              </View>
+            )}
           />
+        </View>
+      </View>
+    );
+  }
 
-          {/* Dots indicator */}
-          <View style={styles.dotsWrap}>
-            {items.map((_, i) => {
-              const active = i === activeIndex;
-              return (
-                <View
-                  key={`dot-${i}`}
-                  style={[
-                    styles.dot,
-                    active ? styles.dotActive : null,
-                    // spread out horizontally a little
-                    i !== items.length - 1 ? { marginRight: 8 } : null,
-                  ]}
-                />
-              );
-            })}
+  return (
+    <SafeAreaView style={styles.container}>
+      <ScrollView contentContainerStyle={{ paddingBottom: 36 }}>
+        {/* Leaderboard */}
+        <View style={styles.header}>
+          <View>
+            <Text style={styles.title}>Top 5</Text>
+            <Text style={styles.subtitle}>Top performers for your grade</Text>
           </View>
-        </>
-      )}
+          <TouchableOpacity style={styles.cta} onPress={() => router.push("/exam/leaderboard")}>
+            <Ionicons name="trophy" size={16} color="#fff" />
+            <Text style={styles.ctaText}>See all</Text>
+          </TouchableOpacity>
+        </View>
 
-      <View style={{ height: 20 }} />
+        {loadingLeaders ? (
+          <View style={styles.loadingArea}><ActivityIndicator size="large" color={PRIMARY} /></View>
+        ) : leaders.length === 0 ? (
+          <View style={styles.emptyArea}><Text style={styles.emptyText}>No leaderboard data</Text></View>
+        ) : (
+          <>
+            <FlatList
+              ref={leaderRef}
+              data={leaders}
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              keyExtractor={(i) => i.userId}
+              renderItem={({ item, index }) => <LeaderCard item={item} index={index} />}
+              contentContainerStyle={{ paddingHorizontal: leaderPadding }}
+              snapToInterval={LEADER_CARD_W + SPACING}
+              decelerationRate={Platform.OS === "ios" ? 0.92 : 0.98}
+              onMomentumScrollEnd={onLeaderScrollEnd}
+            />
+            <View style={styles.dotsRow}>
+              {leaders.map((_, i) => (
+                <View key={i} style={[styles.dot, i === leaderIndex ? styles.dotActive : null]} />
+              ))}
+            </View>
+          </>
+        )}
+
+        {/* Company rounds (horizontal) */}
+        <View style={styles.sectionHeader}>
+          <Text style={styles.sectionTitle}>Company rounds</Text>
+          <Text style={styles.sectionSubtitle}>Competitive and practice rounds</Text>
+        </View>
+
+        {loadingRounds ? (
+          <View style={{ padding: 18, alignItems: "center" }}><ActivityIndicator size="small" color={PRIMARY} /></View>
+        ) : rounds.length === 0 ? (
+          <View style={{ padding: 18 }}><Text style={{ color: MUTED }}>No rounds found</Text></View>
+        ) : (
+          <>
+            <FlatList
+              ref={roundsRef}
+              data={rounds}
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              keyExtractor={(r) => r.id}
+              renderItem={({ item }) => <RoundCard item={item} />}
+              contentContainerStyle={{ paddingHorizontal: roundPadding }}
+              snapToInterval={ROUND_CARD_W + SPACING}
+              decelerationRate={Platform.OS === "ios" ? 0.92 : 0.98}
+              onMomentumScrollEnd={onRoundScrollEnd}
+            />
+            <View style={styles.dotsRow}>
+              {rounds.map((_, i) => (
+                <View key={i} style={[styles.dot, i === roundIndex ? styles.dotActive : null]} />
+              ))}
+            </View>
+          </>
+        )}
+
+        {/* Optional: school-level area (kept minimal and simple) */}
+        <View style={styles.sectionHeader}>
+          <Text style={styles.sectionTitle}>School assignments</Text>
+          <Text style={styles.sectionSubtitle}>From your teachers (classwork, quizzes)</Text>
+        </View>
+
+        <View style={{ paddingHorizontal: 18, paddingTop: 8 }}>
+          <Text style={{ color: MUTED }}>School-level assignments appear here when available.</Text>
+        </View>
+      </ScrollView>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  screen: { flex: 1, backgroundColor: "#FBFCFF" },
-  header: { paddingHorizontal: 18, paddingTop: 18, paddingBottom: 12, flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
+  container: { flex: 1, backgroundColor: "#FBFCFF" },
+
+  header: { paddingHorizontal: 18, paddingTop: 18, paddingBottom: 8, flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
   title: { fontSize: 22, fontWeight: "900", color: "#0B2540" },
+  subtitle: { color: MUTED, marginTop: 4, fontSize: 13 },
 
   cta: { flexDirection: "row", alignItems: "center", backgroundColor: PRIMARY, paddingHorizontal: 12, paddingVertical: 8, borderRadius: 12 },
   ctaText: { color: "#fff", marginLeft: 8, fontWeight: "800" },
 
-  loaderWrap: { height: CARD_HEIGHT + 20, alignItems: "center", justifyContent: "center" },
-  emptyWrap: { paddingHorizontal: 18, paddingVertical: 26, alignItems: "center" },
+  loadingArea: { height: LEADER_CARD_H + 20, alignItems: "center", justifyContent: "center" },
+  emptyArea: { paddingVertical: 18, alignItems: "center" },
   emptyText: { color: MUTED },
 
-  card: {
-    borderRadius: 16,
+  leaderCard: {
+    borderRadius: 14,
     padding: 14,
     backgroundColor: "#fff",
     borderWidth: 1,
     borderColor: "#EEF4FF",
-    justifyContent: "space-between",
+    justifyContent: "center",
+    height: LEADER_CARD_H,
   },
-  cardTop: {
-    shadowColor: "#000",
-    shadowOpacity: 0.06,
-    shadowRadius: 12,
-    elevation: 6,
-    transform: [{ scale: 1.02 }],
-  },
-  cardNormal: {
-    shadowColor: "#000",
-    shadowOpacity: 0.03,
-    shadowRadius: 6,
-    elevation: 3,
-  },
+  leaderCardTop: { shadowColor: "#000", shadowOpacity: 0.06, shadowRadius: 12, elevation: 6 },
+  leaderCardNormal: { shadowColor: "#000", shadowOpacity: 0.03, shadowRadius: 6, elevation: 3 },
 
-  cardHeader: { flexDirection: "row", alignItems: "center" },
-  rankWrap: { width: 48, height: 48, borderRadius: 24, borderWidth: 2, alignItems: "center", justifyContent: "center" },
-  rankWrapTop: { width: 56, height: 56, borderRadius: 28 },
+  leaderRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  leaderLeft: { flexDirection: "row", alignItems: "center", flex: 1 },
+  rankCircle: { width: 46, height: 46, borderRadius: 23, borderWidth: 2, alignItems: "center", justifyContent: "center" },
+  rankCircleTop: { width: 56, height: 56, borderRadius: 28 },
   rankText: { fontWeight: "900", fontSize: 16 },
   rankTextTop: { fontSize: 20 },
 
-  name: { fontWeight: "800", fontSize: 14, color: "#0B2540" },
-  nameTop: { fontSize: 18 },
-  schoolText: { color: MUTED, marginTop: 4, fontSize: 12 },
+  leaderName: { fontWeight: "800", fontSize: 16, color: "#0B2540" },
+  leaderNameTop: { fontSize: 18 },
+  leaderSub: { color: MUTED, marginTop: 4, fontSize: 12 },
 
-  cardFooter: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 8 },
-  avatar: { width: 50, height: 50, borderRadius: 12 },
-  avatarTop: { width: 76, height: 76, borderRadius: 14 },
-  avatarPlaceholder: { width: 64, height: 64, borderRadius: 12, backgroundColor: PRIMARY, alignItems: "center", justifyContent: "center" },
-  avatarPlaceholderText: { color: "#fff", fontWeight: "900", fontSize: 18 },
+  leaderRight: { alignItems: "center", marginLeft: 12 },
+  leaderAvatar: { width: 58, height: 58, borderRadius: 12 },
+  leaderAvatarTop: { width: 78, height: 78, borderRadius: 14 },
+  avatarPlaceholderSmall: { width: 58, height: 58, borderRadius: 12, backgroundColor: PRIMARY, alignItems: "center", justifyContent: "center" },
+  avatarPlaceholderTextSmall: { color: "#fff", fontWeight: "900", fontSize: 20 },
 
   pointsLabel: { color: MUTED, fontSize: 12 },
-  pointsValue: { fontWeight: "900", fontSize: 20, color: "#0B2540" },
-  pointsValueTop: { fontSize: 24 },
+  pointsValue: { fontWeight: "900", fontSize: 18, color: "#0B2540" },
+  pointsValueTop: { fontSize: 22 },
 
-  trophyWrap: { backgroundColor: "rgba(242,201,76,0.14)", padding: 10, borderRadius: 12 },
+  trophyWrap: { backgroundColor: "rgba(242,201,76,0.12)", padding: 8, borderRadius: 10 },
 
-  // Dots indicator
-  dotsWrap: { flexDirection: "row", alignItems: "center", justifyContent: "center", marginTop: 12 },
-  dot: { width: 8, height: 8, borderRadius: 4, backgroundColor: "#D9E6FF", opacity: 0.9 },
+  // Dots
+  dotsRow: { flexDirection: "row", alignItems: "center", justifyContent: "center", marginTop: 12, marginBottom: 6 },
+  dot: { width: 8, height: 8, borderRadius: 4, backgroundColor: "#D9E6FF", opacity: 0.9, marginHorizontal: 4 },
   dotActive: { width: 22, height: 8, borderRadius: 10, backgroundColor: PRIMARY },
+
+  // Rounds
+  sectionHeader: { paddingHorizontal: 18, paddingTop: 18, paddingBottom: 8 },
+  sectionTitle: { fontSize: 18, fontWeight: "900", color: "#0B2540" },
+  sectionSubtitle: { color: MUTED, marginTop: 4, fontSize: 13 },
+
+  roundCard: { borderRadius: 12, padding: 14, backgroundColor: "#fff", borderWidth: 1, borderColor: "#EEF4FF", height: ROUND_CARD_H },
+  roundHeader: { flexDirection: "row", alignItems: "flex-start" },
+  roundName: { fontWeight: "800", fontSize: 15, color: "#12263B" },
+  roundMeta: { color: MUTED, marginTop: 6, fontSize: 12 },
+  roundTime: { color: MUTED, marginTop: 6, fontSize: 12 },
+
+  typePill: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 10 },
+  typeActive: { backgroundColor: "rgba(3,201,90,0.08)" },
+  typeMuted: { backgroundColor: "rgba(107,120,168,0.06)" },
+  typePillText: { fontWeight: "800" },
+  typePillTextActive: { color: "#03C95A" },
+
+  // exam chip inside round card
+  examChip: {
+    minWidth: 220,
+    maxWidth: 280,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 12,
+    backgroundColor: "#F8FAFF",
+    marginRight: 10,
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  examTitle: { fontWeight: "800", color: "#0B2540" },
+  examSub: { color: MUTED, fontSize: 12, marginTop: 4 },
+  examAction: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8 },
+  examActionPrimary: { backgroundColor: PRIMARY },
+  examActionMuted: { backgroundColor: "#DDE8FF" },
+  examActionText: { color: "#fff", fontWeight: "800" },
+
+  enterBtn: { marginTop: 8, backgroundColor: PRIMARY, paddingHorizontal: 12, paddingVertical: 8, borderRadius: 10 },
+  enterBtnText: { color: "#fff", fontWeight: "800" },
 });
