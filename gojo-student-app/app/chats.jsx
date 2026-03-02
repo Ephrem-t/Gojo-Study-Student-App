@@ -21,14 +21,15 @@ import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
 import { setOpenedChat } from "./lib/chatStore";
 import { useFocusEffect } from "@react-navigation/native";
+import { getUserVal } from "./lib/userHelpers";
 
 /**
  * app/chats.jsx
  *
- * - Merge server results with local cache ("chatsCache") and keep whichever lastTime is newer.
- * - Preserve lastSenderId and lastSeen fields in the cache so seen state can be shown immediately.
- * - Time format for last message now uses 12-hour format "8:20 AM".
- * - Show seen tick on chats list when last message sender is current user and lastMessage.seen === true.
+ * Changes:
+ * - Uses school-aware getUserVal(userNodeKey) to resolve user profiles.
+ * - Reads/writes Chats under Platform1/Schools/{schoolKey}/Chats when schoolKey is present in AsyncStorage.
+ * - Keeps cached "chatsCache" behaviour.
  */
 
 const PRIMARY = "#007AFB";
@@ -49,8 +50,6 @@ function fmtTime12(ts) {
     const d = new Date(Number(ts));
     let h = d.getHours();
     const m = d.getMinutes().toString().padStart(2, "0");
-    const ampm = h >= 12 ? "AM" : "AM"; // placeholder
-    // fix above: compute am/pm properly
     const ampmProper = d.getHours() >= 12 ? "PM" : "AM";
     h = d.getHours() % 12;
     if (h === 0) h = 12;
@@ -79,6 +78,14 @@ export default function ChatsScreen() {
 
   const makeDeterministicChatId = (a, b) => `${a}_${b}`;
 
+  // Return a database ref that is prefixed by Platform1/Schools/{schoolKey}/ if schoolKey exists.
+  // Usage: const r = await getDbRef("Chats"); -> ref object
+  async function getDbRef(subPath) {
+    const sk = (await AsyncStorage.getItem("schoolKey")) || null;
+    if (sk) return ref(database, `Platform1/Schools/${sk}/${subPath}`);
+    return ref(database, subPath);
+  }
+
   const resolveCurrentUserId = useCallback(async () => {
     let uId = await AsyncStorage.getItem("userId");
     if (uId) return uId;
@@ -88,13 +95,13 @@ export default function ChatsScreen() {
       (await AsyncStorage.getItem("studentId")) ||
       null;
     if (!nodeKey) return null;
+    // use school-aware helper
     try {
-      const snap = await get(ref(database, `Users/${nodeKey}`));
-      if (snap.exists()) {
-        const v = snap.val();
-        return v?.userId || nodeKey;
-      }
-    } catch (e) {}
+      const u = await getUserVal(nodeKey);
+      if (u) return u.userId || nodeKey;
+    } catch (e) {
+      // fallback
+    }
     return nodeKey;
   }, []);
 
@@ -140,7 +147,7 @@ export default function ChatsScreen() {
             (await AsyncStorage.getItem("studentId")) ||
             null;
           if (studentNodeKey) {
-            const snap = await get(ref(database, `Students/${studentNodeKey}`));
+            const snap = await get(await getDbRef(`Students/${studentNodeKey}`));
             if (snap.exists()) {
               const s = snap.val();
               studentGrade = s.grade ? String(s.grade) : null;
@@ -156,7 +163,7 @@ export default function ChatsScreen() {
           // Courses -> courseKeys
           const courseKeys = new Set();
           try {
-            const coursesSnap = await get(ref(database, "Courses"));
+            const coursesSnap = await get(await getDbRef("Courses"));
             if (coursesSnap.exists() && studentGrade && studentSection) {
               coursesSnap.forEach((c) => {
                 const val = c.val();
@@ -173,7 +180,7 @@ export default function ChatsScreen() {
           // TeacherAssignments -> teacherIdsForStudent
           const teacherIdsForStudent = new Set();
           try {
-            const taSnap = await get(ref(database, "TeacherAssignments"));
+            const taSnap = await get(await getDbRef("TeacherAssignments"));
             if (taSnap.exists() && courseKeys.size > 0) {
               taSnap.forEach((child) => {
                 const val = child.val();
@@ -189,7 +196,7 @@ export default function ChatsScreen() {
           // Teachers node -> teacherId -> userNodeKey
           const teacherNodeKeyMap = {};
           try {
-            const teachersSnap = await get(ref(database, "Teachers"));
+            const teachersSnap = await get(await getDbRef("Teachers"));
             if (teachersSnap.exists()) {
               teachersSnap.forEach((child) => {
                 const v = child.val();
@@ -216,7 +223,7 @@ export default function ChatsScreen() {
 
         const adminUserNodeKeys = new Set();
         try {
-          const saSnap = await get(ref(database, "School_Admins"));
+          const saSnap = await get(await getDbRef("School_Admins"));
           if (saSnap.exists()) {
             saSnap.forEach((child) => {
               const v = child.val();
@@ -227,14 +234,14 @@ export default function ChatsScreen() {
           console.warn("School_Admins fetch failed", e);
         }
 
-        // Load Users for union of node keys
+        // Load Users for union of node keys using school-aware getUserVal
         const userNodeKeysToLoad = new Set([...Array.from(teacherUserNodeKeys), ...Array.from(adminUserNodeKeys)]);
         const userProfiles = {};
         await Promise.all(
           Array.from(userNodeKeysToLoad).map(async (nodeKey) => {
             try {
-              const snap = await get(ref(database, `Users/${nodeKey}`));
-              if (snap.exists()) userProfiles[nodeKey] = snap.val();
+              const val = await getUserVal(nodeKey);
+              if (val) userProfiles[nodeKey] = val;
             } catch (e) {
               // ignore individual failures
             }
@@ -281,7 +288,7 @@ export default function ChatsScreen() {
 
         // Merge Chats metadata and set lastSenderId/lastSeen if present
         try {
-          const chatsSnap = await get(ref(database, "Chats"));
+          const chatsSnap = await get(await getDbRef("Chats"));
           if (chatsSnap.exists()) {
             chatsSnap.forEach((child) => {
               const chatKey = child.key;
@@ -440,8 +447,8 @@ export default function ChatsScreen() {
     let contactUserId = contact.userId || "";
     if (!contactUserId) {
       try {
-        const snap = await get(ref(database, `Users/${contact.key}`));
-        if (snap.exists()) contactUserId = snap.val()?.userId || contact.key;
+        const profile = await getUserVal(contact.key);
+        if (profile) contactUserId = profile.userId || contact.key;
         else contactUserId = contact.key;
       } catch (e) {
         contactUserId = contact.key;
@@ -457,8 +464,8 @@ export default function ChatsScreen() {
         null;
       if (nodeKey) {
         try {
-          const snap = await get(ref(database, `Users/${nodeKey}`));
-          if (snap.exists()) myUserId = snap.val()?.userId || nodeKey;
+          const u = await getUserVal(nodeKey);
+          if (u) myUserId = u.userId || nodeKey;
           else myUserId = nodeKey;
         } catch (e) {
           myUserId = nodeKey;
@@ -471,10 +478,10 @@ export default function ChatsScreen() {
       try {
         const c1 = makeDeterministicChatId(myUserId, contactUserId);
         const c2 = makeDeterministicChatId(contactUserId, myUserId);
-        const s1 = await get(ref(database, `Chats/${c1}`));
+        const s1 = await get(await getDbRef(`Chats/${c1}`));
         if (s1.exists()) existingChatId = c1;
         else {
-          const s2 = await get(ref(database, `Chats/${c2}`));
+          const s2 = await get(await getDbRef(`Chats/${c2}`));
           if (s2.exists()) existingChatId = c2;
         }
       } catch (e) {
@@ -671,7 +678,7 @@ const styles = StyleSheet.create({
   avatar: { width: 56, height: 56, borderRadius: 28, backgroundColor: "#F1F3F8" },
   rowTop: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
   name: { fontWeight: "700", fontSize: 16, color: "#111", marginRight: 8 },
-  badge: { marginLeft: 6, paddingHorizontal: 7, paddingVertical: 3, borderRadius: 8, backgroundColor: "#F1F7FF" },
+  badge: { marginLeft: -4, paddingHorizontal: 7, paddingVertical: 3, borderRadius: 8, backgroundColor: "#F1F7FF" },
   badgeText: { color: PRIMARY, fontWeight: "700", fontSize: 11 },
   subtitleText: { color: MUTED, fontSize: 13, flex: 1 },
 

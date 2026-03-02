@@ -37,18 +37,48 @@ export default function LoginScreen() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
-  const findUserByUsername = async (uname) => {
-    const q = query(ref(database, "Users"), orderByChild("username"), equalTo(uname));
-    const snap = await get(q);
-    if (snap.exists()) {
-      let found = null;
-      snap.forEach((child) => {
-        found = { ...child.val(), _nodeKey: child.key };
-        return true;
-      });
-      return found;
+  // Find schoolKey from 3-char prefix (e.g. "GMIS_..." -> "GMI" -> schoolKey)
+  const resolveSchoolKeyFromUsername = async (uname) => {
+    if (!uname || uname.length < 3) return null;
+    const prefix = uname.substr(0, 3).toUpperCase();
+    try {
+      const snap = await get(ref(database, `Platform1/schoolCodeIndex/${prefix}`));
+      if (snap.exists()) {
+        return snap.val(); // expected value: e.g. "ET-ORO-ADA-GMI"
+      }
+    } catch (e) {
+      console.warn("[Login] resolveSchoolKey error", e);
     }
     return null;
+  };
+
+  // Find user by username inside the resolved school's Users node
+  const findUserByUsername = async (uname) => {
+    // Get schoolKey using prefix
+    const schoolKey = await resolveSchoolKeyFromUsername(uname);
+    if (!schoolKey) {
+      return { error: `School code not found for username prefix (${uname.substr(0,3)})` };
+    }
+
+    try {
+      const usersRef = ref(database, `Platform1/Schools/${schoolKey}/Users`);
+      const q = query(usersRef, orderByChild("username"), equalTo(uname));
+      const snap = await get(q);
+      if (snap.exists()) {
+        let found = null;
+        snap.forEach((child) => {
+          // child.key is the node key under that school's Users node
+          found = { ...child.val(), _nodeKey: child.key, _schoolKey: schoolKey };
+          return true;
+        });
+        return { user: found };
+      } else {
+        return { error: "No account found with that username in the resolved school." };
+      }
+    } catch (err) {
+      console.error("[Login] findUserByUsername", err);
+      return { error: "Lookup failed" };
+    }
   };
 
   const handleSignIn = async () => {
@@ -61,43 +91,49 @@ export default function LoginScreen() {
 
     setLoading(true);
     try {
-      const user = await findUserByUsername(uname);
+      const { user, error: lookupError } = await findUserByUsername(uname);
+      if (lookupError) {
+        setError(lookupError);
+        return;
+      }
       if (!user) {
         setError("No account found with that username.");
         return;
       }
+
+      // role check (if you expect only students to login here)
       if (user.role !== "student") {
         setError("This account is not a student account.");
         return;
       }
+
+      // password check (NOTE: passwords appear stored plaintext in DB)
       if (!("password" in user) || user.password !== password) {
         setError("Incorrect password.");
         return;
       }
+
       if (typeof user.isActive === "boolean" && !user.isActive) {
         setError("Account is inactive. Contact the administrator.");
         return;
       }
 
-      let studentNodeKey = "";
-      if (user.studentId) {
-        try {
-          const studentSnap = await get(ref(database, `Students/${user.studentId}`));
-          if (studentSnap.exists()) studentNodeKey = user.studentId;
-        } catch (e) {
-          // ignore
-        }
-      }
+      // If the Users node contains studentId (like GMIS_...), preserve it.
+      const studentNodeKey = user.studentId || "";
 
+      // Persist information. Important: we save the school's key so other modules can resolve Users path.
       await AsyncStorage.multiSet([
         ["userId", user.userId || ""],
         ["username", user.username || ""],
-        ["userNodeKey", user._nodeKey || ""],
+        ["userNodeKey", user._nodeKey || ""], // node key under Schools/{schoolKey}/Users
         ["studentId", user.studentId || ""],
         ["studentNodeKey", studentNodeKey || ""],
         ["role", user.role || ""],
+        ["schoolKey", user._schoolKey || ""], // new: which school bucket this user belongs to
       ]);
 
+      // NOTE: other code that currently reads `Users/${userNodeKey}` must be updated to read
+      // `Schools/${schoolKey}/Users/${userNodeKey}` (or use a shared helper).
       router.replace("/dashboard/home");
     } catch (err) {
       console.error("Login error:", err);

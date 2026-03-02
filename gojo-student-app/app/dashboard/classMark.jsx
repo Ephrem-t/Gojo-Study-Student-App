@@ -24,9 +24,12 @@ import { database } from "../../constants/firebaseConfig";
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { Svg, Circle } from "react-native-svg";
 
+// school-aware helper (adjust path if your helper lives elsewhere)
+import { getUserVal } from "../lib/userHelpers";
+
 /* app/dashboard/classMark.jsx
-   - Handle drag to collapse when full (one-finger) via handle pan responder
-   - Quarter header progress in bottom sheet changed from circular -> linear
+   - Uses Platform1/Schools/{schoolKey}/... where available
+   - Shows empty state when no courses found
 */
 
 const { height: SCREEN_H } = Dimensions.get("window");
@@ -55,6 +58,7 @@ const SUBJECT_ICON_MAP = [
   { keys: ["geography"], icon: "map", color: "#0984e3" },
   { keys: ["computer", "ict", "computing"], icon: "laptop", color: "#8e44ad" },
   { keys: ["physical", "pe", "sport"], icon: "run", color: "#e17055" },
+  
 ];
 function getSubjectIcon(subjectText = "") {
   const s = (subjectText || "").toLowerCase();
@@ -108,13 +112,17 @@ function LinearProgress({ percent = 0, height = 8, style }) {
   );
 }
 
-/* Bottom sheet with main pan and handle pan (handle always captures to collapse when full) */
+function schoolBasePath(schoolKey) {
+  return schoolKey ? `Platform1/Schools/${schoolKey}` : null;
+}
+
+/* Bottom sheet omitted for brevity — unchanged from previous (keeps same implementation) */
+// ... (keep DraggableBottomSheet from prior file unchanged)
 function DraggableBottomSheet({ visible, onClose, contentHeight = SCREEN_H * 0.85, innerScrollAtTopRef, onSnapChange, children }) {
   const sheetHeight = contentHeight;
   const fullY = 0;
-  const halfY = sheetHeight * 0.5; // start at 50%
+  const halfY = sheetHeight * 0.5;
   const hiddenY = sheetHeight;
-
   const translateY = useRef(new Animated.Value(hiddenY)).current;
   const lastY = useRef(hiddenY);
 
@@ -123,15 +131,9 @@ function DraggableBottomSheet({ visible, onClose, contentHeight = SCREEN_H * 0.8
     else { Animated.timing(translateY, { toValue: hiddenY, duration: 220, useNativeDriver: true }).start(); lastY.current = hiddenY; onSnapChange && onSnapChange('hidden'); }
   }, [visible]);
 
-  // main pan captures when sheet isn't full
   const panResponder = useRef(PanResponder.create({
     onStartShouldSetPanResponder: () => false,
-    onMoveShouldSetPanResponder: (_, gesture) => {
-      const dy = Math.abs(gesture.dy);
-      if (dy <= 4) return false;
-      // only capture when sheet not full (so single-finger drag moves sheet until full)
-      return lastY.current !== fullY;
-    },
+    onMoveShouldSetPanResponder: (_, gesture) => Math.abs(gesture.dy) > 4 && lastY.current !== fullY,
     onPanResponderGrant: () => { translateY.setOffset(lastY.current); translateY.setValue(0); },
     onPanResponderMove: (_, gesture) => { translateY.setValue(gesture.dy); },
     onPanResponderRelease: (_, gesture) => {
@@ -150,7 +152,6 @@ function DraggableBottomSheet({ visible, onClose, contentHeight = SCREEN_H * 0.8
     },
   })).current;
 
-  // handle pan: always capture so user can collapse when sheet is full (one-finger)
   const handlePanResponder = useRef(PanResponder.create({
     onStartShouldSetPanResponder: () => true,
     onMoveShouldSetPanResponder: () => true,
@@ -191,7 +192,6 @@ function DraggableBottomSheet({ visible, onClose, contentHeight = SCREEN_H * 0.8
           <TouchableOpacity activeOpacity={0.9} onPress={handleToggle} style={styles.sheetHandleTouchable}>
             <View style={styles.sheetHandle} />
           </TouchableOpacity>
-          {/* invisible view to expand handle touch area and attach pan handlers */}
           <View style={styles.handleDragZone} {...handlePanResponder.panHandlers} />
         </View>
 
@@ -219,30 +219,62 @@ export default function ClassMarkScreen() {
 
   const innerScrollAtTopRef = useRef(true);
 
+  // load student info; reads Students path under school bucket if schoolKey present
   const loadStudent = useCallback(async () => {
     try {
+      const schoolKey = await AsyncStorage.getItem("schoolKey");
+      const base = schoolBasePath(schoolKey);
+
+      // prefer explicit stored student node key (studentNodeKey or studentId)
       const sNode = (await AsyncStorage.getItem("studentNodeKey")) || (await AsyncStorage.getItem("studentId"));
       if (sNode) {
-        const snap = await get(ref(database, `Students/${sNode}`));
-        if (snap.exists()) {
-          const s = snap.val();
-          setStudentId(sNode); setStudentGrade(String(s.grade ?? "")); setStudentSection(String(s.section ?? ""));
-          return { id: sNode, grade: String(s.grade ?? ""), section: String(s.section ?? "") };
+        // try school-scoped Students first
+        if (base) {
+          try {
+            const snap = await get(ref(database, `${base}/Students/${sNode}`));
+            if (snap.exists()) {
+              const s = snap.val();
+              setStudentId(sNode); setStudentGrade(String(s.grade ?? "")); setStudentSection(String(s.section ?? ""));
+              return { id: sNode, grade: String(s.grade ?? ""), section: String(s.section ?? "") };
+            }
+          } catch (e) { /* continue to fallback */ }
         }
+        // fallback to root Students
+        try {
+          const snap2 = await get(ref(database, `Students/${sNode}`));
+          if (snap2.exists()) {
+            const s = snap2.val();
+            setStudentId(sNode); setStudentGrade(String(s.grade ?? "")); setStudentSection(String(s.section ?? ""));
+            return { id: sNode, grade: String(s.grade ?? ""), section: String(s.section ?? "") };
+          }
+        } catch (e) {}
       }
+
+      // fallback: resolve from userNode
       const userNode = await AsyncStorage.getItem("userNodeKey");
       if (userNode) {
-        const uSnap = await get(ref(database, `Users/${userNode}`));
-        if (uSnap.exists()) {
-          const u = uSnap.val();
-          if (u.studentId) {
-            const sSnap = await get(ref(database, `Students/${u.studentId}`));
-            if (sSnap.exists()) {
-              const s = sSnap.val();
-              setStudentId(u.studentId); setStudentGrade(String(s.grade ?? "")); setStudentSection(String(s.section ?? ""));
-              return { id: u.studentId, grade: String(s.grade ?? ""), section: String(s.section ?? "") };
-            }
+        // use getUserVal to read correct Users node under school (if available)
+        const uVal = await getUserVal(userNode);
+        if (uVal && uVal.studentId) {
+          const sid = uVal.studentId;
+          if (base) {
+            try {
+              const sSnap = await get(ref(database, `${base}/Students/${sid}`));
+              if (sSnap.exists()) {
+                const s = sSnap.val();
+                setStudentId(sid); setStudentGrade(String(s.grade ?? "")); setStudentSection(String(s.section ?? ""));
+                return { id: sid, grade: String(s.grade ?? ""), section: String(s.section ?? "") };
+              }
+            } catch (e) { /* continue */ }
           }
+          try {
+            const sSnap2 = await get(ref(database, `Students/${sid}`));
+            if (sSnap2.exists()) {
+              const s = sSnap2.val();
+              setStudentId(sid); setStudentGrade(String(s.grade ?? "")); setStudentSection(String(s.section ?? ""));
+              return { id: sid, grade: String(s.grade ?? ""), section: String(s.section ?? "") };
+            }
+          } catch (e) {}
         }
       }
     } catch (e) { console.warn("loadStudent error", e); }
@@ -258,9 +290,20 @@ export default function ClassMarkScreen() {
       const grade = ctx.grade, section = ctx.section, sid = ctx.id;
 
       try {
-        const snap = await get(ref(database, "Courses"));
+        const schoolKey = await AsyncStorage.getItem("schoolKey");
+        const base = schoolBasePath(schoolKey);
+
+        // Try school-scoped Courses first, then root Courses
+        let snap = null;
+        if (base) {
+          try { snap = await get(ref(database, `${base}/Courses`)); } catch (e) { snap = null; }
+        }
+        if (!snap || !snap.exists()) {
+          try { snap = await get(ref(database, "Courses")); } catch (e) { snap = null; }
+        }
+
         const list = [];
-        if (snap.exists()) {
+        if (snap && snap.exists()) {
           snap.forEach((child) => {
             const val = child.val(), key = child.key;
             if (String(val.grade ?? "") === String(grade) && String(val.section ?? "") === String(section)) {
@@ -268,20 +311,33 @@ export default function ClassMarkScreen() {
             }
           });
         }
+
         list.sort((a, b) => (a.data.name || "").localeCompare(b.data.name || ""));
         if (!mounted) return;
         setCourses(list);
 
+        // ClassMarks: try school-scoped path then fallback to root path
         const marks = {};
         await Promise.all(list.map(async (c) => {
           try {
-            const cm = await get(ref(database, `ClassMarks/${c.key}/${sid}`));
-            marks[c.key] = cm.exists() ? cm.val() : null;
+            let cm = null;
+            if (base) {
+              try { cm = await get(ref(database, `${base}/ClassMarks/${c.key}/${sid}`)); } catch (e) { cm = null; }
+            }
+            if (!cm || !cm.exists()) {
+              try { cm = await get(ref(database, `ClassMarks/${c.key}/${sid}`)); } catch (e) { cm = null; }
+            }
+            marks[c.key] = cm && cm.exists() ? cm.val() : null;
           } catch (err) { console.warn("classmark fetch", err); marks[c.key] = null; }
         }));
         if (!mounted) return;
         setMarksMap(marks);
-      } catch (err) { console.warn(err); if (mounted) { setCourses([]); setMarksMap({}); } } finally { if (mounted) setLoading(false); }
+      } catch (err) {
+        console.warn(err);
+        if (mounted) { setCourses([]); setMarksMap({}); }
+      } finally {
+        if (mounted) setLoading(false);
+      }
     })();
     return () => { mounted = false; };
   }, [loadStudent]);
@@ -315,22 +371,48 @@ export default function ClassMarkScreen() {
     return { s, m, percent: m > 0 ? (s / m) * 100 : null };
   };
 
+  // fetch teacher profile using TeacherAssignments/Teachers under school bucket first, fallback to root.
   const fetchTeacherProfileForCourse = useCallback(async (courseId) => {
     try {
-      const taSnap = await get(ref(database, "TeacherAssignments"));
+      const schoolKey = await AsyncStorage.getItem("schoolKey");
+      const base = schoolBasePath(schoolKey);
+
+      // load TeacherAssignments
+      let taSnap = null;
+      if (base) {
+        try { taSnap = await get(ref(database, `${base}/TeacherAssignments`)); } catch (e) { taSnap = null; }
+      }
+      if (!taSnap || !taSnap.exists()) {
+        try { taSnap = await get(ref(database, "TeacherAssignments")); } catch (e) { taSnap = null; }
+      }
+
       let foundTeacherId = null;
-      if (taSnap.exists()) {
+      if (taSnap && taSnap.exists()) {
         taSnap.forEach((child) => {
           const val = child.val();
           if (val && val.courseId === courseId) foundTeacherId = val.teacherId || null;
         });
       }
       if (!foundTeacherId) return null;
-      const tSnap = await get(ref(database, `Teachers/${foundTeacherId}`));
-      if (!tSnap.exists()) return null;
-      const tVal = tSnap.val(); const userId = tVal.userId; if (!userId) return null;
-      const uSnap = await get(ref(database, `Users/${userId}`)); if (!uSnap.exists()) return null;
-      const uVal = uSnap.val(); return { name: uVal.name || null, profileImage: uVal.profileImage || null };
+
+      // load Teachers node
+      let tSnap = null;
+      if (base) {
+        try { tSnap = await get(ref(database, `${base}/Teachers/${foundTeacherId}`)); } catch (e) { tSnap = null; }
+      }
+      if (!tSnap || !tSnap.exists()) {
+        try { tSnap = await get(ref(database, `Teachers/${foundTeacherId}`)); } catch (e) { tSnap = null; }
+      }
+      if (!tSnap || !tSnap.exists()) return null;
+
+      const tVal = tSnap.val();
+      const userId = tVal.userId;
+      if (!userId) return null;
+
+      // Use getUserVal so this will resolve into the correct Schools/{schoolKey}/Users/{userId} if present
+      const uVal = await getUserVal(userId);
+      if (!uVal) return null;
+      return { name: uVal.name || null, profileImage: uVal.profileImage || null };
     } catch (err) { console.warn("fetchTeacherProfileForCourse error:", err); return null; }
   }, []);
 
@@ -414,6 +496,21 @@ export default function ClassMarkScreen() {
 
   if (loading) return (<View style={styles.center}><ActivityIndicator size="large" color={PRIMARY} /></View>);
 
+  // Empty state when no courses found (friendly message)
+  if (!courses || courses.length === 0) {
+    return (
+      <View style={styles.container}>
+        <View style={{ padding: 24, alignItems: "center", justifyContent: "center" }}>
+          <Image source={require("../../assets/images/no_data_illustrator.jpg")} style={{ width: 220, height: 160, marginBottom: 18 }} resizeMode="contain" />
+          <Text style={{ fontWeight: "700", fontSize: 18, color: "#222", textAlign: "center" }}>No courses found</Text>
+          <Text style={{ color: MUTED, marginTop: 8, textAlign: "center" }}>
+            We couldn't find any courses for your grade/section. If this looks incorrect, contact your school administrator.
+          </Text>
+        </View>
+      </View>
+    );
+  }
+
   return (
     <View style={styles.container}>
       <ScrollView contentContainerStyle={{ padding: 12, paddingBottom: 80 }}>
@@ -446,7 +543,7 @@ export default function ClassMarkScreen() {
   );
 }
 
-/* CourseSheetInner: shows quarters for selected semester — quarter header uses linear progress */
+/* CourseSheetInner unchanged from previous (keeps same implementation) */
 function CourseSheetInner({ courseKey, courseName, marks = {}, onClose, selectedSemester, setSelectedSemester, teacherProfile, innerScrollAtTopRef }) {
   const [expandedQuarter, setExpandedQuarter] = useState({});
 

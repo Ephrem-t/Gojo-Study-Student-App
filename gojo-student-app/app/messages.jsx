@@ -24,11 +24,20 @@ import * as ImagePicker from "expo-image-picker";
 import { database } from "../constants/firebaseConfig";
 import { getOpenedChat, clearOpenedChat } from "./lib/chatStore";
 import { useSafeAreaInsets, SafeAreaView } from "react-native-safe-area-context";
+// school-aware helpers
+import { getUserVal } from "./lib/userHelpers";
 
 /**
  * app/messages.jsx
- * - Updates chats cache with lastSenderId and lastSeen when sending so Chats shows seen state instantly.
- * - Keeps previous features (image upload, viewer, optimistic UI, keyboard handling).
+ * - Uses school-aware getUserVal for all Users lookups so code works with:
+ *     Platform1/Schools/{schoolKey}/Users/{nodeKey}
+ *   (and falls back to root /Users if no schoolKey saved).
+ *
+ * - Uses school-aware Chats path when schoolKey is present:
+ *     Platform1/Schools/{schoolKey}/Chats/{chatId}
+ *
+ * Notes:
+ * - Avoids inline `await` inside template literals — builds a prefix string first.
  */
 
 const PRIMARY = "#007AFB";
@@ -66,6 +75,18 @@ function dateLabelForTs(ts) {
   if (diffDays === 0) return "Today";
   if (diffDays === 1) return "Yesterday";
   return date.toLocaleDateString();
+}
+
+// return prefix path (empty or "Platform1/Schools/{schoolKey}/")
+async function getPathPrefix() {
+  const sk = (await AsyncStorage.getItem("schoolKey")) || null;
+  return sk ? `Platform1/Schools/${sk}/` : "";
+}
+
+// return a ref for a subpath (school-aware)
+async function getDbRef(subPath) {
+  const prefix = await getPathPrefix();
+  return ref(database, `${prefix}${subPath}`);
 }
 
 export default function MessagesScreen(props) {
@@ -114,7 +135,7 @@ export default function MessagesScreen(props) {
 
   const makeDeterministicChatId = (a, b) => `${a}_${b}`;
 
-  // Resolve local ids
+  // Resolve local ids (use school-aware helper)
   useEffect(() => {
     let mounted = true;
     (async () => {
@@ -127,10 +148,9 @@ export default function MessagesScreen(props) {
 
       if (!uId && nodeKey) {
         try {
-          const snap = await get(ref(database, `Users/${nodeKey}`));
-          if (snap.exists()) {
-            const v = snap.val();
-            uId = v?.userId || nodeKey;
+          const uVal = await getUserVal(nodeKey);
+          if (uVal) {
+            uId = uVal.userId || nodeKey;
           } else {
             uId = nodeKey;
           }
@@ -147,29 +167,24 @@ export default function MessagesScreen(props) {
     return () => { mounted = false; };
   }, []);
 
-  // Resolve contactUserId & subtitle (subject/role) if missing
+  // Resolve contactUserId & subtitle (subject/role) if missing - use getUserVal
   useEffect(() => {
     let mounted = true;
     (async () => {
       if (!contactKey) return;
       try {
-        const snap = await get(ref(database, `Users/${contactKey}`));
-        if (snap.exists()) {
-          const v = snap.val();
-          if (v && v.userId && mounted) {
-            setContactUserId(v.userId);
-            setContactName((prev) => prev || v.name || v.username || "");
-            setContactImage((prev) => prev || v.profileImage || null);
-            // prefer subject, then role/designation
-            const subtitle = (v.subject && String(v.subject).trim()) ? v.subject : (v.role || v.designation || "");
-            setContactSubtitle(subtitle || "");
-            return;
-          }
+        const v = await getUserVal(contactKey);
+        if (v && mounted) {
+          if (v.userId) setContactUserId(v.userId);
+          setContactName((prev) => prev || v.name || v.username || "");
+          setContactImage((prev) => prev || v.profileImage || null);
+          const subtitle = (v.subject && String(v.subject).trim()) ? v.subject : (v.role || v.designation || "");
+          setContactSubtitle(subtitle || "");
+          return;
         }
       } catch (e) {
         // ignore
       }
-      // fallback: don't show id as subtitle
       if (mounted) setContactSubtitle("");
     })();
     return () => { mounted = false; };
@@ -181,19 +196,24 @@ export default function MessagesScreen(props) {
     const c1 = makeDeterministicChatId(userA, userB);
     const c2 = makeDeterministicChatId(userB, userA);
     try {
-      const s1 = await get(ref(database, `Chats/${c1}`));
+      const r1 = await getDbRef(`Chats/${c1}`);
+      const s1 = await get(r1);
       if (s1.exists()) return c1;
-      const s2 = await get(ref(database, `Chats/${c2}`));
+      const r2 = await getDbRef(`Chats/${c2}`);
+      const s2 = await get(r2);
       if (s2.exists()) return c2;
       if (!createIfMissing) return null;
+
+      // create under school-aware prefix by building updates with prefix
+      const prefix = await getPathPrefix();
       const now = Date.now();
       const participants = { [userA]: true, [userB]: true };
       const lastMessage = { seen: false, senderId: userA, text: "", timeStamp: now, type: "system" };
       const unread = { [userA]: 0, [userB]: 0 };
       const baseUpdates = {};
-      baseUpdates[`Chats/${c1}/participants`] = participants;
-      baseUpdates[`Chats/${c1}/lastMessage`] = lastMessage;
-      baseUpdates[`Chats/${c1}/unread`] = unread;
+      baseUpdates[`${prefix}Chats/${c1}/participants`] = participants;
+      baseUpdates[`${prefix}Chats/${c1}/lastMessage`] = lastMessage;
+      baseUpdates[`${prefix}Chats/${c1}/unread`] = unread;
       await update(ref(database), baseUpdates);
       return c1;
     } catch (err) {
@@ -212,7 +232,7 @@ export default function MessagesScreen(props) {
         return;
       }
       setLoading(true);
-      const msgsRef = ref(database, `Chats/${chatId}/messages`);
+      const msgsRef = await getDbRef(`Chats/${chatId}/messages`);
       messagesRefRef.current = msgsRef;
 
       const listener = onValue(msgsRef, (snap) => {
@@ -231,14 +251,33 @@ export default function MessagesScreen(props) {
 
         if (currentUserId) {
           try {
-            update(ref(database, `Chats/${chatId}/unread`), { [currentUserId]: 0 }).catch(() => {});
+            // mark unread 0 at chat path (school-aware)
+            (async () => {
+              try {
+                const prefix = await getPathPrefix();
+                await update(ref(database), { [`${prefix}Chats/${chatId}/unread/${currentUserId}`]: 0 });
+              } catch {}
+            })();
+
             const updates = {};
             arr.forEach((m) => {
               if ((String(m.receiverId) === String(currentUserId) || String(m.receiverId) === String(currentUserNodeKey)) && !m.seen) {
-                updates[`Chats/${chatId}/messages/${m.messageId}/seen`] = true;
+                updates[`Chats/${chatId}/messages/${m.messageId}/seen`] = true; // this will be written relative to root prefix below
               }
             });
-            if (Object.keys(updates).length) update(ref(database), updates).catch(() => {});
+            // write seen flags using path prefix
+            if (Object.keys(updates).length) {
+              (async () => {
+                try {
+                  const prefix = await getPathPrefix();
+                  const fullUpdates = {};
+                  Object.keys(updates).forEach((k) => {
+                    fullUpdates[`${prefix}${k}`] = true;
+                  });
+                  await update(ref(database), fullUpdates);
+                } catch {}
+              })();
+            }
           } catch (err) {
             console.warn("[Messages] mark seen error", err);
           }
@@ -263,14 +302,17 @@ export default function MessagesScreen(props) {
       setLastMessageMeta(null);
       return;
     }
-    const lastRef = ref(database, `Chats/${chatId}/lastMessage`);
-    lastMessageRefRef.current = lastRef;
-    const unsub = onValue(lastRef, (snap) => {
-      if (snap.exists()) setLastMessageMeta(snap.val());
-      else setLastMessageMeta(null);
-    });
+    (async () => {
+      const lastRef = await getDbRef(`Chats/${chatId}/lastMessage`);
+      lastMessageRefRef.current = lastRef;
+      const unsub = onValue(lastRef, (snap) => {
+        if (snap.exists()) setLastMessageMeta(snap.val());
+        else setLastMessageMeta(null);
+      });
+      // cleanup will be handled by return
+    })();
     return () => {
-      try { off(lastRef); } catch (e) {}
+      try { if (lastMessageRefRef.current) off(lastMessageRefRef.current); } catch (e) {}
       lastMessageRefRef.current = null;
     };
   }, [chatId]);
@@ -313,14 +355,13 @@ export default function MessagesScreen(props) {
     const nodeKey = await AsyncStorage.getItem("userNodeKey") || await AsyncStorage.getItem("studentNodeKey") || await AsyncStorage.getItem("studentId") || null;
     if (!nodeKey) return null;
     try {
-      const snap = await get(ref(database, `Users/${nodeKey}`));
-      if (snap.exists()) return snap.val()?.userId || nodeKey;
+      const v = await getUserVal(nodeKey);
+      if (v) return v.userId || nodeKey;
     } catch {}
     return nodeKey;
   };
 
   // helper: update chatsCache in AsyncStorage so Chats shows optimistic lastMessage instantly
-  // now stores lastSenderId and lastSeen
   async function updateChatsCacheWithLastMessage({ contactKeyLocal, contactUserIdLocal, lastMessageText, timeStamp, lastSenderId = null, lastSeen = false }) {
     try {
       const raw = await AsyncStorage.getItem("chatsCache");
@@ -430,7 +471,7 @@ export default function MessagesScreen(props) {
         setChatId(chatKeyLocal);
       }
 
-      const messageId = push(ref(database, `Chats/${chatKeyLocal}/messages`)).key;
+      const messageId = push(await getDbRef(`Chats/${chatKeyLocal}/messages`)).key;
       const now = Date.now();
 
       const localMessage = {
@@ -458,6 +499,7 @@ export default function MessagesScreen(props) {
 
       const blob = await uriToBlob(localUri);
 
+      const prefix = await getPathPrefix();
       const path = `chatImages/${chatKeyLocal}/${messageId}.jpg`;
       const storageReference = storageRef(storage, path);
       await uploadBytes(storageReference, blob);
@@ -484,19 +526,18 @@ export default function MessagesScreen(props) {
         type: "image",
       };
 
-      const updates = {
-        [`Chats/${chatKeyLocal}/messages/${messageId}`]: messageObj,
-        [`Chats/${chatKeyLocal}/lastMessage`]: lastMessage,
-        [`Chats/${chatKeyLocal}/unread/${contactUserId}`]: 1,
-        [`Chats/${chatKeyLocal}/unread/${cu}`]: 0,
-      };
+      const updates = {};
+      updates[`${prefix}Chats/${chatKeyLocal}/messages/${messageId}`] = messageObj;
+      updates[`${prefix}Chats/${chatKeyLocal}/lastMessage`] = lastMessage;
+      updates[`${prefix}Chats/${chatKeyLocal}/unread/${contactUserId}`] = 1;
+      updates[`${prefix}Chats/${chatKeyLocal}/unread/${cu}`] = 0;
 
       await update(ref(database), updates);
 
       // resync
       setTimeout(async () => {
         try {
-          const snap = await get(ref(database, `Chats/${chatKeyLocal}/messages`));
+          const snap = await get(await getDbRef(`Chats/${chatKeyLocal}/messages`));
           if (snap.exists()) {
             const arr = [];
             snap.forEach((c) => {
@@ -516,7 +557,7 @@ export default function MessagesScreen(props) {
     }
   }
 
-  // createChatAndSend & sendMessage function declarations (kept as previously)
+  // createChatAndSend & sendMessage
   async function createChatAndSend(messagePayload) {
     const cu = await getResolvedUserId();
     if (!cu || !contactUserId) {
@@ -531,7 +572,7 @@ export default function MessagesScreen(props) {
     }
 
     const now = Date.now();
-    const messageId = push(ref(database, `Chats/${chatKeyLocal}/messages`)).key;
+    const messageId = push(await getDbRef(`Chats/${chatKeyLocal}/messages`)).key;
     const messageObj = {
       messageId,
       senderId: cu,
@@ -552,10 +593,10 @@ export default function MessagesScreen(props) {
       type: messageObj.type,
     };
 
-    const updates = {
-      [`Chats/${chatKeyLocal}/messages/${messageId}`]: messageObj,
-      [`Chats/${chatKeyLocal}/lastMessage`]: lastMessage,
-    };
+    const prefix = await getPathPrefix();
+    const updates = {};
+    updates[`${prefix}Chats/${chatKeyLocal}/messages/${messageId}`] = messageObj;
+    updates[`${prefix}Chats/${chatKeyLocal}/lastMessage`] = lastMessage;
 
     try {
       await update(ref(database), updates);
@@ -574,7 +615,7 @@ export default function MessagesScreen(props) {
 
       setTimeout(async () => {
         try {
-          const snap = await get(ref(database, `Chats/${chatKeyLocal}/messages`));
+          const snap = await get(await getDbRef(`Chats/${chatKeyLocal}/messages`));
           if (snap.exists()) {
             const arr = [];
             snap.forEach((c) => {
@@ -617,7 +658,7 @@ export default function MessagesScreen(props) {
         setChatId(chatKeyLocal);
       }
 
-      const messageId = push(ref(database, `Chats/${chatKeyLocal}/messages`)).key;
+      const messageId = push(await getDbRef(`Chats/${chatKeyLocal}/messages`)).key;
       const messageObj = {
         messageId,
         senderId: cu,
@@ -630,24 +671,25 @@ export default function MessagesScreen(props) {
         deleted: false,
       };
 
-      const chatRef = ref(database, `Chats/${chatKeyLocal}`);
-      const chatSnap = await get(chatRef);
+      // read chat snapshot under school-aware path
+      const chatSnap = await get(await getDbRef(`Chats/${chatKeyLocal}`));
       let unreadObj = {};
       if (chatSnap.exists()) unreadObj = chatSnap.child("unread").val() || {};
 
       const unreadUpdates = {};
+      const prefix = await getPathPrefix();
       if (chatSnap.exists()) {
         const parts = chatSnap.child("participants").val() || {};
         Object.keys(parts).forEach((p) => {
-          if (p === cu) unreadUpdates[`Chats/${chatKeyLocal}/unread/${p}`] = 0;
+          if (p === cu) unreadUpdates[`${prefix}Chats/${chatKeyLocal}/unread/${p}`] = 0;
           else {
             const prev = typeof unreadObj[p] === "number" ? unreadObj[p] : 0;
-            unreadUpdates[`Chats/${chatKeyLocal}/unread/${p}`] = prev + 1;
+            unreadUpdates[`${prefix}Chats/${chatKeyLocal}/unread/${p}`] = prev + 1;
           }
         });
       } else {
-        unreadUpdates[`Chats/${chatKeyLocal}/unread/${contactUserId}`] = (unreadObj[contactUserId] || 0) + 1;
-        unreadUpdates[`Chats/${chatKeyLocal}/unread/${cu}`] = 0;
+        unreadUpdates[`${prefix}Chats/${chatKeyLocal}/unread/${contactUserId}`] = (unreadObj[contactUserId] || 0) + 1;
+        unreadUpdates[`${prefix}Chats/${chatKeyLocal}/unread/${cu}`] = 0;
       }
 
       const lastMessage = {
@@ -658,13 +700,10 @@ export default function MessagesScreen(props) {
         type: payload.type,
       };
 
-      const updates = {
-        [`Chats/${chatKeyLocal}/messages/${messageId}`]: messageObj,
-        [`Chats/${chatKeyLocal}/lastMessage`]: lastMessage,
-        ...unreadUpdates,
-      };
-
-      console.log("[Messages:send] writing message", { chatKeyLocal, messageId, receiverId: contactUserId, senderId: cu });
+      const updates = {};
+      updates[`${prefix}Chats/${chatKeyLocal}/messages/${messageId}`] = messageObj;
+      updates[`${prefix}Chats/${chatKeyLocal}/lastMessage`] = lastMessage;
+      Object.assign(updates, unreadUpdates);
 
       // optimistic append locally
       setMessages((prev) => (prev.some((m) => m.messageId === messageId) ? prev : [...prev, messageObj]));
@@ -685,7 +724,7 @@ export default function MessagesScreen(props) {
       // re-sync after short delay
       setTimeout(async () => {
         try {
-          const snap = await get(ref(database, `Chats/${chatKeyLocal}/messages`));
+          const snap = await get(await getDbRef(`Chats/${chatKeyLocal}/messages`));
           if (snap.exists()) {
             const arr = [];
             snap.forEach((c) => {
@@ -978,7 +1017,7 @@ const styles = StyleSheet.create({
     elevation: 0,
   },
   bubbleLeft: { backgroundColor: INCOMING_BG, borderTopLeftRadius: 6, borderTopRightRadius: 14, borderBottomRightRadius: 14, borderBottomLeftRadius: 14 },
-  bubbleRight: { backgroundColor: OUTGOING_BG, borderTopRightRadius: 6, borderTopLeftRadius: 14, borderBottomRightRadius: 14, borderBottomLeftRadius: 14, marginRight: -20 },
+  bubbleRight: { backgroundColor: OUTGOING_BG, borderTopRightRadius: 6, borderTopLeftRadius: 14, borderBottomRightRadius: 14, borderBottomLeftRadius: 14, marginRight: -12 },
 
   bubbleText: { fontSize: 15, lineHeight: 20 },
   bubbleTextLeft: { color: INCOMING_TEXT, fontWeight: "500" },
@@ -1002,7 +1041,7 @@ const styles = StyleSheet.create({
     transform: [{ rotate: "180deg" }],
   },
 
-  rightTailContainer: { position: "absolute", right: -28, bottom: -2, width: 12, height: 8, overflow: "hidden", alignItems: "flex-end" },
+  rightTailContainer: { position: "absolute", right: -20, bottom: -2, width: 12, height: 8, overflow: "hidden", alignItems: "flex-end" },
   rightTail: {
     width: 0,
     height: 0,
@@ -1016,7 +1055,7 @@ const styles = StyleSheet.create({
   },
 
   incomingImage: { width: 220, height: 140, borderRadius: 12, resizeMode: "cover", backgroundColor: "#eaeefb" },
-  outgoingImage: { width: 220, height: 140, borderRadius: 12, resizeMode: "cover", backgroundColor: "#005ecc" , marginRight: -20},
+  outgoingImage: { width: 220, height: 140, borderRadius: 12, resizeMode: "cover", backgroundColor: "#005ecc" , marginRight: -12},
   imageMeta: { position: "absolute", right: 8, bottom: 6, flexDirection: "row", alignItems: "center" },
   incomingImageMeta: { position: "absolute", left: 8, bottom: 6, flexDirection: "row", alignItems: "center" },
   imageTime: { color: "rgba(255,255,255,0.9)", fontSize: 11 },

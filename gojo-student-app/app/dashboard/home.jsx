@@ -28,22 +28,12 @@ import {
   runTransaction,
 } from "firebase/database";
 import { database } from "../../constants/firebaseConfig";
+import { queryUserByUsernameInSchool, queryUserByChildInSchool } from "../lib/userHelpers"; // <<< school-aware helpers
 
 /**
  * Home feed with pagination ("load more") for older posts.
- * - Realtime listener fetches newest PAGE_SIZE posts (keeps them live).
- * - "Load more" fetches older pages via one-time queries and appends them.
- * - Prefetches images and caches minimal admin lookups.
- * - Optimistic like UI with atomic DB updates via runTransaction.
- *
- * How pagination works:
- * - Initial realtime query: orderByChild("time"), limitToLast(PAGE_SIZE)
- *   (returns newest PAGE_SIZE posts).
- * - For load more: use orderByChild("time"), endAt(oldestTime), limitToLast(PAGE_SIZE + 1)
- *   then drop duplicate overlap and append older items.
- *
- * Important: add index on Posts.time in RTDB rules for fast queries:
- * "Posts": { ".indexOn": ["time"] }
+ * - Only shows posts where post.target is "all" or "students" (or missing).
+ * - Reads Posts from Platform1/Schools/{schoolKey}/Posts when schoolKey is available.
  */
 
 const SCREEN_WIDTH = Dimensions.get("window").width;
@@ -69,8 +59,6 @@ function timeAgo(iso) {
 }
 
 export default function HomeScreen() {
-  // postsLatest: controlled by realtime listener (newest PAGE_SIZE)
-  // postsOlder: appended older pages loaded via get()
   const [postsLatest, setPostsLatest] = useState([]); // newest first
   const [postsOlder, setPostsOlder] = useState([]); // older pages appended after latest; oldest at end
   const [loading, setLoading] = useState(true);
@@ -79,10 +67,9 @@ export default function HomeScreen() {
   const [hasMore, setHasMore] = useState(true);
   const [userId, setUserId] = useState(null);
 
-  // admin cache to avoid repeated User queries
   const adminCacheRef = useRef({});
+  const postsQueryRef = useRef(null); // keep query ref for cleanup
 
-  // load userId and refresh cached profileImage quickly
   const loadUserContext = useCallback(async () => {
     const uid = await AsyncStorage.getItem("userId");
     setUserId(uid);
@@ -90,14 +77,20 @@ export default function HomeScreen() {
     // background: refresh cached profileImage for header
     try {
       const userNodeKey = await AsyncStorage.getItem("userNodeKey");
-      if (userNodeKey) {
-        const snap = await get(ref(database, `Users/${userNodeKey}`));
-        if (snap.exists()) {
-          const u = snap.val();
-          if (u.profileImage) {
-            await AsyncStorage.setItem("profileImage", u.profileImage);
-            Image.prefetch(u.profileImage).catch(() => {});
-          }
+      const schoolKey = await AsyncStorage.getItem("schoolKey");
+      let userSnap = null;
+      if (userNodeKey && schoolKey) {
+        userSnap = await get(ref(database, `Platform1/Schools/${schoolKey}/Users/${userNodeKey}`));
+      }
+      if ((!userSnap || !userSnap.exists()) && userNodeKey) {
+        // fallback to root Users
+        userSnap = await get(ref(database, `Users/${userNodeKey}`));
+      }
+      if (userSnap && userSnap.exists()) {
+        const u = userSnap.val();
+        if (u.profileImage) {
+          await AsyncStorage.setItem("profileImage", u.profileImage);
+          Image.prefetch(u.profileImage).catch(() => {});
         }
       }
     } catch {
@@ -107,25 +100,33 @@ export default function HomeScreen() {
     return uid;
   }, []);
 
-  // Combine latest + older into one array for rendering (newest first)
   const combinedPosts = useMemo(() => {
     return [...postsLatest, ...postsOlder];
   }, [postsLatest, postsOlder]);
 
-  // helper to update a single post across both arrays (used for optimistic like updates)
   const updatePostInState = (postId, updater) => {
     setPostsLatest((prev) => prev.map((p) => (p.postId === postId ? updater(p) : p)));
     setPostsOlder((prev) => prev.map((p) => (p.postId === postId ? updater(p) : p)));
   };
 
-  // Load initial realtime latest PAGE_SIZE posts
+  // helper: determine posts DB path based on saved schoolKey
+  const postsRefForSchool = async () => {
+    const sk = await AsyncStorage.getItem("schoolKey");
+    if (sk) return ref(database, `Platform1/Schools/${sk}/Posts`);
+    return ref(database, "Posts");
+  };
+
+  // main realtime listener for newest page
   useEffect(() => {
-    const postsQuery = query(ref(database, "Posts"), orderByChild("time"), limitToLast(PAGE_SIZE));
     let unsubscribe = null;
     let mounted = true;
 
     (async () => {
       const currentUserId = await loadUserContext();
+      const postsRef = await postsRefForSchool();
+      // build limited query (newest PAGE_SIZE)
+      const postsQuery = query(postsRef, orderByChild("time"), limitToLast(PAGE_SIZE));
+      postsQueryRef.current = postsQuery;
 
       unsubscribe = onValue(
         postsQuery,
@@ -133,13 +134,13 @@ export default function HomeScreen() {
           if (!mounted) return;
           if (!snap.exists()) {
             setPostsLatest([]);
-            setPostsOlder([]); // clear older too on empty DB
+            setPostsOlder([]);
             setHasMore(false);
             setLoading(false);
             return;
           }
 
-          // gather and sort newest-first
+          // gather, sort newest-first
           const tmp = [];
           snap.forEach((child) => {
             const val = child.val();
@@ -151,49 +152,103 @@ export default function HomeScreen() {
             return tb - ta;
           });
 
-          // unique admin ids needed
-          const adminIds = Array.from(new Set(tmp.map((p) => p.data.adminId).filter(Boolean)));
+          // FILTER: only keep posts where target is missing, "all" or "students"
+          const filteredTmp = tmp.filter((p) => {
+            const t = (p.data && p.data.target) || "";
+            const tNorm = String(t).toLowerCase();
+            return !t || tNorm === "all" || tNorm === "students";
+          });
 
-          // fetch admin info only for required admins (cache results)
+          // admin ids needed (unique)
+          const adminIds = Array.from(new Set(filteredTmp.map((p) => p.data.adminId).filter(Boolean)));
+
+          // determine schoolKey saved (so we can pass explicit to helper)
+          const schoolKey = await AsyncStorage.getItem("schoolKey");
+
+          // fetch admin info only for required admins (cache results) using school-aware queries
           await Promise.all(
             adminIds.map(async (aid) => {
               if (adminCacheRef.current[aid]) return;
               try {
-                // try username lookup
-                const q = query(ref(database, "Users"), orderByChild("username"), equalTo(aid));
-                const s = await get(q);
-                if (s.exists()) {
-                  s.forEach((c) => {
-                    adminCacheRef.current[aid] = { ...c.val(), _nodeKey: c.key };
+                // try school-aware username query first
+                let snapUser = null;
+                try {
+                  snapUser = await queryUserByUsernameInSchool(aid, schoolKey);
+                } catch (err) {
+                  // if the RTDB rules lack .indexOn, fallback below
+                  snapUser = null;
+                }
+
+                if (snapUser && snapUser.exists()) {
+                  snapUser.forEach((c) => {
+                    adminCacheRef.current[aid] = { ...c.val(), _nodeKey: c.key, _schoolKey: schoolKey || null };
                     return true;
                   });
                   return;
                 }
-                // fallback: lookup by userId
-                const q2 = query(ref(database, "Users"), orderByChild("userId"), equalTo(aid));
-                const s2 = await get(q2);
-                if (s2.exists()) {
-                  s2.forEach((c) => {
-                    adminCacheRef.current[aid] = { ...c.val(), _nodeKey: c.key };
-                    return true;
-                  });
+
+                // fallback: search by userId (school-aware) -> queryUserByChildInSchool
+                try {
+                  const snapByUserId = await queryUserByChildInSchool("userId", aid, schoolKey);
+                  if (snapByUserId && snapByUserId.exists()) {
+                    snapByUserId.forEach((c) => {
+                      adminCacheRef.current[aid] = { ...c.val(), _nodeKey: c.key, _schoolKey: schoolKey || null };
+                      return true;
+                    });
+                    return;
+                  }
+                } catch (err2) {
+                  // ignore and fallback to global Users lookup below
+                }
+
+                // final fallback: try global Users path (root). This avoids hard failures if school indexing not present.
+                try {
+                  const qGlobal = query(ref(database, "Users"), orderByChild("username"), equalTo(aid));
+                  const sGlobal = await get(qGlobal);
+                  if (sGlobal.exists()) {
+                    sGlobal.forEach((c) => {
+                      adminCacheRef.current[aid] = { ...c.val(), _nodeKey: c.key, _schoolKey: null };
+                      return true;
+                    });
+                    return;
+                  }
+                  // fallback to userId global
+                  const qGlobal2 = query(ref(database, "Users"), orderByChild("userId"), equalTo(aid));
+                  const sGlobal2 = await get(qGlobal2);
+                  if (sGlobal2.exists()) {
+                    sGlobal2.forEach((c) => {
+                      adminCacheRef.current[aid] = { ...c.val(), _nodeKey: c.key, _schoolKey: null };
+                      return true;
+                    });
+                    return;
+                  }
+                } catch (finalErr) {
+                  // give up on this admin
                 }
               } catch {
-                // ignore
+                // ignore individual admin failures
               }
             })
           );
 
-          // build enriched posts and prefetch images
-          const enriched = tmp.map((p) => {
+          const enriched = filteredTmp.map((p) => {
             const likesNode = p.data.likes || {};
             const seenNode = p.data.seenBy || {};
 
             // mark seen best-effort
             if (currentUserId && !seenNode[currentUserId]) {
               const updates = {};
-              updates[`Posts/${p.postId}/seenBy/${currentUserId}`] = true;
-              update(ref(database), updates).catch(() => {});
+              // posts path may be under school posts or root posts; compute correct path
+              (async () => {
+                try {
+                  const sk = await AsyncStorage.getItem("schoolKey");
+                  const postPath = sk ? `Platform1/Schools/${sk}/Posts/${p.postId}` : `Posts/${p.postId}`;
+                  updates[`${postPath}/seenBy/${currentUserId}`] = true;
+                  update(ref(database), updates).catch(() => {});
+                } catch {
+                  // ignore
+                }
+              })();
               seenNode[currentUserId] = true;
             }
 
@@ -209,10 +264,7 @@ export default function HomeScreen() {
 
           if (mounted) {
             setPostsLatest(enriched);
-            // remove any duplicates that exist in postsOlder (in case the new latest overlapped)
             setPostsOlder((prevOlder) => prevOlder.filter((o) => !enriched.some((el) => el.postId === o.postId)));
-            // determine if there may be more older posts (if returned items < page size then maybe none)
-            // we can't be sure because DB could have fewer than PAGE_SIZE; keep hasMore true for loadMore attempt
             setHasMore(true);
             setLoading(false);
             setRefreshing(false);
@@ -231,7 +283,7 @@ export default function HomeScreen() {
     return () => {
       mounted = false;
       if (unsubscribe) unsubscribe();
-      off(postsQuery);
+      if (postsQueryRef.current) off(postsQueryRef.current);
     };
   }, [loadUserContext]);
 
@@ -240,12 +292,11 @@ export default function HomeScreen() {
     setTimeout(() => setRefreshing(false), 700);
   };
 
-  // Load older page (pagination). Appends older posts to postsOlder.
+  // loadMore: same school-aware path + target filter + admin lookup logic
   const loadMore = async () => {
     if (loadingMore || !hasMore) return;
     setLoadingMore(true);
     try {
-      // find current oldest time from combined posts (last element)
       const combined = [...postsLatest, ...postsOlder];
       if (combined.length === 0) {
         setHasMore(false);
@@ -260,8 +311,8 @@ export default function HomeScreen() {
         return;
       }
 
-      // Query: get PAGE_SIZE + 1 items ending at oldestTime (so we can drop overlap)
-      const q = query(ref(database, "Posts"), orderByChild("time"), endAt(oldestTime), limitToLast(PAGE_SIZE + 1));
+      const postsRef = await postsRefForSchool();
+      const q = query(postsRef, orderByChild("time"), endAt(oldestTime), limitToLast(PAGE_SIZE + 1));
       const snap = await get(q);
       if (!snap.exists()) {
         setHasMore(false);
@@ -269,7 +320,6 @@ export default function HomeScreen() {
         return;
       }
 
-      // collect and sort newest-first then remove duplicate overlap
       const tmp = [];
       snap.forEach((child) => {
         const val = child.val();
@@ -281,47 +331,87 @@ export default function HomeScreen() {
         return tb - ta;
       });
 
-      // Remove the duplicate (the one with same postId as oldest) if present at the end/start
-      // tmp is newest-first; find and remove any item with postId equal to oldest.postId
-      const filtered = tmp.filter((p) => p.postId !== oldest.postId);
+      // drop overlap (oldest)
+      const filteredTmp = tmp.filter((p) => p.postId !== oldest.postId);
 
-      // If filtered is empty, no older items
-      if (filtered.length === 0) {
+      // apply target filter for students
+      const filteredByTarget = filteredTmp.filter((p) => {
+        const t = (p.data && p.data.target) || "";
+        const tNorm = String(t).toLowerCase();
+        return !t || tNorm === "all" || tNorm === "students";
+      });
+
+      if (filteredByTarget.length === 0) {
         setHasMore(false);
         setLoadingMore(false);
         return;
       }
 
-      // unique adminIds to fetch
-      const adminIds = Array.from(new Set(filtered.map((p) => p.data.adminId).filter(Boolean)));
+      // admin lookups (same logic as above)
+      const adminIds = Array.from(new Set(filteredByTarget.map((p) => p.data.adminId).filter(Boolean)));
+      const schoolKey = await AsyncStorage.getItem("schoolKey");
+
       await Promise.all(
         adminIds.map(async (aid) => {
           if (adminCacheRef.current[aid]) return;
           try {
-            const q1 = query(ref(database, "Users"), orderByChild("username"), equalTo(aid));
-            const s1 = await get(q1);
-            if (s1.exists()) {
-              s1.forEach((c) => {
-                adminCacheRef.current[aid] = { ...c.val(), _nodeKey: c.key };
+            let snapUser = null;
+            try {
+              snapUser = await queryUserByUsernameInSchool(aid, schoolKey);
+            } catch {
+              snapUser = null;
+            }
+            if (snapUser && snapUser.exists()) {
+              snapUser.forEach((c) => {
+                adminCacheRef.current[aid] = { ...c.val(), _nodeKey: c.key, _schoolKey: schoolKey || null };
                 return true;
               });
               return;
             }
-            const q2 = query(ref(database, "Users"), orderByChild("userId"), equalTo(aid));
-            const s2 = await get(q2);
-            if (s2.exists()) {
-              s2.forEach((c) => {
-                adminCacheRef.current[aid] = { ...c.val(), _nodeKey: c.key };
-                return true;
-              });
+
+            try {
+              const snapByUserId = await queryUserByChildInSchool("userId", aid, schoolKey);
+              if (snapByUserId && snapByUserId.exists()) {
+                snapByUserId.forEach((c) => {
+                  adminCacheRef.current[aid] = { ...c.val(), _nodeKey: c.key, _schoolKey: schoolKey || null };
+                  return true;
+                });
+                return;
+              }
+            } catch {
+              // ignore
+            }
+
+            // fallback to global Users
+            try {
+              const qGlobal = query(ref(database, "Users"), orderByChild("username"), equalTo(aid));
+              const sGlobal = await get(qGlobal);
+              if (sGlobal.exists()) {
+                sGlobal.forEach((c) => {
+                  adminCacheRef.current[aid] = { ...c.val(), _nodeKey: c.key, _schoolKey: null };
+                  return true;
+                });
+                return;
+              }
+              const qGlobal2 = query(ref(database, "Users"), orderByChild("userId"), equalTo(aid));
+              const sGlobal2 = await get(qGlobal2);
+              if (sGlobal2.exists()) {
+                sGlobal2.forEach((c) => {
+                  adminCacheRef.current[aid] = { ...c.val(), _nodeKey: c.key, _schoolKey: null };
+                  return true;
+                });
+                return;
+              }
+            } catch {
+              // ignore
             }
           } catch {
-            // ignore
+            // ignore per-admin failure
           }
         })
       );
 
-      const enrichedOlder = filtered.map((p) => {
+      const enrichedOlder = filteredByTarget.map((p) => {
         const likesNode = p.data.likes || {};
         const seenNode = p.data.seenBy || {};
         const admin = adminCacheRef.current[p.data.adminId] || null;
@@ -334,13 +424,10 @@ export default function HomeScreen() {
         if (e.admin && e.admin.profileImage) Image.prefetch(e.admin.profileImage).catch(() => {});
       });
 
-      // append older items after the existing older list
       setPostsOlder((prev) => {
-        // avoid duplicates if any
         const existingIds = new Set(prev.map((p) => p.postId).concat(postsLatest.map((p) => p.postId)));
         const toAdd = enrichedOlder.filter((p) => !existingIds.has(p.postId));
         const newOlder = [...prev, ...toAdd];
-        // If returned items less than PAGE_SIZE, we've exhausted older posts
         if (enrichedOlder.length < PAGE_SIZE) setHasMore(false);
         return newOlder;
       });
@@ -351,7 +438,6 @@ export default function HomeScreen() {
     }
   };
 
-  // Optimistic like + runTransaction (apply updates to whichever array contains the post)
   const toggleLike = async (postId) => {
     const uid = userId || (await loadUserContext());
     if (!uid) {
@@ -359,7 +445,6 @@ export default function HomeScreen() {
       return;
     }
 
-    // find post in latest or older and current liked state
     const findPost = () => {
       let p = postsLatest.find((x) => x.postId === postId);
       if (p) return { which: "latest", p };
@@ -372,7 +457,6 @@ export default function HomeScreen() {
     if (!found) return;
     const currentlyLiked = !!(found.p.likesMap && found.p.likesMap[uid]);
 
-    // optimistic update helper
     const optimisticUpdater = (post) => {
       const likes = { ...(post.likesMap || {}) };
       if (currentlyLiked) delete likes[uid];
@@ -380,13 +464,13 @@ export default function HomeScreen() {
       return { ...post, likesMap: likes, data: { ...post.data, likeCount: Object.keys(likes).length } };
     };
 
-    // apply optimistic update
     if (found.which === "latest") setPostsLatest((prev) => prev.map((p) => (p.postId === postId ? optimisticUpdater(p) : p)));
     else setPostsOlder((prev) => prev.map((p) => (p.postId === postId ? optimisticUpdater(p) : p)));
 
-    // runTransaction on DB
-    const postRef = ref(database, `Posts/${postId}`);
+    // posts path might be under school or root; pick a ref (prefer school posts)
     try {
+      const sk = await AsyncStorage.getItem("schoolKey");
+      const postRef = sk ? ref(database, `Platform1/Schools/${sk}/Posts/${postId}`) : ref(database, `Posts/${postId}`);
       await runTransaction(postRef, (current) => {
         if (current === null) return current;
         if (!current.likes) current.likes = {};
@@ -401,16 +485,16 @@ export default function HomeScreen() {
         }
         return current;
       });
-      // onValue listener will reconcile for items in postsLatest; for older items loaded via get() we re-fetch if needed
     } catch (err) {
       console.warn("runTransaction failed for like:", err);
-      // revert by reloading that single post from DB
+      // reload single post from DB fallback (try school path then root)
       try {
-        const snap = await get(postRef);
+        const sk = await AsyncStorage.getItem("schoolKey");
+        const pRef = sk ? ref(database, `Platform1/Schools/${sk}/Posts/${postId}`) : ref(database, `Posts/${postId}`);
+        const snap = await get(pRef);
         if (snap.exists()) {
           const val = snap.val();
           const updated = { postId: val.postId || postId, data: val, likesMap: val.likes || {}, seenMap: val.seenBy || {} };
-          // replace in latest or older
           setPostsLatest((prev) => prev.map((p) => (p.postId === postId ? updated : p)));
           setPostsOlder((prev) => prev.map((p) => (p.postId === postId ? updated : p)));
         }
@@ -421,7 +505,6 @@ export default function HomeScreen() {
     }
   };
 
-  // Post card (with pulse animation)
   function PostCard({ item }) {
     const { postId, data, admin, likesMap = {}, seenMap = {} } = item;
     const likesCount = data.likeCount || Object.keys(likesMap || {}).length;
@@ -531,7 +614,6 @@ export default function HomeScreen() {
       refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={["#007AFB"]} />}
       onEndReachedThreshold={0.6}
       onEndReached={() => {
-        // load older posts when scrolling near bottom
         if (!loadingMore && hasMore) loadMore();
       }}
       ListFooterComponent={<ListFooter />}
@@ -586,7 +668,7 @@ const styles = StyleSheet.create({
   timeSmall: { color: "#888", fontSize: 12 },
 
   emptyContainer: { flex: 1, backgroundColor: "#fff", alignItems: "center", justifyContent: "center", padding: 28 },
-  emptyImage: { width: 260, height: 200, marginBottom: 18 },
+  emptyImage: { width: 220, height: 160, marginBottom: 18 },
   emptyFallbackIcon: { width: 120, height: 120, borderRadius: 60, backgroundColor: "#F6F8FF", alignItems: "center", justifyContent: "center", marginBottom: 12 },
   emptyTitle: { fontSize: 20, fontWeight: "700", color: "#222", marginBottom: 6 },
   emptySubtitle: { fontSize: 14, color: "#8B93B3", textAlign: "center" },
