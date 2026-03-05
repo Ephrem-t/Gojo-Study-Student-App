@@ -1,156 +1,124 @@
-// app/dashboard/exam.jsx
-import React, { useEffect, useState, useCallback, useRef } from "react";
+import React, { useEffect, useMemo, useState, useCallback } from "react";
 import {
   View,
   Text,
   StyleSheet,
-  FlatList,
+  SafeAreaView,
   TouchableOpacity,
+  FlatList,
   ActivityIndicator,
   Image,
+  RefreshControl,
   Dimensions,
-  Platform,
-  SafeAreaView,
-  ScrollView,
 } from "react-native";
+import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
+import { useRouter } from "expo-router";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { ref, get } from "firebase/database";
 import { database } from "../../constants/firebaseConfig";
-import { Ionicons } from "@expo/vector-icons";
-import { useRouter } from "expo-router";
 import { queryUserByUsernameInSchool, queryUserByChildInSchool } from "../lib/userHelpers";
 
-/**
- * Exams screen (dashboard)
- * - Top: compact Top-5 leaderboard (horizontal carousel + dots)
- * - Middle: Company rounds presented as a horizontal carousel of round cards
- *   - Each round card shows metadata and a horizontal list of exam chips inside it
- * - Below: (kept simple) placeholder for school-level tasks if needed
- *
- * Design goals: simple, modern, professional, responsive.
- * The UI uses data from Platform1/companyExams/rounds and Platform1/rankings.
- */
-
-const SCREEN_W = Dimensions.get("window").width;
-const LEADER_CARD_W = Math.round(Math.min(720, SCREEN_W * 0.86));
-const LEADER_CARD_H = 160;
-const ROUND_CARD_W = Math.round(Math.min(640, SCREEN_W * 0.78));
-const ROUND_CARD_H = 190;
+const { width: SCREEN_W } = Dimensions.get("window");
 const PRIMARY = "#0B72FF";
-const MUTED = "#6B78A8";
 const GOLD = "#F2C94C";
-const SPACING = 14;
+const SILVER = "#C0C6CC";
+const BRONZE = "#D08A3A";
+const BG = "#FFFFFF";
+const TEXT = "#0B2540";
+const MUTED = "#6B78A8";
+const CARD_W = Math.round(SCREEN_W * 0.76);
+const STORY_AVATAR_SIZE = 64;
 
-async function tryGet(pathVariants) {
-  for (const p of pathVariants) {
+async function tryGet(paths) {
+  for (const p of paths) {
     try {
       const snap = await get(ref(database, p));
-      if (snap && snap.exists()) return snap;
-    } catch (e) {
-      // ignore and try next
-    }
+      if (snap?.exists()) return snap;
+    } catch {}
   }
   return null;
 }
 
-async function resolveSchoolKeyForPrefix(prefix) {
-  const snap = await tryGet([`Platform1/schoolCodeIndex/${prefix}`, `schoolCodeIndex/${prefix}`]);
-  return snap && snap.exists() ? snap.val() : null;
+function normalizeGrade(g) {
+  if (!g) return null;
+  return String(g).trim().toLowerCase().replace(/^grade/i, "");
 }
 
+async function resolveSchoolKeyForPrefix(prefix) {
+  const snap = await tryGet([`Platform1/schoolCodeIndex/${prefix}`, `schoolCodeIndex/${prefix}`]);
+  return snap?.val?.() || null;
+}
 async function queryUserProfile(userId) {
   if (!userId) return {};
   try {
-    const prefix = (userId.substr(0, 3) || "").toUpperCase();
+    const prefix = String(userId).slice(0, 3).toUpperCase();
     const schoolKey = await resolveSchoolKeyForPrefix(prefix);
-
     let profile = null;
-    let userNodeKey = null;
 
     if (schoolKey) {
       try {
         const snap = await queryUserByUsernameInSchool(userId, schoolKey);
-        if (snap && snap.exists()) {
+        if (snap?.exists()) {
           snap.forEach((c) => {
             profile = c.val();
-            userNodeKey = c.key;
             return true;
           });
         }
       } catch {}
     }
-
     if (!profile) {
       try {
         const snap = await queryUserByChildInSchool("username", userId, null);
-        if (snap && snap.exists()) {
+        if (snap?.exists()) {
           snap.forEach((c) => {
             profile = c.val();
-            userNodeKey = c.key;
             return true;
           });
         }
       } catch {}
     }
-
-    let schoolInfo = null;
-    if (schoolKey) {
-      try {
-        const sSnap = await tryGet([`Platform1/Schools/${schoolKey}/schoolInfo`, `Schools/${schoolKey}/schoolInfo`]);
-        if (sSnap && sSnap.exists()) schoolInfo = sSnap.val();
-      } catch {}
-    }
-
-    return { profile, schoolInfo, userNodeKey, schoolKey };
+    return { profile };
   } catch {
     return {};
-  }
-}
-
-function fmtDate(ts) {
-  if (!ts) return "";
-  try {
-    const d = new Date(Number(ts));
-    return d.toLocaleString();
-  } catch {
-    return "";
   }
 }
 
 export default function ExamScreen() {
   const router = useRouter();
 
-  // Leaderboard state
-  const [loadingLeaders, setLoadingLeaders] = useState(true);
-  const [leaders, setLeaders] = useState([]);
-  const [leaderIndex, setLeaderIndex] = useState(0);
-  const leaderRef = useRef(null);
-  const leaderPadding = Math.round((SCREEN_W - LEADER_CARD_W) / 2);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
 
-  // Rounds state
-  const [loadingRounds, setLoadingRounds] = useState(true);
-  const [rounds, setRounds] = useState([]);
-  const [roundIndex, setRoundIndex] = useState(0);
-  const roundsRef = useRef(null);
-  const roundPadding = Math.round((SCREEN_W - ROUND_CARD_W) / 2);
+  const [leaders, setLeaders] = useState([]);
+  const [packages, setPackages] = useState([]);
+  const [studentGrade, setStudentGrade] = useState(null);
+
+  const fetchAll = useCallback(async () => {
+    const grade = normalizeGrade(await AsyncStorage.getItem("studentGrade"));
+    setStudentGrade(grade || null);
+
+    await Promise.all([loadLeaders(grade), loadPackages(grade)]);
+  }, []);
 
   useEffect(() => {
     (async () => {
-      setLoadingLeaders(true);
-      setLoadingRounds(true);
-      await Promise.all([loadLeaders(), loadRounds()]);
-      setLoadingLeaders(false);
-      setLoadingRounds(false);
+      setLoading(true);
+      await fetchAll();
+      setLoading(false);
     })();
-  }, []);
+  }, [fetchAll]);
 
-  // Load top-5 leaders (enriched)
-  const loadLeaders = useCallback(async () => {
+  const onRefresh = useCallback(async () => {
+    setRefreshing(true);
+    await fetchAll();
+    setRefreshing(false);
+  }, [fetchAll]);
+
+  const loadLeaders = useCallback(async (grade) => {
     try {
       const countrySnap = await tryGet([`Platform1/country`, `country`]);
-      const country = countrySnap && countrySnap.exists() ? countrySnap.val() : "Ethiopia";
-      const grade = (await AsyncStorage.getItem("studentGrade")) || "9";
-      const gradeKey = `grade${grade}`;
+      const country = countrySnap?.val?.() || "Ethiopia";
+      const gradeKey = grade ? `grade${grade}` : "grade9";
 
       const snap = await tryGet([
         `Platform1/rankings/country/${country}/${gradeKey}/leaderboard`,
@@ -158,330 +126,291 @@ export default function ExamScreen() {
       ]);
 
       const raw = [];
-      if (snap && snap.exists()) {
+      if (snap?.exists()) {
         snap.forEach((c) => {
           const v = c.val() || {};
-          raw.push({ userId: c.key, rank: v.rank || 999, totalPoints: v.totalPoints || 0, badge: v.badge || null });
+          raw.push({ userId: c.key, rank: v.rank || 999 });
         });
       }
-
       raw.sort((a, b) => (a.rank || 999) - (b.rank || 999));
-      const top5 = raw.slice(0, 5);
+      const top = raw.slice(0, 5);
 
       const enriched = await Promise.all(
-        top5.map(async (entry) => {
-          const resolved = await queryUserProfile(entry.userId);
-          return { ...entry, profile: resolved.profile || null, schoolInfo: resolved.schoolInfo || null };
+        top.map(async (entry) => {
+          const u = await queryUserProfile(entry.userId);
+          return { ...entry, profile: u.profile || null };
         })
       );
-
       setLeaders(enriched);
-      setLeaderIndex(0);
-      setTimeout(() => leaderRef.current && enriched.length && leaderRef.current.scrollToOffset({ offset: 0, animated: true }), 150);
-    } catch (err) {
-      console.warn("loadLeaders", err);
+    } catch {
       setLeaders([]);
     }
   }, []);
 
-  // Load company rounds
-  const loadRounds = useCallback(async () => {
+  const loadPackages = useCallback(async (grade) => {
     try {
-      const snap = await tryGet([`Platform1/companyExams/rounds`, `companyExams/rounds`]);
-      const arr = [];
-      if (snap && snap.exists()) {
-        snap.forEach((c) => {
-          const v = c.val() || {};
-          arr.push({ id: c.key, ...v });
-        });
+      // ✅ FIX: your actual DB path
+      const pkgSnap = await tryGet([
+        `Platform1/companyExams/packages`,
+        `companyExams/packages`,
+      ]);
+
+      if (!pkgSnap?.exists()) {
+        setPackages([]);
+        return;
       }
-      arr.sort((a, b) => (b.startTimestamp || 0) - (a.startTimestamp || 0));
-      setRounds(arr);
-      setRoundIndex(0);
-      setTimeout(() => roundsRef.current && arr.length && roundsRef.current.scrollToOffset({ offset: 0, animated: true }), 150);
-    } catch (err) {
-      console.warn("loadRounds", err);
-      setRounds([]);
+
+      const arr = [];
+      pkgSnap.forEach((c) => {
+        const v = c.val() || {};
+        const pkgGrade = normalizeGrade(v.grade);
+        if (grade && pkgGrade && pkgGrade !== String(grade)) return; // filter by student grade
+
+        const subjectsNode = v.subjects || {};
+        const subjectCount = Object.keys(subjectsNode).length;
+
+        arr.push({
+          id: c.key,
+          name: v.name || c.key,
+          subtitle:
+            v.type === "competitive"
+              ? "National Challenge"
+              : v.type === "practice"
+              ? "Practice Pack"
+              : v.type === "entrance"
+              ? "Entrance Prep"
+              : "Special Pack",
+          description: v.description || "Explore package",
+          type: v.type || "practice",
+          subjectCount,
+          active: v.active !== false,
+        });
+      });
+
+      setPackages(arr.filter((p) => p.active));
+    } catch (e) {
+      console.warn("loadPackages error", e);
+      setPackages([]);
     }
   }, []);
 
-  // Handlers for snapping indices
-  const onLeaderScrollEnd = (e) => {
-    const offsetX = e.nativeEvent.contentOffset.x || 0;
-    const idx = Math.round(offsetX / (LEADER_CARD_W + SPACING));
-    setLeaderIndex(Math.max(0, Math.min(leaders.length - 1, idx)));
-  };
-  const onRoundScrollEnd = (e) => {
-    const offsetX = e.nativeEvent.contentOffset.x || 0;
-    const idx = Math.round(offsetX / (ROUND_CARD_W + SPACING));
-    setRoundIndex(Math.max(0, Math.min(rounds.length - 1, idx)));
-  };
-
-  function LeaderCard({ item, index }) {
-    const isTop = index === 0 || Number(item.rank) === 1;
-    const displayName = item.profile?.name || item.profile?.username || item.userId;
-    const avatar = item.profile?.profileImage || item.schoolInfo?.logoUrl || null;
-    const school = item.schoolInfo?.name || item.profile?.schoolName || item.schoolInfo?.city || "";
-
-    return (
-      <View style={{ width: LEADER_CARD_W, height: LEADER_CARD_H, marginRight: SPACING }}>
-        <TouchableOpacity
-          activeOpacity={0.92}
-          onPress={() => router.push({ pathname: "/exam/profile", params: { userId: item.userId } })}
-          style={[styles.leaderCard, isTop ? styles.leaderCardTop : styles.leaderCardNormal]}
-        >
-          <View style={styles.leaderRow}>
-            <View style={styles.leaderLeft}>
-              <View style={[styles.rankCircle, isTop && styles.rankCircleTop]}>
-                <Text style={[styles.rankText, isTop && styles.rankTextTop]}>{item.rank}</Text>
-              </View>
-              <View style={{ marginLeft: 12, flex: 1 }}>
-                <Text numberOfLines={1} style={[styles.leaderName, isTop && styles.leaderNameTop]}>{displayName}</Text>
-                <Text numberOfLines={1} style={styles.leaderSub}>{school}{item.schoolInfo?.region ? ` • ${item.schoolInfo.region}` : ""}</Text>
-              </View>
-            </View>
-
-            <View style={styles.leaderRight}>
-              {avatar ? <Image source={{ uri: avatar }} style={[styles.leaderAvatar, isTop && styles.leaderAvatarTop]} /> : (
-                <View style={[styles.avatarPlaceholderSmall, isTop && styles.leaderAvatarTop]}>
-                  <Text style={styles.avatarPlaceholderTextSmall}>{(displayName || "U").slice(0, 1)}</Text>
-                </View>
-              )}
-              <View style={{ height: 8 }} />
-              <Text style={styles.pointsLabel}>Points</Text>
-              <Text style={[styles.pointsValue, isTop && styles.pointsValueTop]}>{item.totalPoints}</Text>
-            </View>
+  const topSection = useMemo(
+    () => (
+      <View>
+        {/* HEADER */}
+        <View style={styles.header}>
+          <View>
+            <Text style={styles.title}>Exams</Text>
+            <Text style={styles.subtitle}>Compete nationally and improve your skills</Text>
           </View>
-        </TouchableOpacity>
-      </View>
-    );
-  }
+          <TouchableOpacity style={styles.leaderBtn} onPress={() => router.push("/exam/leaderboard")}>
+            <Ionicons name="trophy" size={15} color="#fff" />
+            <Text style={styles.leaderBtnText}>Leaderboard</Text>
+          </TouchableOpacity>
+        </View>
 
-  function RoundCard({ item }) {
-    const exams = item.exams ? Object.keys(item.exams).map((k) => ({ id: k, ...item.exams[k] })) : [];
-    const status = item.status || "upcoming";
-    const typeLabel = (item.type || "round").toUpperCase();
+        {/* SECTION 1: LEADERBOARD */}
+        <View style={styles.sectionHeader}><Text style={styles.sectionTitle}>Top Students</Text></View>
+        <FlatList
+          data={leaders}
+          horizontal
+          keyExtractor={(i) => i.userId}
+          contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 10 }}
+          showsHorizontalScrollIndicator={false}
+          ItemSeparatorComponent={() => <View style={{ width: 12 }} />}
+          renderItem={({ item, index }) => {
+            const rank = Number(item.rank || index + 1);
+            const name = item.profile?.name || item.profile?.username || item.userId;
+            const avatar = item.profile?.profileImage || null;
+            const trophyColor = rank === 1 ? GOLD : rank === 2 ? SILVER : rank === 3 ? BRONZE : null;
+            return (
+              <View style={styles.storyWrap}>
+                <View style={[styles.avatarShadow, rank === 1 ? styles.firstGlow : null]}>
+                  {avatar ? (
+                    <Image source={{ uri: avatar }} style={styles.avatar} />
+                  ) : (
+                    <View style={styles.avatarFallback}><Text style={styles.avatarLetter}>{(name || "U")[0]}</Text></View>
+                  )}
+                  {rank <= 3 ? (
+                    <View style={[styles.trophyBadge, { backgroundColor: trophyColor }]}>
+                      <Ionicons name="trophy" size={10} color="#fff" />
+                    </View>
+                  ) : null}
+                </View>
+                <Text style={styles.rank}>#{rank}</Text>
+                <Text numberOfLines={1} style={styles.storyName}>{name}</Text>
+              </View>
+            );
+          }}
+        />
 
-    return (
-      <View style={{ width: ROUND_CARD_W, height: ROUND_CARD_H, marginRight: SPACING }}>
-        <View style={styles.roundCard}>
-          <View style={styles.roundHeader}>
-            <View style={{ flex: 1 }}>
-              <Text style={styles.roundName} numberOfLines={2}>{item.name || item.id}</Text>
-              <Text style={styles.roundMeta}>{typeLabel} • {status}</Text>
-              <Text style={styles.roundTime}>{fmtDate(item.startTimestamp)} — {fmtDate(item.endTimestamp)}</Text>
-            </View>
-
-            <View style={{ marginLeft: 10, alignItems: "flex-end" }}>
-              <TouchableOpacity style={[styles.typePill, status === "active" ? styles.typeActive : styles.typeMuted]}>
-                <Text style={[styles.typePillText, status === "active" ? styles.typePillTextActive : null]}>{status.toUpperCase()}</Text>
+        {/* SECTION 2: PACKAGE CARDS */}
+        <View style={styles.sectionHeader}><Text style={styles.sectionTitle}>Company Level Packages</Text></View>
+        <FlatList
+          data={packages}
+          horizontal
+          keyExtractor={(p) => p.id}
+          showsHorizontalScrollIndicator={false}
+          contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 14 }}
+          ItemSeparatorComponent={() => <View style={{ width: 12 }} />}
+          renderItem={({ item }) => {
+            const icon =
+              item.type === "competitive"
+                ? "trophy-outline"
+                : item.type === "practice"
+                ? "book-open-page-variant-outline"
+                : item.type === "entrance"
+                ? "school-outline"
+                : "star-outline";
+            return (
+              <TouchableOpacity
+                style={styles.packageCard}
+                activeOpacity={0.9}
+                onPress={() =>
+                  router.push({
+                    pathname: "/packageSubjects",
+                    params: { packageId: item.id, packageName: item.name, studentGrade: studentGrade || "" },
+                  })
+                }
+              >
+                <MaterialCommunityIcons name={icon} size={24} color={PRIMARY} />
+                <Text style={styles.packageTitle}>{item.name}</Text>
+                <Text style={styles.packageSubtitle}>{item.subtitle}</Text>
+                <Text numberOfLines={2} style={styles.packageDesc}>{item.description}</Text>
+                <Text style={styles.packageMeta}>{item.subjectCount || 0} subjects</Text>
               </TouchableOpacity>
-            </View>
-          </View>
+            );
+          }}
+        />
 
-          <FlatList
-            data={exams}
-            horizontal
-            showsHorizontalScrollIndicator={false}
-            keyExtractor={(e) => e.id}
-            contentContainerStyle={{ paddingTop: 12 }}
-            renderItem={({ item: e }) => (
-              <View style={styles.examChip}>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.examTitle}>{(e.subject || e.id).toUpperCase()}</Text>
-                  <Text style={styles.examSub}>{e.chapter} • Grade {String(e.grade || "").replace("grade", "")}</Text>
-                </View>
-                <TouchableOpacity
-                  style={[styles.examAction, e.scoringEnabled ? styles.examActionPrimary : styles.examActionMuted]}
-                  onPress={() => router.push({ pathname: "/exam/rules", params: { roundId: item.id, examId: e.id } })}
-                >
-                  <Text style={styles.examActionText}>{e.scoringEnabled ? "Enter" : "Practice"}</Text>
-                </TouchableOpacity>
-              </View>
-            )}
-          />
+        {/* SECTION 3: SCHOOL PLACEHOLDER */}
+        <View style={styles.sectionHeader}><Text style={styles.sectionTitle}>School Level Exams</Text></View>
+        <View style={styles.schoolCard}>
+          <Text style={styles.schoolComing}>School activities coming soon</Text>
         </View>
       </View>
+    ),
+    [leaders, packages, router, studentGrade]
+  );
+
+  if (loading) {
+    return (
+      <SafeAreaView style={[styles.screen, styles.center]}>
+        <ActivityIndicator color={PRIMARY} />
+      </SafeAreaView>
     );
   }
 
   return (
-    <SafeAreaView style={styles.container}>
-      <ScrollView contentContainerStyle={{ paddingBottom: 36 }}>
-        {/* Leaderboard */}
-        <View style={styles.header}>
-          <View>
-            <Text style={styles.title}>Top 5</Text>
-            <Text style={styles.subtitle}>Top performers for your grade</Text>
-          </View>
-          <TouchableOpacity style={styles.cta} onPress={() => router.push("/exam/leaderboard")}>
-            <Ionicons name="trophy" size={16} color="#fff" />
-            <Text style={styles.ctaText}>See all</Text>
-          </TouchableOpacity>
-        </View>
-
-        {loadingLeaders ? (
-          <View style={styles.loadingArea}><ActivityIndicator size="large" color={PRIMARY} /></View>
-        ) : leaders.length === 0 ? (
-          <View style={styles.emptyArea}><Text style={styles.emptyText}>No leaderboard data</Text></View>
-        ) : (
-          <>
-            <FlatList
-              ref={leaderRef}
-              data={leaders}
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              keyExtractor={(i) => i.userId}
-              renderItem={({ item, index }) => <LeaderCard item={item} index={index} />}
-              contentContainerStyle={{ paddingHorizontal: leaderPadding }}
-              snapToInterval={LEADER_CARD_W + SPACING}
-              decelerationRate={Platform.OS === "ios" ? 0.92 : 0.98}
-              onMomentumScrollEnd={onLeaderScrollEnd}
-            />
-            <View style={styles.dotsRow}>
-              {leaders.map((_, i) => (
-                <View key={i} style={[styles.dot, i === leaderIndex ? styles.dotActive : null]} />
-              ))}
-            </View>
-          </>
-        )}
-
-        {/* Company rounds (horizontal) */}
-        <View style={styles.sectionHeader}>
-          <Text style={styles.sectionTitle}>Company rounds</Text>
-          <Text style={styles.sectionSubtitle}>Competitive and practice rounds</Text>
-        </View>
-
-        {loadingRounds ? (
-          <View style={{ padding: 18, alignItems: "center" }}><ActivityIndicator size="small" color={PRIMARY} /></View>
-        ) : rounds.length === 0 ? (
-          <View style={{ padding: 18 }}><Text style={{ color: MUTED }}>No rounds found</Text></View>
-        ) : (
-          <>
-            <FlatList
-              ref={roundsRef}
-              data={rounds}
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              keyExtractor={(r) => r.id}
-              renderItem={({ item }) => <RoundCard item={item} />}
-              contentContainerStyle={{ paddingHorizontal: roundPadding }}
-              snapToInterval={ROUND_CARD_W + SPACING}
-              decelerationRate={Platform.OS === "ios" ? 0.92 : 0.98}
-              onMomentumScrollEnd={onRoundScrollEnd}
-            />
-            <View style={styles.dotsRow}>
-              {rounds.map((_, i) => (
-                <View key={i} style={[styles.dot, i === roundIndex ? styles.dotActive : null]} />
-              ))}
-            </View>
-          </>
-        )}
-
-        {/* Optional: school-level area (kept minimal and simple) */}
-        <View style={styles.sectionHeader}>
-          <Text style={styles.sectionTitle}>School assignments</Text>
-          <Text style={styles.sectionSubtitle}>From your teachers (classwork, quizzes)</Text>
-        </View>
-
-        <View style={{ paddingHorizontal: 18, paddingTop: 8 }}>
-          <Text style={{ color: MUTED }}>School-level assignments appear here when available.</Text>
-        </View>
-      </ScrollView>
+    <SafeAreaView style={styles.screen}>
+      <FlatList
+        data={[]}
+        renderItem={null}
+        ListHeaderComponent={topSection}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={PRIMARY} />}
+      />
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: "#FBFCFF" },
+  screen: { flex: 1, backgroundColor: BG },
+  center: { alignItems: "center", justifyContent: "center" },
 
-  header: { paddingHorizontal: 18, paddingTop: 18, paddingBottom: 8, flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
-  title: { fontSize: 22, fontWeight: "900", color: "#0B2540" },
-  subtitle: { color: MUTED, marginTop: 4, fontSize: 13 },
-
-  cta: { flexDirection: "row", alignItems: "center", backgroundColor: PRIMARY, paddingHorizontal: 12, paddingVertical: 8, borderRadius: 12 },
-  ctaText: { color: "#fff", marginLeft: 8, fontWeight: "800" },
-
-  loadingArea: { height: LEADER_CARD_H + 20, alignItems: "center", justifyContent: "center" },
-  emptyArea: { paddingVertical: 18, alignItems: "center" },
-  emptyText: { color: MUTED },
-
-  leaderCard: {
-    borderRadius: 14,
-    padding: 14,
-    backgroundColor: "#fff",
-    borderWidth: 1,
-    borderColor: "#EEF4FF",
-    justifyContent: "center",
-    height: LEADER_CARD_H,
-  },
-  leaderCardTop: { shadowColor: "#000", shadowOpacity: 0.06, shadowRadius: 12, elevation: 6 },
-  leaderCardNormal: { shadowColor: "#000", shadowOpacity: 0.03, shadowRadius: 6, elevation: 3 },
-
-  leaderRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
-  leaderLeft: { flexDirection: "row", alignItems: "center", flex: 1 },
-  rankCircle: { width: 46, height: 46, borderRadius: 23, borderWidth: 2, alignItems: "center", justifyContent: "center" },
-  rankCircleTop: { width: 56, height: 56, borderRadius: 28 },
-  rankText: { fontWeight: "900", fontSize: 16 },
-  rankTextTop: { fontSize: 20 },
-
-  leaderName: { fontWeight: "800", fontSize: 16, color: "#0B2540" },
-  leaderNameTop: { fontSize: 18 },
-  leaderSub: { color: MUTED, marginTop: 4, fontSize: 12 },
-
-  leaderRight: { alignItems: "center", marginLeft: 12 },
-  leaderAvatar: { width: 58, height: 58, borderRadius: 12 },
-  leaderAvatarTop: { width: 78, height: 78, borderRadius: 14 },
-  avatarPlaceholderSmall: { width: 58, height: 58, borderRadius: 12, backgroundColor: PRIMARY, alignItems: "center", justifyContent: "center" },
-  avatarPlaceholderTextSmall: { color: "#fff", fontWeight: "900", fontSize: 20 },
-
-  pointsLabel: { color: MUTED, fontSize: 12 },
-  pointsValue: { fontWeight: "900", fontSize: 18, color: "#0B2540" },
-  pointsValueTop: { fontSize: 22 },
-
-  trophyWrap: { backgroundColor: "rgba(242,201,76,0.12)", padding: 8, borderRadius: 10 },
-
-  // Dots
-  dotsRow: { flexDirection: "row", alignItems: "center", justifyContent: "center", marginTop: 12, marginBottom: 6 },
-  dot: { width: 8, height: 8, borderRadius: 4, backgroundColor: "#D9E6FF", opacity: 0.9, marginHorizontal: 4 },
-  dotActive: { width: 22, height: 8, borderRadius: 10, backgroundColor: PRIMARY },
-
-  // Rounds
-  sectionHeader: { paddingHorizontal: 18, paddingTop: 18, paddingBottom: 8 },
-  sectionTitle: { fontSize: 18, fontWeight: "900", color: "#0B2540" },
-  sectionSubtitle: { color: MUTED, marginTop: 4, fontSize: 13 },
-
-  roundCard: { borderRadius: 12, padding: 14, backgroundColor: "#fff", borderWidth: 1, borderColor: "#EEF4FF", height: ROUND_CARD_H },
-  roundHeader: { flexDirection: "row", alignItems: "flex-start" },
-  roundName: { fontWeight: "800", fontSize: 15, color: "#12263B" },
-  roundMeta: { color: MUTED, marginTop: 6, fontSize: 12 },
-  roundTime: { color: MUTED, marginTop: 6, fontSize: 12 },
-
-  typePill: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 10 },
-  typeActive: { backgroundColor: "rgba(3,201,90,0.08)" },
-  typeMuted: { backgroundColor: "rgba(107,120,168,0.06)" },
-  typePillText: { fontWeight: "800" },
-  typePillTextActive: { color: "#03C95A" },
-
-  // exam chip inside round card
-  examChip: {
-    minWidth: 220,
-    maxWidth: 280,
-    paddingVertical: 10,
-    paddingHorizontal: 12,
-    borderRadius: 12,
-    backgroundColor: "#F8FAFF",
-    marginRight: 10,
+  header: {
+    paddingHorizontal: 16,
+    paddingTop: 14,
+    paddingBottom: 8,
     flexDirection: "row",
+    justifyContent: "space-between",
     alignItems: "center",
   },
-  examTitle: { fontWeight: "800", color: "#0B2540" },
-  examSub: { color: MUTED, fontSize: 12, marginTop: 4 },
-  examAction: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8 },
-  examActionPrimary: { backgroundColor: PRIMARY },
-  examActionMuted: { backgroundColor: "#DDE8FF" },
-  examActionText: { color: "#fff", fontWeight: "800" },
+  title: { fontSize: 24, fontWeight: "900", color: TEXT },
+  subtitle: { marginTop: 4, color: MUTED, fontSize: 13 },
 
-  enterBtn: { marginTop: 8, backgroundColor: PRIMARY, paddingHorizontal: 12, paddingVertical: 8, borderRadius: 10 },
-  enterBtnText: { color: "#fff", fontWeight: "800" },
+  leaderBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: PRIMARY,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 12,
+  },
+  leaderBtnText: { color: "#fff", marginLeft: 6, fontWeight: "800", fontSize: 12 },
+
+  sectionHeader: { paddingHorizontal: 16, paddingTop: 14, paddingBottom: 8 },
+  sectionTitle: { fontSize: 18, fontWeight: "900", color: TEXT },
+
+  storyWrap: { width: STORY_AVATAR_SIZE + 16, alignItems: "center" },
+  avatarShadow: {
+    width: STORY_AVATAR_SIZE,
+    height: STORY_AVATAR_SIZE,
+    borderRadius: STORY_AVATAR_SIZE / 2,
+    shadowColor: "#000",
+    shadowOpacity: 0.1,
+    shadowRadius: 8,
+    elevation: 4,
+  },
+  firstGlow: {
+    shadowColor: GOLD,
+    shadowOpacity: 0.45,
+    shadowRadius: 12,
+    elevation: 7,
+  },
+  avatar: { width: STORY_AVATAR_SIZE, height: STORY_AVATAR_SIZE, borderRadius: STORY_AVATAR_SIZE / 2 },
+  avatarFallback: {
+    width: STORY_AVATAR_SIZE,
+    height: STORY_AVATAR_SIZE,
+    borderRadius: STORY_AVATAR_SIZE / 2,
+    backgroundColor: PRIMARY,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  avatarLetter: { color: "#fff", fontWeight: "900", fontSize: 20 },
+  trophyBadge: {
+    position: "absolute",
+    top: -4,
+    right: -4,
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    borderWidth: 1.4,
+    borderColor: "#fff",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  rank: { marginTop: 6, color: PRIMARY, fontWeight: "900", fontSize: 12 },
+  storyName: { marginTop: 2, width: STORY_AVATAR_SIZE + 8, textAlign: "center", fontSize: 11, color: TEXT },
+
+  packageCard: {
+    width: CARD_W,
+    backgroundColor: "#fff",
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: "#EAF0FF",
+    padding: 14,
+    shadowColor: "#000",
+    shadowOpacity: 0.05,
+    shadowRadius: 8,
+    elevation: 3,
+  },
+  packageTitle: { marginTop: 8, fontSize: 17, fontWeight: "900", color: TEXT },
+  packageSubtitle: { marginTop: 4, fontSize: 12, color: PRIMARY, fontWeight: "700" },
+  packageDesc: { marginTop: 6, color: MUTED, lineHeight: 18, fontSize: 12 },
+  packageMeta: { marginTop: 10, color: TEXT, fontWeight: "800", fontSize: 12 },
+
+  schoolCard: {
+    marginHorizontal: 16,
+    marginBottom: 24,
+    backgroundColor: "#fff",
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: "#EAF0FF",
+    padding: 16,
+    shadowColor: "#000",
+    shadowOpacity: 0.04,
+    shadowRadius: 8,
+    elevation: 2,
+  },
+  schoolComing: { color: MUTED, fontWeight: "700" },
 });
