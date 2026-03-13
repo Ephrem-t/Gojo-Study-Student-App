@@ -11,6 +11,8 @@ import {
   Dimensions,
   Alert,
   Animated,
+  Modal,
+  Pressable,
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import AsyncStorage from "@react-native-async-storage/async-storage";
@@ -28,12 +30,13 @@ import {
   runTransaction,
 } from "firebase/database";
 import { database } from "../../constants/firebaseConfig";
-import { queryUserByUsernameInSchool, queryUserByChildInSchool } from "../lib/userHelpers"; // <<< school-aware helpers
+import { queryUserByUsernameInSchool, queryUserByChildInSchool } from "../lib/userHelpers";
 
 /**
  * Home feed with pagination ("load more") for older posts.
- * - Only shows posts where post.target is "all" or "students" (or missing).
- * - Reads Posts from Platform1/Schools/{schoolKey}/Posts when schoolKey is available.
+ * Added:
+ * 1) Student-target filter uses targetRole: only "all" or "student" (or missing => all)
+ * 2) Image tap opens full-screen viewer
  */
 
 const SCREEN_WIDTH = Dimensions.get("window").width;
@@ -59,22 +62,25 @@ function timeAgo(iso) {
 }
 
 export default function HomeScreen() {
-  const [postsLatest, setPostsLatest] = useState([]); // newest first
-  const [postsOlder, setPostsOlder] = useState([]); // older pages appended after latest; oldest at end
+  const [postsLatest, setPostsLatest] = useState([]);
+  const [postsOlder, setPostsOlder] = useState([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [hasMore, setHasMore] = useState(true);
   const [userId, setUserId] = useState(null);
 
+  // large image viewer state
+  const [viewerVisible, setViewerVisible] = useState(false);
+  const [viewerImage, setViewerImage] = useState(null);
+
   const adminCacheRef = useRef({});
-  const postsQueryRef = useRef(null); // keep query ref for cleanup
+  const postsQueryRef = useRef(null);
 
   const loadUserContext = useCallback(async () => {
     const uid = await AsyncStorage.getItem("userId");
     setUserId(uid);
 
-    // background: refresh cached profileImage for header
     try {
       const userNodeKey = await AsyncStorage.getItem("userNodeKey");
       const schoolKey = await AsyncStorage.getItem("schoolKey");
@@ -83,7 +89,6 @@ export default function HomeScreen() {
         userSnap = await get(ref(database, `Platform1/Schools/${schoolKey}/Users/${userNodeKey}`));
       }
       if ((!userSnap || !userSnap.exists()) && userNodeKey) {
-        // fallback to root Users
         userSnap = await get(ref(database, `Users/${userNodeKey}`));
       }
       if (userSnap && userSnap.exists()) {
@@ -93,30 +98,29 @@ export default function HomeScreen() {
           Image.prefetch(u.profileImage).catch(() => {});
         }
       }
-    } catch {
-      // ignore
-    }
+    } catch {}
 
     return uid;
   }, []);
 
-  const combinedPosts = useMemo(() => {
-    return [...postsLatest, ...postsOlder];
-  }, [postsLatest, postsOlder]);
+  const combinedPosts = useMemo(() => [...postsLatest, ...postsOlder], [postsLatest, postsOlder]);
 
-  const updatePostInState = (postId, updater) => {
-    setPostsLatest((prev) => prev.map((p) => (p.postId === postId ? updater(p) : p)));
-    setPostsOlder((prev) => prev.map((p) => (p.postId === postId ? updater(p) : p)));
-  };
-
-  // helper: determine posts DB path based on saved schoolKey
   const postsRefForSchool = async () => {
     const sk = await AsyncStorage.getItem("schoolKey");
     if (sk) return ref(database, `Platform1/Schools/${sk}/Posts`);
     return ref(database, "Posts");
   };
 
-  // main realtime listener for newest page
+  // helper: targetRole filtering
+  const isStudentVisiblePost = (data) => {
+    // your new schema uses targetRole
+    const raw = data?.targetRole ?? data?.target ?? "all";
+    const role = String(raw).toLowerCase().trim();
+    // allow missing as all
+    if (!raw) return true;
+    return role === "all" || role === "student";
+  };
+
   useEffect(() => {
     let unsubscribe = null;
     let mounted = true;
@@ -124,7 +128,6 @@ export default function HomeScreen() {
     (async () => {
       const currentUserId = await loadUserContext();
       const postsRef = await postsRefForSchool();
-      // build limited query (newest PAGE_SIZE)
       const postsQuery = query(postsRef, orderByChild("time"), limitToLast(PAGE_SIZE));
       postsQueryRef.current = postsQuery;
 
@@ -140,42 +143,32 @@ export default function HomeScreen() {
             return;
           }
 
-          // gather, sort newest-first
           const tmp = [];
           snap.forEach((child) => {
             const val = child.val();
             tmp.push({ postId: val.postId || child.key, data: val });
           });
+
           tmp.sort((a, b) => {
             const ta = a.data.time ? new Date(a.data.time).getTime() : 0;
             const tb = b.data.time ? new Date(b.data.time).getTime() : 0;
             return tb - ta;
           });
 
-          // FILTER: only keep posts where target is missing, "all" or "students"
-          const filteredTmp = tmp.filter((p) => {
-            const t = (p.data && p.data.target) || "";
-            const tNorm = String(t).toLowerCase();
-            return !t || tNorm === "all" || tNorm === "students";
-          });
+          // FEATURE #1: targetRole filter for student
+          const filteredTmp = tmp.filter((p) => isStudentVisiblePost(p.data));
 
-          // admin ids needed (unique)
           const adminIds = Array.from(new Set(filteredTmp.map((p) => p.data.adminId).filter(Boolean)));
-
-          // determine schoolKey saved (so we can pass explicit to helper)
           const schoolKey = await AsyncStorage.getItem("schoolKey");
 
-          // fetch admin info only for required admins (cache results) using school-aware queries
           await Promise.all(
             adminIds.map(async (aid) => {
               if (adminCacheRef.current[aid]) return;
               try {
-                // try school-aware username query first
                 let snapUser = null;
                 try {
                   snapUser = await queryUserByUsernameInSchool(aid, schoolKey);
-                } catch (err) {
-                  // if the RTDB rules lack .indexOn, fallback below
+                } catch {
                   snapUser = null;
                 }
 
@@ -187,7 +180,6 @@ export default function HomeScreen() {
                   return;
                 }
 
-                // fallback: search by userId (school-aware) -> queryUserByChildInSchool
                 try {
                   const snapByUserId = await queryUserByChildInSchool("userId", aid, schoolKey);
                   if (snapByUserId && snapByUserId.exists()) {
@@ -197,11 +189,8 @@ export default function HomeScreen() {
                     });
                     return;
                   }
-                } catch (err2) {
-                  // ignore and fallback to global Users lookup below
-                }
+                } catch {}
 
-                // final fallback: try global Users path (root). This avoids hard failures if school indexing not present.
                 try {
                   const qGlobal = query(ref(database, "Users"), orderByChild("username"), equalTo(aid));
                   const sGlobal = await get(qGlobal);
@@ -212,7 +201,6 @@ export default function HomeScreen() {
                     });
                     return;
                   }
-                  // fallback to userId global
                   const qGlobal2 = query(ref(database, "Users"), orderByChild("userId"), equalTo(aid));
                   const sGlobal2 = await get(qGlobal2);
                   if (sGlobal2.exists()) {
@@ -222,12 +210,8 @@ export default function HomeScreen() {
                     });
                     return;
                   }
-                } catch (finalErr) {
-                  // give up on this admin
-                }
-              } catch {
-                // ignore individual admin failures
-              }
+                } catch {}
+              } catch {}
             })
           );
 
@@ -235,19 +219,15 @@ export default function HomeScreen() {
             const likesNode = p.data.likes || {};
             const seenNode = p.data.seenBy || {};
 
-            // mark seen best-effort
             if (currentUserId && !seenNode[currentUserId]) {
-              const updates = {};
-              // posts path may be under school posts or root posts; compute correct path
               (async () => {
                 try {
                   const sk = await AsyncStorage.getItem("schoolKey");
                   const postPath = sk ? `Platform1/Schools/${sk}/Posts/${p.postId}` : `Posts/${p.postId}`;
+                  const updates = {};
                   updates[`${postPath}/seenBy/${currentUserId}`] = true;
                   update(ref(database), updates).catch(() => {});
-                } catch {
-                  // ignore
-                }
+                } catch {}
               })();
               seenNode[currentUserId] = true;
             }
@@ -256,7 +236,6 @@ export default function HomeScreen() {
             return { postId: p.postId, data: p.data, admin, likesMap: likesNode, seenMap: seenNode };
           });
 
-          // prefetch images
           enriched.forEach((e) => {
             if (e.data.postUrl) Image.prefetch(e.data.postUrl).catch(() => {});
             if (e.admin && e.admin.profileImage) Image.prefetch(e.admin.profileImage).catch(() => {});
@@ -292,7 +271,6 @@ export default function HomeScreen() {
     setTimeout(() => setRefreshing(false), 700);
   };
 
-  // loadMore: same school-aware path + target filter + admin lookup logic
   const loadMore = async () => {
     if (loadingMore || !hasMore) return;
     setLoadingMore(true);
@@ -325,21 +303,17 @@ export default function HomeScreen() {
         const val = child.val();
         tmp.push({ postId: val.postId || child.key, data: val });
       });
+
       tmp.sort((a, b) => {
         const ta = a.data.time ? new Date(a.data.time).getTime() : 0;
         const tb = b.data.time ? new Date(b.data.time).getTime() : 0;
         return tb - ta;
       });
 
-      // drop overlap (oldest)
       const filteredTmp = tmp.filter((p) => p.postId !== oldest.postId);
 
-      // apply target filter for students
-      const filteredByTarget = filteredTmp.filter((p) => {
-        const t = (p.data && p.data.target) || "";
-        const tNorm = String(t).toLowerCase();
-        return !t || tNorm === "all" || tNorm === "students";
-      });
+      // FEATURE #1 filter for older pages too
+      const filteredByTarget = filteredTmp.filter((p) => isStudentVisiblePost(p.data));
 
       if (filteredByTarget.length === 0) {
         setHasMore(false);
@@ -347,7 +321,6 @@ export default function HomeScreen() {
         return;
       }
 
-      // admin lookups (same logic as above)
       const adminIds = Array.from(new Set(filteredByTarget.map((p) => p.data.adminId).filter(Boolean)));
       const schoolKey = await AsyncStorage.getItem("schoolKey");
 
@@ -378,11 +351,8 @@ export default function HomeScreen() {
                 });
                 return;
               }
-            } catch {
-              // ignore
-            }
+            } catch {}
 
-            // fallback to global Users
             try {
               const qGlobal = query(ref(database, "Users"), orderByChild("username"), equalTo(aid));
               const sGlobal = await get(qGlobal);
@@ -402,12 +372,8 @@ export default function HomeScreen() {
                 });
                 return;
               }
-            } catch {
-              // ignore
-            }
-          } catch {
-            // ignore per-admin failure
-          }
+            } catch {}
+          } catch {}
         })
       );
 
@@ -418,7 +384,6 @@ export default function HomeScreen() {
         return { postId: p.postId, data: p.data, admin, likesMap: likesNode, seenMap: seenNode };
       });
 
-      // prefetch images
       enrichedOlder.forEach((e) => {
         if (e.data.postUrl) Image.prefetch(e.data.postUrl).catch(() => {});
         if (e.admin && e.admin.profileImage) Image.prefetch(e.admin.profileImage).catch(() => {});
@@ -467,7 +432,6 @@ export default function HomeScreen() {
     if (found.which === "latest") setPostsLatest((prev) => prev.map((p) => (p.postId === postId ? optimisticUpdater(p) : p)));
     else setPostsOlder((prev) => prev.map((p) => (p.postId === postId ? optimisticUpdater(p) : p)));
 
-    // posts path might be under school or root; pick a ref (prefer school posts)
     try {
       const sk = await AsyncStorage.getItem("schoolKey");
       const postRef = sk ? ref(database, `Platform1/Schools/${sk}/Posts/${postId}`) : ref(database, `Posts/${postId}`);
@@ -487,7 +451,6 @@ export default function HomeScreen() {
       });
     } catch (err) {
       console.warn("runTransaction failed for like:", err);
-      // reload single post from DB fallback (try school path then root)
       try {
         const sk = await AsyncStorage.getItem("schoolKey");
         const pRef = sk ? ref(database, `Platform1/Schools/${sk}/Posts/${postId}`) : ref(database, `Posts/${postId}`);
@@ -498,9 +461,7 @@ export default function HomeScreen() {
           setPostsLatest((prev) => prev.map((p) => (p.postId === postId ? updated : p)));
           setPostsOlder((prev) => prev.map((p) => (p.postId === postId ? updated : p)));
         }
-      } catch {
-        // ignore
-      }
+      } catch {}
       Alert.alert("Error", "Unable to update like. Please try again.");
     }
   };
@@ -537,7 +498,12 @@ export default function HomeScreen() {
           </View>
         </View>
 
-        {imageUri ? <Image source={{ uri: imageUri }} style={styles.postImage} resizeMode="cover" /> : null}
+        {/* FEATURE #2: tap to open large view */}
+        {imageUri ? (
+          <TouchableOpacity activeOpacity={0.95} onPress={() => { setViewerImage(imageUri); setViewerVisible(true); }}>
+            <Image source={{ uri: imageUri }} style={styles.postImage} resizeMode="cover" />
+          </TouchableOpacity>
+        ) : null}
 
         <View style={styles.actionsRow}>
           <View style={styles.leftActions}>
@@ -606,18 +572,36 @@ export default function HomeScreen() {
   };
 
   return (
-    <FlatList
-      data={combinedPosts}
-      keyExtractor={(i) => i.postId}
-      renderItem={({ item }) => <PostCard item={item} />}
-      contentContainerStyle={styles.list}
-      refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={["#007AFB"]} />}
-      onEndReachedThreshold={0.6}
-      onEndReached={() => {
-        if (!loadingMore && hasMore) loadMore();
-      }}
-      ListFooterComponent={<ListFooter />}
-    />
+    <>
+      <FlatList
+        data={combinedPosts}
+        keyExtractor={(i) => i.postId}
+        renderItem={({ item }) => <PostCard item={item} />}
+        contentContainerStyle={styles.list}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={["#007AFB"]} />}
+        onEndReachedThreshold={0.6}
+        onEndReached={() => {
+          if (!loadingMore && hasMore) loadMore();
+        }}
+        ListFooterComponent={<ListFooter />}
+      />
+
+      {/* FEATURE #2: full-screen image modal */}
+      <Modal visible={viewerVisible} transparent animationType="fade" onRequestClose={() => setViewerVisible(false)}>
+        <View style={styles.viewerBg}>
+          <View style={styles.viewerTop}>
+            <TouchableOpacity style={styles.viewerClose} onPress={() => setViewerVisible(false)}>
+              <Ionicons name="close" size={26} color="#fff" />
+            </TouchableOpacity>
+          </View>
+          <Pressable style={{ flex: 1, width: "100%" }} onPress={() => setViewerVisible(false)}>
+            {viewerImage ? (
+              <Image source={{ uri: viewerImage }} style={styles.viewerImage} resizeMode="contain" />
+            ) : null}
+          </Pressable>
+        </View>
+      </Modal>
+    </>
   );
 }
 
@@ -672,4 +656,29 @@ const styles = StyleSheet.create({
   emptyFallbackIcon: { width: 120, height: 120, borderRadius: 60, backgroundColor: "#F6F8FF", alignItems: "center", justifyContent: "center", marginBottom: 12 },
   emptyTitle: { fontSize: 20, fontWeight: "700", color: "#222", marginBottom: 6 },
   emptySubtitle: { fontSize: 14, color: "#8B93B3", textAlign: "center" },
+
+  viewerBg: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.96)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  viewerTop: {
+    position: "absolute",
+    top: 45,
+    right: 14,
+    zIndex: 20,
+  },
+  viewerClose: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: "rgba(255,255,255,0.18)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  viewerImage: {
+    width: "100%",
+    height: "100%",
+  },
 });

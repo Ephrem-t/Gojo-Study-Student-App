@@ -1,4 +1,3 @@
-// app/chats.jsx
 import React, { useEffect, useState, useCallback, useRef } from "react";
 import {
   View,
@@ -22,15 +21,6 @@ import { useRouter } from "expo-router";
 import { setOpenedChat } from "./lib/chatStore";
 import { useFocusEffect } from "@react-navigation/native";
 import { getUserVal } from "./lib/userHelpers";
-
-/**
- * app/chats.jsx
- *
- * Changes:
- * - Uses school-aware getUserVal(userNodeKey) to resolve user profiles.
- * - Reads/writes Chats under Platform1/Schools/{schoolKey}/Chats when schoolKey is present in AsyncStorage.
- * - Keeps cached "chatsCache" behaviour.
- */
 
 const PRIMARY = "#007AFB";
 const MUTED = "#6B78A8";
@@ -66,7 +56,6 @@ export default function ChatsScreen() {
   const [refreshing, setRefreshing] = useState(false);
   const [filter, setFilter] = useState("All");
   const [contacts, setContacts] = useState([]);
-  const [currentUserNodeKey, setCurrentUserNodeKey] = useState(null);
   const [currentUserId, setCurrentUserId] = useState(null);
 
   const cacheRef = useRef({
@@ -78,8 +67,6 @@ export default function ChatsScreen() {
 
   const makeDeterministicChatId = (a, b) => `${a}_${b}`;
 
-  // Return a database ref that is prefixed by Platform1/Schools/{schoolKey}/ if schoolKey exists.
-  // Usage: const r = await getDbRef("Chats"); -> ref object
   async function getDbRef(subPath) {
     const sk = (await AsyncStorage.getItem("schoolKey")) || null;
     if (sk) return ref(database, `Platform1/Schools/${sk}/${subPath}`);
@@ -89,19 +76,18 @@ export default function ChatsScreen() {
   const resolveCurrentUserId = useCallback(async () => {
     let uId = await AsyncStorage.getItem("userId");
     if (uId) return uId;
+
     const nodeKey =
       (await AsyncStorage.getItem("userNodeKey")) ||
       (await AsyncStorage.getItem("studentNodeKey")) ||
       (await AsyncStorage.getItem("studentId")) ||
       null;
     if (!nodeKey) return null;
-    // use school-aware helper
+
     try {
       const u = await getUserVal(nodeKey);
       if (u) return u.userId || nodeKey;
-    } catch (e) {
-      // fallback
-    }
+    } catch {}
     return nodeKey;
   }, []);
 
@@ -113,318 +99,288 @@ export default function ChatsScreen() {
         if (Array.isArray(parsed) && parsed.length > 0) {
           setContacts(parsed);
           setLoadingInitial(false);
-          const fetchedAt = Number(await AsyncStorage.getItem("chatsCacheFetchedAt") || 0);
+          const fetchedAt = Number((await AsyncStorage.getItem("chatsCacheFetchedAt")) || 0);
           lastFetchedAtRef.current = fetchedAt;
           return true;
         }
       }
-    } catch (e) {}
+    } catch {}
     return false;
   };
 
-  // Core loader with merge: server results + cache (keep newest lastTime)
-  const loadData = useCallback(
-    async ({ background = false } = {}) => {
-      if (!background) setLoadingInitial(true);
+  const loadData = useCallback(async ({ background = false } = {}) => {
+    if (!background) setLoadingInitial(true);
+    try {
+      const studentNodeKey =
+        (await AsyncStorage.getItem("studentNodeKey")) ||
+        (await AsyncStorage.getItem("studentId")) ||
+        null;
+
+      const resolvedUserId = await resolveCurrentUserId();
+      setCurrentUserId(resolvedUserId || null);
+
+      let studentGrade = null;
+      let studentSection = null;
+      let studentParentsMap = {};
       try {
-        const nodeKey =
-          (await AsyncStorage.getItem("userNodeKey")) ||
-          (await AsyncStorage.getItem("studentNodeKey")) ||
-          (await AsyncStorage.getItem("studentId")) ||
-          null;
-        setCurrentUserNodeKey(nodeKey);
+        if (studentNodeKey) {
+          const snap = await get(await getDbRef(`Students/${studentNodeKey}`));
+          if (snap.exists()) {
+            const s = snap.val() || {};
+            studentGrade = s?.grade ? String(s.grade) : null;
+            studentSection = s?.section ? String(s.section) : null;
+            studentParentsMap = s?.parents || s?.parentGuardianInformation?.parents || {};
+          }
+        }
+      } catch (e) {
+        console.warn("students fetch failed", e);
+      }
 
-        const resolvedUserId = await resolveCurrentUserId();
-        setCurrentUserId(resolvedUserId || null);
-
-        // Resolve student's grade/section
-        let studentGrade = null;
-        let studentSection = null;
-        let studentNodeKey = null;
+      // teachers from grade/section course assignment
+      if (cacheRef.current.studentNodeKey !== studentNodeKey || !cacheRef.current.teacherIdsForStudent) {
+        const courseKeys = new Set();
         try {
-          studentNodeKey =
-            (await AsyncStorage.getItem("studentNodeKey")) ||
-            (await AsyncStorage.getItem("studentId")) ||
-            null;
-          if (studentNodeKey) {
-            const snap = await get(await getDbRef(`Students/${studentNodeKey}`));
-            if (snap.exists()) {
-              const s = snap.val();
-              studentGrade = s.grade ? String(s.grade) : null;
-              studentSection = s.section ? String(s.section) : null;
-            }
-          }
-        } catch (e) {
-          console.warn("students fetch failed", e);
-        }
-
-        // If cached student differs, recompute teacher assignment caches
-        if (cacheRef.current.studentNodeKey !== studentNodeKey || !cacheRef.current.teacherIdsForStudent) {
-          // Courses -> courseKeys
-          const courseKeys = new Set();
-          try {
-            const coursesSnap = await get(await getDbRef("Courses"));
-            if (coursesSnap.exists() && studentGrade && studentSection) {
-              coursesSnap.forEach((c) => {
-                const val = c.val();
-                const key = c.key;
-                if (String(val.grade ?? "") === String(studentGrade) && String(val.section ?? "") === String(studentSection)) {
-                  courseKeys.add(key);
-                }
-              });
-            }
-          } catch (e) {
-            console.warn("Courses fetch failed", e);
-          }
-
-          // TeacherAssignments -> teacherIdsForStudent
-          const teacherIdsForStudent = new Set();
-          try {
-            const taSnap = await get(await getDbRef("TeacherAssignments"));
-            if (taSnap.exists() && courseKeys.size > 0) {
-              taSnap.forEach((child) => {
-                const val = child.val();
-                if (val && val.courseId && courseKeys.has(val.courseId) && val.teacherId) {
-                  teacherIdsForStudent.add(val.teacherId);
-                }
-              });
-            }
-          } catch (e) {
-            console.warn("TeacherAssignments fetch failed", e);
-          }
-
-          // Teachers node -> teacherId -> userNodeKey
-          const teacherNodeKeyMap = {};
-          try {
-            const teachersSnap = await get(await getDbRef("Teachers"));
-            if (teachersSnap.exists()) {
-              teachersSnap.forEach((child) => {
-                const v = child.val();
-                const teacherId = v?.teacherId;
-                const userNode = v?.userId;
-                if (teacherId && userNode) teacherNodeKeyMap[teacherId] = userNode;
-              });
-            }
-          } catch (e) {
-            console.warn("Teachers fetch failed", e);
-          }
-
-          cacheRef.current.studentNodeKey = studentNodeKey;
-          cacheRef.current.teacherIdsForStudent = teacherIdsForStudent;
-          cacheRef.current.teacherNodeKeys = teacherNodeKeyMap;
-        }
-
-        // Build sets of teacher user node keys and admin keys
-        const teacherUserNodeKeys = new Set();
-        for (const tid of Array.from(cacheRef.current.teacherIdsForStudent || [])) {
-          const nodek = cacheRef.current.teacherNodeKeys?.[tid];
-          if (nodek) teacherUserNodeKeys.add(nodek);
-        }
-
-        const adminUserNodeKeys = new Set();
-        try {
-          const saSnap = await get(await getDbRef("School_Admins"));
-          if (saSnap.exists()) {
-            saSnap.forEach((child) => {
-              const v = child.val();
-              if (v && v.userId) adminUserNodeKeys.add(v.userId);
-            });
-          }
-        } catch (e) {
-          console.warn("School_Admins fetch failed", e);
-        }
-
-        // Load Users for union of node keys using school-aware getUserVal
-        const userNodeKeysToLoad = new Set([...Array.from(teacherUserNodeKeys), ...Array.from(adminUserNodeKeys)]);
-        const userProfiles = {};
-        await Promise.all(
-          Array.from(userNodeKeysToLoad).map(async (nodeKey) => {
-            try {
-              const val = await getUserVal(nodeKey);
-              if (val) userProfiles[nodeKey] = val;
-            } catch (e) {
-              // ignore individual failures
-            }
-          })
-        );
-
-        // Build contacts map
-        const contactsMap = new Map();
-        for (const nodeKey of Array.from(teacherUserNodeKeys)) {
-          const profile = userProfiles[nodeKey] || null;
-          contactsMap.set(nodeKey, {
-            nodeKey,
-            userId: profile?.userId || nodeKey,
-            name: profile?.name || profile?.username || "Teacher",
-            role: "Teacher",
-            profileImage: profile?.profileImage || null,
-            type: "teacher",
-            chatId: null,
-            lastMessage: null,
-            lastTime: null,
-            lastSenderId: null,
-            lastSeen: false,
-            unread: 0,
-          });
-        }
-        for (const nodeKey of Array.from(adminUserNodeKeys)) {
-          if (contactsMap.has(nodeKey)) continue;
-          const profile = userProfiles[nodeKey] || null;
-          contactsMap.set(nodeKey, {
-            nodeKey,
-            userId: profile?.userId || nodeKey,
-            name: profile?.name || profile?.username || "Admin",
-            role: "Management",
-            profileImage: profile?.profileImage || null,
-            type: "management",
-            chatId: null,
-            lastMessage: null,
-            lastTime: null,
-            lastSenderId: null,
-            lastSeen: false,
-            unread: 0,
-          });
-        }
-
-        // Merge Chats metadata and set lastSenderId/lastSeen if present
-        try {
-          const chatsSnap = await get(await getDbRef("Chats"));
-          if (chatsSnap.exists()) {
-            chatsSnap.forEach((child) => {
-              const chatKey = child.key;
-              const val = child.val();
-              const participants = val.participants || {};
-              const last = val.lastMessage || null;
-              const unreadObj = val.unread || {};
-
-              if (currentUserId && participants && participants[currentUserId]) {
-                const otherKeys = Object.keys(participants).filter((k) => k !== currentUserId);
-                if (otherKeys.length === 0) return;
-                const other = otherKeys[0];
-                for (const [k, contact] of contactsMap.entries()) {
-                  if (String(contact.userId) === String(other)) {
-                    const existing = contactsMap.get(k);
-                    existing.chatId = chatKey;
-                    existing.lastMessage = last?.text || existing.lastMessage;
-                    existing.lastTime = last?.timeStamp || existing.lastTime;
-                    existing.lastSenderId = last?.senderId ?? existing.lastSenderId;
-                    existing.lastSeen = typeof last?.seen === "boolean" ? last.seen : existing.lastSeen;
-                    const unreadCount = Number(unreadObj[currentUserId] ?? 0);
-                    const lastSender = last?.senderId ?? null;
-                    existing.unread = lastSender && String(lastSender) === String(currentUserId) ? 0 : unreadCount;
-                    contactsMap.set(k, existing);
-                  }
-                }
+          const coursesSnap = await get(await getDbRef("Courses"));
+          if (coursesSnap.exists() && studentGrade && studentSection) {
+            coursesSnap.forEach((c) => {
+              const val = c.val();
+              const key = c.key;
+              if (String(val?.grade ?? "") === String(studentGrade) && String(val?.section ?? "") === String(studentSection)) {
+                courseKeys.add(key);
               }
             });
           }
-        } catch (e) {
-          console.warn("Chats merge failed", e);
-        }
+        } catch {}
 
-        // Convert to array
-        const serverArr = Array.from(contactsMap.values()).map((c) => ({
-          key: c.nodeKey,
-          userId: c.userId,
-          name: c.name,
-          role: c.role,
-          profileImage: c.profileImage,
-          type: c.type,
-          chatId: c.chatId,
-          lastMessage: c.lastMessage,
-          lastTime: c.lastTime,
-          lastSenderId: c.lastSenderId,
-          lastSeen: c.lastSeen,
-          unread: c.unread || 0,
-        }));
-
-        // Merge with cache: prefer newer lastTime (cache or server) per contact and keep cache-only entries
-        const rawCache = await AsyncStorage.getItem("chatsCache");
-        const cache = rawCache ? JSON.parse(rawCache) : [];
-        const cacheByKey = new Map();
-        for (const c of cache) {
-          const k = String(c.key || c.userId || "");
-          cacheByKey.set(k, c);
-        }
-
-        const merged = [];
-        for (const s of serverArr) {
-          const k = String(s.key || s.userId || "");
-          const cached = cacheByKey.get(k);
-          if (cached) {
-            const cachedTs = Number(cached.lastTime || 0);
-            const serverTs = Number(s.lastTime || 0);
-            if (cachedTs > serverTs) {
-              merged.push({
-                ...s,
-                name: s.name || cached.name,
-                profileImage: s.profileImage || cached.profileImage,
-                lastMessage: cached.lastMessage,
-                lastTime: cached.lastTime,
-                lastSenderId: cached.lastSenderId ?? s.lastSenderId,
-                lastSeen: typeof cached.lastSeen === "boolean" ? cached.lastSeen : s.lastSeen,
-                unread: cached.unread ?? s.unread ?? 0,
-              });
-            } else {
-              merged.push(s);
-            }
-            cacheByKey.delete(k);
-          } else {
-            merged.push(s);
-          }
-        }
-
-        // Add remaining cached-only entries
-        for (const [k, cached] of cacheByKey.entries()) {
-          merged.push(cached);
-        }
-
-        // Sort
-        merged.sort((a, b) => {
-          if ((b.unread || 0) - (a.unread || 0) !== 0) return (b.unread || 0) - (a.unread || 0);
-          const ta = a.lastTime ? Number(a.lastTime) : 0;
-          const tb = b.lastTime ? Number(b.lastTime) : 0;
-          if (tb - ta !== 0) return tb - ta;
-          return (a.name || "").localeCompare(b.name || "");
-        });
-
-        setContacts(merged);
-
+        const teacherIdsForStudent = new Set();
         try {
-          await AsyncStorage.setItem("chatsCache", JSON.stringify(merged));
-          await AsyncStorage.setItem("chatsCacheFetchedAt", String(Date.now()));
-          lastFetchedAtRef.current = Date.now();
-        } catch (e) {
-          // ignore
-        }
-      } catch (err) {
-        console.warn("loadData error", err);
-      } finally {
-        if (!background) setLoadingInitial(false);
-        setRefreshing(false);
-      }
-    },
-    [currentUserId, resolveCurrentUserId]
-  );
+          const taSnap = await get(await getDbRef("TeacherAssignments"));
+          if (taSnap.exists() && courseKeys.size > 0) {
+            taSnap.forEach((child) => {
+              const val = child.val();
+              if (val?.courseId && courseKeys.has(val.courseId) && val?.teacherId) {
+                teacherIdsForStudent.add(val.teacherId);
+              }
+            });
+          }
+        } catch {}
 
-  useEffect(() => {
-    let mounted = true;
-    (async () => {
-      const hadCache = await loadCacheAndShow();
+        const teacherNodeKeyMap = {};
+        try {
+          const teachersSnap = await get(await getDbRef("Teachers"));
+          if (teachersSnap.exists()) {
+            teachersSnap.forEach((child) => {
+              const v = child.val();
+              const teacherId = v?.teacherId;
+              const userNode = v?.userId;
+              if (teacherId && userNode) teacherNodeKeyMap[teacherId] = userNode;
+            });
+          }
+        } catch {}
+
+        cacheRef.current.studentNodeKey = studentNodeKey;
+        cacheRef.current.teacherIdsForStudent = teacherIdsForStudent;
+        cacheRef.current.teacherNodeKeys = teacherNodeKeyMap;
+      }
+
+      const teacherUserNodeKeys = new Set();
+      for (const tid of Array.from(cacheRef.current.teacherIdsForStudent || [])) {
+        const nodek = cacheRef.current.teacherNodeKeys?.[tid];
+        if (nodek) teacherUserNodeKeys.add(nodek);
+      }
+
+      // parents linked to student
+      const parentUserNodeKeys = new Set();
       try {
-        const fetchedAtStr = await AsyncStorage.getItem("chatsCacheFetchedAt");
-        const fetchedAt = fetchedAtStr ? Number(fetchedAtStr) : 0;
-        const now = Date.now();
-        if (!fetchedAt || now - fetchedAt > debounceWindowMs) {
-          loadData({ background: true });
-        } else {
-          lastFetchedAtRef.current = fetchedAt;
+        if (studentParentsMap && typeof studentParentsMap === "object") {
+          Object.keys(studentParentsMap).forEach((pid) => {
+            const p = studentParentsMap[pid];
+            if (p?.userId) parentUserNodeKeys.add(String(p.userId));
+          });
+        }
+      } catch {}
+
+      // management sources: School_Admins + Registerers + Finances (NO HR)
+      const managementMap = new Map(); // userId -> role label
+
+      try {
+        const saSnap = await get(await getDbRef("School_Admins"));
+        if (saSnap.exists()) {
+          saSnap.forEach((child) => {
+            const v = child.val();
+            if (v?.userId) managementMap.set(String(v.userId), "Management");
+          });
+        }
+      } catch {}
+
+      try {
+        const regSnap = await get(await getDbRef("Registerers"));
+        if (regSnap.exists()) {
+          regSnap.forEach((child) => {
+            const v = child.val();
+            if (v?.userId) managementMap.set(String(v.userId), "Registerer");
+          });
+        }
+      } catch {}
+
+      try {
+        const finSnap = await get(await getDbRef("Finances"));
+        if (finSnap.exists()) {
+          finSnap.forEach((child) => {
+            const v = child.val();
+            if (v?.userId) managementMap.set(String(v.userId), "Finance");
+          });
+        }
+      } catch {}
+
+      const userNodeKeysToLoad = new Set([
+        ...Array.from(teacherUserNodeKeys),
+        ...Array.from(parentUserNodeKeys),
+        ...Array.from(managementMap.keys()),
+      ]);
+
+      const userProfiles = {};
+      await Promise.all(
+        Array.from(userNodeKeysToLoad).map(async (k) => {
+          try {
+            const val = await getUserVal(k);
+            if (val) userProfiles[k] = val;
+          } catch {}
+        })
+      );
+
+      // build contacts map
+      const contactsMap = new Map();
+
+      for (const nodeK of Array.from(teacherUserNodeKeys)) {
+        const p = userProfiles[nodeK] || null;
+        contactsMap.set(nodeK, {
+          key: nodeK,
+          userId: p?.userId || nodeK,
+          name: p?.name || p?.username || "Teacher",
+          role: "Teacher",
+          profileImage: p?.profileImage || null,
+          type: "teacher",
+          chatId: null,
+          lastMessage: null,
+          lastTime: null,
+          lastSenderId: null,
+          lastSeen: false,
+          unread: 0,
+        });
+      }
+
+      for (const nodeK of Array.from(parentUserNodeKeys)) {
+        const p = userProfiles[nodeK] || null;
+        if (!p) continue;
+        contactsMap.set(nodeK, {
+          key: nodeK,
+          userId: p?.userId || nodeK,
+          name: p?.name || p?.username || "Parent",
+          role: "Parent",
+          profileImage: p?.profileImage || null,
+          type: "parent",
+          chatId: null,
+          lastMessage: null,
+          lastTime: null,
+          lastSenderId: null,
+          lastSeen: false,
+          unread: 0,
+        });
+      }
+
+      for (const nodeK of Array.from(managementMap.keys())) {
+        if (contactsMap.has(nodeK)) continue;
+        const p = userProfiles[nodeK] || null;
+        const roleLabel = managementMap.get(nodeK) || "Management";
+
+        contactsMap.set(nodeK, {
+          key: nodeK,
+          userId: p?.userId || nodeK,
+          name: p?.name || p?.username || roleLabel,
+          role: roleLabel, // Registerer / Finance / Management
+          profileImage: p?.profileImage || null,
+          type: "management",
+          chatId: null,
+          lastMessage: null,
+          lastTime: null,
+          lastSenderId: null,
+          lastSeen: false,
+          unread: 0,
+        });
+      }
+
+      // merge chat last message + unread
+      try {
+        const chatsSnap = await get(await getDbRef("Chats"));
+        if (chatsSnap.exists()) {
+          chatsSnap.forEach((child) => {
+            const chatKey = child.key;
+            const val = child.val() || {};
+            const participants = val.participants || {};
+            const last = val.lastMessage || null;
+            const unreadObj = val.unread || {};
+
+            if (!resolvedUserId || !participants[resolvedUserId]) return;
+
+            const otherKeys = Object.keys(participants).filter((k) => String(k) !== String(resolvedUserId));
+            if (!otherKeys.length) return;
+            const other = otherKeys[0];
+
+            for (const [mapKey, c] of contactsMap.entries()) {
+              if (String(c.userId) === String(other) || String(mapKey) === String(other)) {
+                const next = { ...c };
+                next.chatId = chatKey;
+                next.lastMessage = last?.text || next.lastMessage;
+                next.lastTime = last?.timeStamp || next.lastTime;
+                next.lastSenderId = last?.senderId ?? next.lastSenderId;
+                next.lastSeen = typeof last?.seen === "boolean" ? last.seen : next.lastSeen;
+                const unreadCount = Number(unreadObj[resolvedUserId] ?? 0);
+                const lastSender = last?.senderId ?? null;
+                next.unread = lastSender && String(lastSender) === String(resolvedUserId) ? 0 : unreadCount;
+                contactsMap.set(mapKey, next);
+              }
+            }
+          });
         }
       } catch (e) {
+        console.warn("Chats merge failed", e);
+      }
+
+      const fresh = Array.from(contactsMap.values()).sort((a, b) => {
+        if ((b.unread || 0) !== (a.unread || 0)) return (b.unread || 0) - (a.unread || 0);
+        const ta = Number(a.lastTime || 0);
+        const tb = Number(b.lastTime || 0);
+        if (tb !== ta) return tb - ta;
+        return String(a.name || "").localeCompare(String(b.name || ""));
+      });
+
+      setContacts(fresh);
+
+      try {
+        await AsyncStorage.setItem("chatsCache", JSON.stringify(fresh));
+        await AsyncStorage.setItem("chatsCacheFetchedAt", String(Date.now()));
+        lastFetchedAtRef.current = Date.now();
+      } catch {}
+    } catch (err) {
+      console.warn("loadData error", err);
+    } finally {
+      if (!background) setLoadingInitial(false);
+      setRefreshing(false);
+    }
+  }, [resolveCurrentUserId]);
+
+  useEffect(() => {
+    (async () => {
+      await loadCacheAndShow();
+      try {
+        const fetchedAt = Number((await AsyncStorage.getItem("chatsCacheFetchedAt")) || 0);
+        if (!fetchedAt || Date.now() - fetchedAt > debounceWindowMs) loadData({ background: true });
+        else lastFetchedAtRef.current = fetchedAt;
+      } catch {
         loadData({ background: true });
       }
     })();
-    return () => { mounted = false; };
   }, [loadData]);
 
   useFocusEffect(
@@ -447,28 +403,26 @@ export default function ChatsScreen() {
     let contactUserId = contact.userId || "";
     if (!contactUserId) {
       try {
-        const profile = await getUserVal(contact.key);
-        if (profile) contactUserId = profile.userId || contact.key;
-        else contactUserId = contact.key;
-      } catch (e) {
+        const p = await getUserVal(contact.key);
+        contactUserId = p?.userId || contact.key;
+      } catch {
         contactUserId = contact.key;
       }
     }
 
     let myUserId = await AsyncStorage.getItem("userId");
     if (!myUserId) {
-      const nodeKey =
+      const nk =
         (await AsyncStorage.getItem("userNodeKey")) ||
         (await AsyncStorage.getItem("studentNodeKey")) ||
         (await AsyncStorage.getItem("studentId")) ||
         null;
-      if (nodeKey) {
+      if (nk) {
         try {
-          const u = await getUserVal(nodeKey);
-          if (u) myUserId = u.userId || nodeKey;
-          else myUserId = nodeKey;
-        } catch (e) {
-          myUserId = nodeKey;
+          const u = await getUserVal(nk);
+          myUserId = u?.userId || nk;
+        } catch {
+          myUserId = nk;
         }
       }
     }
@@ -508,61 +462,6 @@ export default function ChatsScreen() {
     return true;
   });
 
-  const hasAssignedTeachers = contacts.some((c) => c.type === "teacher");
-
-  if (loadingInitial && contacts.length === 0) {
-    return (
-      <SafeAreaView edges={["top", "bottom"]} style={styles.safe}>
-        <StatusBar barStyle="dark-content" backgroundColor="#ffffff" translucent={false} />
-        <View style={styles.center}>
-          <ActivityIndicator size="large" color={PRIMARY} />
-        </View>
-      </SafeAreaView>
-    );
-  }
-
-  if (filter === "Teachers" && !hasAssignedTeachers) {
-    return (
-      <SafeAreaView edges={["top", "bottom"]} style={styles.safe}>
-        <StatusBar barStyle="dark-content" backgroundColor="#ffffff" translucent={false} />
-        <View style={styles.container}>
-          <View style={styles.headerRow}>
-            <TouchableOpacity onPress={() => router.back()} style={styles.backButton}>
-              <Ionicons name="chevron-back" size={22} color="#222" />
-            </TouchableOpacity>
-
-            <Text style={styles.headerTitle}>Messages</Text>
-
-            <View style={{ width: 36 }} />
-          </View>
-
-          <View style={styles.filterContainer}>
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.filterScrollContent}>
-              {FILTERS.map((f) => (
-                <TouchableOpacity
-                  key={f}
-                  onPress={() => setFilter(f)}
-                  activeOpacity={0.85}
-                  style={[styles.filterPill, filter === f ? styles.filterPillActive : null]}
-                >
-                  <Text style={[styles.filterPillText, filter === f ? styles.filterPillTextActive : null]}>{f}</Text>
-                </TouchableOpacity>
-              ))}
-            </ScrollView>
-          </View>
-
-          <View style={styles.emptyWrap}>
-            <Text style={styles.emptyTitle}>No assigned teachers</Text>
-            <Text style={styles.emptySubtitle}>There are currently no teachers assigned to this student.</Text>
-            <Text style={[styles.emptySubtitle, { marginTop: 12 }]}>Contact the school administration if this looks incorrect.</Text>
-          </View>
-        </View>
-      </SafeAreaView>
-    );
-  }
-
-  const renderSeparator = () => <View style={styles.separatorLine} />;
-
   return (
     <SafeAreaView edges={["top", "bottom"]} style={styles.safe}>
       <StatusBar barStyle="dark-content" backgroundColor="#ffffff" translucent={false} />
@@ -582,19 +481,16 @@ export default function ChatsScreen() {
         <View style={styles.filterContainer}>
           <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.filterScrollContent}>
             {FILTERS.map((f) => (
-              <TouchableOpacity
-                key={f}
-                onPress={() => setFilter(f)}
-                activeOpacity={0.85}
-                style={[styles.filterPill, filter === f ? styles.filterPillActive : null]}
-              >
+              <TouchableOpacity key={f} onPress={() => setFilter(f)} activeOpacity={0.85} style={[styles.filterPill, filter === f ? styles.filterPillActive : null]}>
                 <Text style={[styles.filterPillText, filter === f ? styles.filterPillTextActive : null]}>{f}</Text>
               </TouchableOpacity>
             ))}
           </ScrollView>
         </View>
 
-        {filteredContacts.length === 0 ? (
+        {loadingInitial && contacts.length === 0 ? (
+          <View style={styles.center}><ActivityIndicator size="large" color={PRIMARY} /></View>
+        ) : filteredContacts.length === 0 ? (
           <View style={styles.emptyWrap}>
             <Text style={styles.emptyTitle}>No contacts</Text>
             <Text style={styles.emptySubtitle}>No {filter.toLowerCase()} contacts found yet.</Text>
@@ -618,29 +514,27 @@ export default function ChatsScreen() {
                           {item.role ? <View style={styles.badge}><Text style={styles.badgeText}>{item.role}</Text></View> : null}
                         </View>
 
-                        <View style={{ alignItems: "flex-end", flexDirection: "row", alignItemsVertical: "center" }}>
+                        <View style={{ alignItems: "flex-end", flexDirection: "row" }}>
                           <Text style={styles.time}>{fmtTime12(item.lastTime)}</Text>
                           <View style={{ width: 8 }} />
                           {lastWasMine ? (
-                            <Ionicons
-                              name={seenFlag ? "checkmark-done" : "checkmark"}
-                              size={16}
-                              color={seenFlag ? PRIMARY : MUTED}
-                            />
+                            <Ionicons name={seenFlag ? "checkmark-done" : "checkmark"} size={16} color={seenFlag ? PRIMARY : MUTED} />
                           ) : null}
                           {item.unread ? <View style={styles.unreadPill}><Text style={styles.unreadText}>{item.unread}</Text></View> : null}
                         </View>
                       </View>
 
                       <View style={{ marginTop: 6 }}>
-                        <Text style={styles.subtitleText} numberOfLines={1}>{shortText(item.lastMessage || (item.role === "Teacher" ? "Tap to message your teacher" : "Start a conversation"))}</Text>
+                        <Text style={styles.subtitleText} numberOfLines={1}>
+                          {shortText(item.lastMessage || "Start a conversation")}
+                        </Text>
                       </View>
                     </View>
                   </View>
                 </TouchableOpacity>
               );
             }}
-            ItemSeparatorComponent={renderSeparator}
+            ItemSeparatorComponent={() => <View style={styles.separatorLine} />}
             contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 20 }}
           />
         )}

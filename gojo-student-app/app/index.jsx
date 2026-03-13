@@ -13,6 +13,8 @@ import {
   StyleSheet,
   TouchableWithoutFeedback,
   Keyboard,
+  Linking,
+  Alert,
 } from "react-native";
 import { StatusBar } from "expo-status-bar";
 import { Ionicons } from "@expo/vector-icons";
@@ -21,7 +23,6 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { ref, query, orderByChild, equalTo, get } from "firebase/database";
 import { database } from "../constants/firebaseConfig";
 
-/* Hide the automatic header (removes the 'index' toolbar) */
 export const options = { headerShown: false };
 
 const PRIMARY = "#007AFB";
@@ -37,22 +38,18 @@ export default function LoginScreen() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
-  // Find schoolKey from 3-char prefix (e.g. "GMIS_..." -> "GMI" -> schoolKey)
   const resolveSchoolKeyFromUsername = async (uname) => {
     if (!uname || uname.length < 3) return null;
     const prefix = uname.substr(0, 3).toUpperCase();
     try {
       const snap = await get(ref(database, `Platform1/schoolCodeIndex/${prefix}`));
-      if (snap.exists()) {
-        return snap.val(); // expected value: e.g. "ET-ORO-ADA-GMI"
-      }
+      if (snap.exists()) return snap.val();
     } catch (e) {
       console.warn("[Login] resolveSchoolKey error", e);
     }
     return null;
   };
 
-  // Find user by username inside the resolved school's Users node
   const findUserByUsername = async (uname) => {
     const schoolKey = await resolveSchoolKeyFromUsername(uname);
     if (!schoolKey) {
@@ -79,15 +76,59 @@ export default function LoginScreen() {
     }
   };
 
-  // Helper: normalize grade value to "grade12" when storing
   function normalizeAndFormatGrade(val) {
     if (val == null) return null;
     const s = String(val).trim().toLowerCase();
     const m = s.match(/(\d{1,2})/);
     if (m) return `grade${m[1]}`;
-    // fallback to use raw
     return `grade${s.replace(/\D/g, "") || s}`;
   }
+
+  // NEW: open dialer with Platform1/schoolInfo/phone
+  const handleNeedHelp = async () => {
+  try {
+    // Prefer current username prefix -> schoolKey
+    const uname = username.trim();
+    let schoolKey = null;
+
+    if (uname && uname.length >= 3) {
+      schoolKey = await resolveSchoolKeyFromUsername(uname);
+    }
+
+    // fallback to cached schoolKey (if exists)
+    if (!schoolKey) {
+      schoolKey = await AsyncStorage.getItem("schoolKey");
+    }
+
+    if (!schoolKey) {
+      return Alert.alert("Unavailable", "Could not resolve school contact yet. Enter your username first.");
+    }
+
+    const schoolInfoSnap = await get(ref(database, `Platform1/Schools/${schoolKey}/schoolInfo`));
+    if (!schoolInfoSnap.exists()) {
+      return Alert.alert("Unavailable", "School contact is not available yet.");
+    }
+
+    const schoolInfo = schoolInfoSnap.val() || {};
+    const phoneRaw = schoolInfo.phone || schoolInfo.alternativePhone || "";
+    const phone = String(phoneRaw).replace(/[^\d+]/g, "");
+
+    if (!phone) {
+      return Alert.alert("Unavailable", "School phone number is missing.");
+    }
+
+    const telUrl = `tel:${phone}`;
+    const canOpen = await Linking.canOpenURL(telUrl);
+    if (!canOpen) {
+      return Alert.alert("Unavailable", `Cannot open dialer for: ${phone}`);
+    }
+
+    await Linking.openURL(telUrl);
+  } catch (e) {
+    console.warn("[Login] handleNeedHelp error:", e);
+    Alert.alert("Error", "Could not open dialer.");
+  }
+};
 
   const handleSignIn = async () => {
     setError("");
@@ -111,13 +152,11 @@ export default function LoginScreen() {
         return;
       }
 
-      // role check (if you expect only students to login here)
       if (user.role !== "student") {
         setError("This account is not a student account.");
         return;
       }
 
-      // Password check: normalize both stored and input to strings to avoid type mismatches (e.g. numeric 1 in DB)
       const storedPwd = user.password == null ? "" : String(user.password).trim();
       if (!storedPwd || storedPwd !== pwd) {
         setError("Incorrect password.");
@@ -131,7 +170,6 @@ export default function LoginScreen() {
 
       const studentNodeKey = user.studentId || "";
 
-      // Try to read student's grade from Platform1/Schools/{schoolKey}/Students/{studentId}
       let studentGradeFormatted = null;
       try {
         if (user._schoolKey && studentNodeKey) {
@@ -147,7 +185,6 @@ export default function LoginScreen() {
         console.warn("[Login] could not read student record for grade:", e);
       }
 
-      // Persist information (overwrite any previous cached studentGrade)
       const items = [
         ["userId", user.userId || ""],
         ["username", user.username || ""],
@@ -230,7 +267,7 @@ export default function LoginScreen() {
                 {loading ? <ActivityIndicator color="#fff" /> : <Text style={styles.buttonText}>Login</Text>}
               </TouchableOpacity>
 
-              <TouchableOpacity style={styles.linkRow} onPress={() => { /* route to support or forgot */ }}>
+              <TouchableOpacity style={styles.linkRow} onPress={handleNeedHelp}>
                 <Text style={styles.linkText}>Need help? Contact your school</Text>
               </TouchableOpacity>
             </View>
@@ -255,7 +292,6 @@ const styles = StyleSheet.create({
   subtitle: { marginTop: 8, fontSize: 14, color: MUTED, textAlign: "center" },
 
   form: { paddingHorizontal: 28, marginTop: 8 },
-
   error: { color: "#B00020", marginBottom: 8, textAlign: "center" },
 
   inputRow: {
