@@ -202,26 +202,76 @@ export default function ExamScreen() {
   }, []);
 
   const loadSubjectsFast = useCallback(async ({ studentId, schoolKey }) => {
-    try {
-      if (!studentId) return setSubjects([]);
+  try {
+    if (!studentId) return setSubjects([]);
 
-      // StudentCourses scoped->global
-      let studentCoursesMap = {};
-      if (schoolKey) {
-        const s = await get(ref(database, `Platform1/Schools/${schoolKey}/StudentCourses/${studentId}`));
-        if (s.exists()) studentCoursesMap = s.val() || {};
+    // 0) Resolve student's current grade + section (source of truth)
+    let studentGrade = null;
+    let studentSection = null;
+
+    // try scoped student first
+    if (schoolKey) {
+      const ss = await get(ref(database, `Platform1/Schools/${schoolKey}/Students/${studentId}`));
+      if (ss.exists()) {
+        const sv = ss.val() || {};
+        studentGrade =
+          normalizeGrade(
+            sv?.basicStudentInformation?.grade ??
+            sv?.grade ??
+            null
+          ) || null;
+        studentSection =
+          String(
+            sv?.basicStudentInformation?.section ??
+            sv?.section ??
+            ""
+          ).trim().toUpperCase() || null;
       }
-      if (!Object.keys(studentCoursesMap).length) {
-        const g = await get(ref(database, `StudentCourses/${studentId}`));
-        if (g.exists()) studentCoursesMap = g.val() || {};
+    }
+
+    // fallback global student
+    if (!studentGrade || !studentSection) {
+      const sg = await get(ref(database, `Students/${studentId}`));
+      if (sg.exists()) {
+        const sv = sg.val() || {};
+        if (!studentGrade) {
+          studentGrade =
+            normalizeGrade(
+              sv?.basicStudentInformation?.grade ??
+              sv?.grade ??
+              null
+            ) || null;
+        }
+        if (!studentSection) {
+          studentSection =
+            String(
+              sv?.basicStudentInformation?.section ??
+              sv?.section ??
+              ""
+            ).trim().toUpperCase() || null;
+        }
       }
+    }
 
-      const courseIds = Object.keys(studentCoursesMap).filter((k) => !!studentCoursesMap[k]);
-      if (!courseIds.length) return setSubjects([]);
+    // 1) StudentCourses scoped->global
+    let studentCoursesMap = {};
+    if (schoolKey) {
+      const s = await get(ref(database, `Platform1/Schools/${schoolKey}/StudentCourses/${studentId}`));
+      if (s.exists()) studentCoursesMap = s.val() || {};
+    }
+    if (!Object.keys(studentCoursesMap).length) {
+      const g = await get(ref(database, `StudentCourses/${studentId}`));
+      if (g.exists()) studentCoursesMap = g.val() || {};
+    }
 
-      // fetch courses in parallel
-      const courses = await Promise.all(courseIds.map(async (courseId) => {
+    const courseIds = Object.keys(studentCoursesMap).filter((k) => !!studentCoursesMap[k]);
+    if (!courseIds.length) return setSubjects([]);
+
+    // 2) fetch courses in parallel
+    const rawCourses = await Promise.all(
+      courseIds.map(async (courseId) => {
         let c = null;
+
         if (schoolKey) {
           const s = await get(ref(database, `Platform1/Schools/${schoolKey}/Courses/${courseId}`));
           if (s.exists()) c = s.val() || {};
@@ -230,44 +280,58 @@ export default function ExamScreen() {
           const g = await get(ref(database, `Courses/${courseId}`));
           if (g.exists()) c = g.val() || {};
         }
+
         c = c || {};
         return {
           courseId,
           name: c.name || c.subject || courseId,
           subject: c.subject || c.name || "Subject",
-          grade: c.grade || "",
-          section: c.section || "",
+          grade: normalizeGrade(c.grade) || "",
+          section: String(c.section || "").trim().toUpperCase(),
         };
-      }));
+      })
+    );
 
-      // assessments once (for badges only)
-      let assessmentsObj = {};
-      if (schoolKey) {
-        const s = await get(ref(database, `Platform1/Schools/${schoolKey}/SchoolExams/Assessments`));
-        if (s.exists()) assessmentsObj = s.val() || {};
-      }
-      if (!Object.keys(assessmentsObj).length) {
-        const g = await get(ref(database, `SchoolExams/Assessments`));
-        if (g.exists()) assessmentsObj = g.val() || {};
-      }
+    // 3) HARD FILTER by student current grade + section
+    const courses = rawCourses.filter((c) => {
+      const gradeOk = studentGrade ? String(c.grade) === String(studentGrade) : true;
+      const sectionOk = studentSection ? c.section === studentSection : true;
+      return gradeOk && sectionOk;
+    });
 
-      const countByCourse = {};
-      Object.keys(assessmentsObj).forEach((aid) => {
-        const cid = assessmentsObj[aid]?.courseId;
-        if (!cid) return;
-        countByCourse[cid] = (countByCourse[cid] || 0) + 1;
-      });
-
-      const out = courses.map((c) => ({
-        ...c,
-        assessmentCount: countByCourse[c.courseId] || 0,
-      }));
-
-      setSubjects(out);
-    } catch {
+    if (!courses.length) {
       setSubjects([]);
+      return;
     }
-  }, []);
+
+    // 4) assessments once (for badge count only)
+    let assessmentsObj = {};
+    if (schoolKey) {
+      const s = await get(ref(database, `Platform1/Schools/${schoolKey}/SchoolExams/Assessments`));
+      if (s.exists()) assessmentsObj = s.val() || {};
+    }
+    if (!Object.keys(assessmentsObj).length) {
+      const g = await get(ref(database, `SchoolExams/Assessments`));
+      if (g.exists()) assessmentsObj = g.val() || {};
+    }
+
+    const countByCourse = {};
+    Object.keys(assessmentsObj).forEach((aid) => {
+      const cid = assessmentsObj[aid]?.courseId;
+      if (!cid) return;
+      countByCourse[cid] = (countByCourse[cid] || 0) + 1;
+    });
+
+    const out = courses.map((c) => ({
+      ...c,
+      assessmentCount: countByCourse[c.courseId] || 0,
+    }));
+
+    setSubjects(out);
+  } catch {
+    setSubjects([]);
+  }
+}, []);
 
   const topSection = useMemo(() => (
     <View>
