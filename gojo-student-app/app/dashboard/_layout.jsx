@@ -9,7 +9,6 @@ import { StatusBar } from "expo-status-bar";
 
 const PRIMARY = "#007AFB";
 const WHITE = "#FFFFFF";
-const MUTED = "#6B78A8";
 
 export default function DashboardLayout() {
   const router = useRouter();
@@ -19,9 +18,14 @@ export default function DashboardLayout() {
 
   useEffect(() => {
     let mounted = true;
+
     (async () => {
       try {
-        const userNodeKey = await AsyncStorage.getItem("userNodeKey");
+        const userNodeKey =
+          (await AsyncStorage.getItem("userNodeKey")) ||
+          (await AsyncStorage.getItem("userId")) ||
+          null;
+
         const userId = await AsyncStorage.getItem("userId");
         const schoolKey = await AsyncStorage.getItem("schoolKey");
 
@@ -29,17 +33,27 @@ export default function DashboardLayout() {
           const userPath = schoolKey
             ? `Platform1/Schools/${schoolKey}/Users/${userNodeKey}`
             : `Users/${userNodeKey}`;
+
           const snap = await get(ref(database, userPath));
-          if (mounted && snap.exists()) setProfileImage(snap.val().profileImage || null);
+          if (mounted && snap.exists()) {
+            setProfileImage(snap.val()?.profileImage || null);
+          }
         }
 
         if (!userId) return;
 
-        const chatsRefPath = schoolKey ? `Platform1/Schools/${schoolKey}/Chats` : "Chats";
+        const chatsRefPath = schoolKey
+          ? `Platform1/Schools/${schoolKey}/Chats`
+          : "Chats";
+
         const chatsRef = ref(database, chatsRefPath);
 
         const listener = (snap) => {
-          if (!snap.exists()) return setTotalUnread(0);
+          if (!snap.exists()) {
+            setTotalUnread(0);
+            return;
+          }
+
           let total = 0;
           snap.forEach((chatSnap) => {
             const unreadNode = chatSnap.child("unread");
@@ -48,12 +62,19 @@ export default function DashboardLayout() {
               if (typeof val === "number") total += val;
             }
           });
+
           setTotalUnread(total);
         };
 
         onValue(chatsRef, listener);
         chatsCleanupRef.current = () => {
-          try { off(chatsRef, "value", listener); } catch { try { off(chatsRef); } catch {} }
+          try {
+            off(chatsRef, "value", listener);
+          } catch {
+            try {
+              off(chatsRef);
+            } catch {}
+          }
         };
       } catch (err) {
         console.warn("Dashboard layout init error:", err);
@@ -63,22 +84,28 @@ export default function DashboardLayout() {
     return () => {
       mounted = false;
       if (chatsCleanupRef.current) {
-        try { chatsCleanupRef.current(); } catch {}
+        try {
+          chatsCleanupRef.current();
+        } catch {}
         chatsCleanupRef.current = null;
       }
     };
   }, []);
 
-  const HeaderLeft = () => <Text style={styles.titleText}>Gojo Study</Text>;
+  const HomeHeaderTitle = () => (
+    <Text style={styles.titleText}>Gojo Study</Text>
+  );
 
-  const HeaderRight = () => (
+  const HomeHeaderRight = () => (
     <View style={styles.headerRightRow}>
       <TouchableOpacity style={styles.iconButton} onPress={() => router.push("/chats")}>
         <View style={styles.chatIconWrap}>
           <Ionicons name="chatbubbles-outline" size={22} color="#222" />
           {totalUnread > 0 && (
             <View style={styles.unreadBadge}>
-              <Text style={styles.unreadText}>{totalUnread > 99 ? "99+" : totalUnread}</Text>
+              <Text style={styles.unreadText}>
+                {totalUnread > 99 ? "99+" : totalUnread}
+              </Text>
             </View>
           )}
         </View>
@@ -86,7 +113,11 @@ export default function DashboardLayout() {
 
       <TouchableOpacity onPress={() => router.push("../profile")} style={{ marginLeft: 12 }}>
         <Image
-          source={profileImage ? { uri: profileImage } : require("../../assets/images/avatar_placeholder.png")}
+          source={
+            profileImage
+              ? { uri: profileImage }
+              : require("../../assets/images/avatar_placeholder.png")
+          }
           style={styles.profileImage}
         />
       </TouchableOpacity>
@@ -99,27 +130,79 @@ export default function DashboardLayout() {
       <Tabs
         screenOptions={{
           headerStyle: { backgroundColor: WHITE },
+          headerShadowVisible: false,
           headerTitleAlign: "left",
-          headerTitle: () => <HeaderLeft />,
-          headerRight: () => <HeaderRight />,
           tabBarActiveTintColor: PRIMARY,
           tabBarInactiveTintColor: "#BFD9FF",
           tabBarStyle: { height: 62, backgroundColor: WHITE },
           tabBarLabelStyle: { fontSize: 12 },
         }}
       >
-        <Tabs.Screen name="home" options={{ title: "Home", tabBarIcon: ({ color, size }) => <Ionicons name="home-outline" size={size} color={color} /> }} />
-        <Tabs.Screen name="book" options={{ title: "Books", tabBarIcon: ({ color, size }) => <Ionicons name="book-outline" size={size} color={color} /> }} />
-        <Tabs.Screen name="exam" options={{ title: "Exams", tabBarIcon: ({ color, size }) => <Ionicons name="clipboard-outline" size={size} color={color} /> }} />
-        <Tabs.Screen name="classMark" options={{ title: "Class Mark", tabBarIcon: ({ color, size }) => <Ionicons name="reader-outline" size={size} color={color} /> }} />
+        <Tabs.Screen
+          name="home"
+          options={{
+            title: "Home",
+            headerTitle: () => <HomeHeaderTitle />,
+            headerRight: () => <HomeHeaderRight />,
+            tabBarIcon: ({ color, size }) => (
+              <Ionicons name="home-outline" size={size} color={color} />
+            ),
+          }}
+        />
+
+        <Tabs.Screen
+          name="book"
+          options={{
+            title: "Books",
+            headerTitle: "Books",
+            headerRight: () => null,
+            tabBarIcon: ({ color, size }) => (
+              <Ionicons name="book-outline" size={size} color={color} />
+            ),
+          }}
+        />
+
+        <Tabs.Screen
+          name="exam"
+          options={{
+            title: "Exams",
+            headerTitle: "Exams",
+            headerRight: () => null,
+            tabBarIcon: ({ color, size }) => (
+              <Ionicons name="clipboard-outline" size={size} color={color} />
+            ),
+          }}
+        />
+
+        <Tabs.Screen
+          name="classMark"
+          options={{
+            title: "Class Mark",
+            headerTitle: "Class Mark",
+            headerRight: () => null,
+            tabBarIcon: ({ color, size }) => (
+              <Ionicons name="reader-outline" size={size} color={color} />
+            ),
+          }}
+        />
       </Tabs>
     </>
   );
 }
 
 const styles = StyleSheet.create({
-  titleText: { fontSize: 20, color: "#222", fontWeight: "700", marginLeft: 8 },
-  headerRightRow: { flexDirection: "row", alignItems: "center", marginRight: 12 },
+  titleText: {
+    fontSize: 20,
+    color: "#222",
+    fontWeight: "700",
+    marginLeft: 8,
+  },
+
+  headerRightRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginRight: 12,
+  },
 
   profileImage: {
     width: 38,
@@ -163,5 +246,9 @@ const styles = StyleSheet.create({
     elevation: 20,
   },
 
-  unreadText: { color: "#fff", fontSize: 10, fontWeight: "700" },
+  unreadText: {
+    color: "#fff",
+    fontSize: 10,
+    fontWeight: "700",
+  },
 });
