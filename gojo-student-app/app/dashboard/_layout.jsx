@@ -111,7 +111,7 @@ export default function DashboardLayout() {
         </View>
       </TouchableOpacity>
 
-      <TouchableOpacity onPress={() => router.push("../profile")} style={{ marginLeft: 12 }}>
+      <TouchableOpacity onPress={() => router.push("../profiles")} style={{ marginLeft: 12 }}>
         <Image
           source={
             profileImage

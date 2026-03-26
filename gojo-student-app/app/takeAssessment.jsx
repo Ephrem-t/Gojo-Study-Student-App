@@ -45,6 +45,7 @@ export default function TakeAssessment() {
   const [assessment, setAssessment] = useState(null);
   const [questions, setQuestions] = useState([]);
   const [answers, setAnswers] = useState({});
+  const [activeQuestionIndex, setActiveQuestionIndex] = useState(0);
 
   const [timeLeftMs, setTimeLeftMs] = useState(null);
   const autoSubmittedRef = useRef(false);
@@ -53,6 +54,9 @@ export default function TakeAssessment() {
     if (!assessmentId || !studentId) return null;
     return `assessmentDraft:${assessmentId}:${studentId}`;
   }, [assessmentId, studentId]);
+
+  const scrollRef = useRef(null);
+  const questionLayoutsRef = useRef({});
 
   useEffect(() => {
     (async () => {
@@ -138,6 +142,17 @@ export default function TakeAssessment() {
 
   const readOnly = alreadySubmitted || submitting || (timeLeftMs !== null && timeLeftMs <= 0);
 
+  const answeredCount = useMemo(() => {
+    return questions.filter((q) => {
+      const a = answers[q.id];
+      if (!a) return false;
+      if (a.type === "written") {
+        return !!String(a.textAnswer || "").trim() || Object.keys(a.imageUrls || {}).length > 0;
+      }
+      return !!String(a.value || "").trim();
+    }).length;
+  }, [questions, answers]);
+
   const setMcq = (qid, option) => {
     if (readOnly) return;
     setAnswers((p) => ({ ...p, [qid]: { type: "mcq", value: option } }));
@@ -218,6 +233,27 @@ export default function TakeAssessment() {
       ...p,
       [qid]: { ...prev, imageUrls: next },
     }));
+  };
+
+  const jumpToQuestion = (index) => {
+    const y = questionLayoutsRef.current[index];
+    if (scrollRef.current && typeof y === "number") {
+      scrollRef.current.scrollTo({ y: Math.max(0, y - 90), animated: true });
+      setActiveQuestionIndex(index);
+    }
+  };
+
+  const handleScroll = (e) => {
+    const y = e.nativeEvent.contentOffset.y;
+    const entries = Object.entries(questionLayoutsRef.current);
+
+    if (!entries.length) return;
+
+    let current = 0;
+    for (const [idx, top] of entries) {
+      if (y + 120 >= top) current = Number(idx);
+    }
+    if (current !== activeQuestionIndex) setActiveQuestionIndex(current);
   };
 
   const submitAssessment = async (isAuto = false) => {
@@ -322,6 +358,9 @@ export default function TakeAssessment() {
   return (
     <SafeAreaView style={styles.container}>
       <ScrollView
+        ref={scrollRef}
+        onScroll={handleScroll}
+        scrollEventThrottle={16}
         contentContainerStyle={{
           paddingTop: insets.top + 8,
           paddingHorizontal: 14,
@@ -339,6 +378,7 @@ export default function TakeAssessment() {
           <Text style={styles.title}>{assessment.title || "Assessment"}</Text>
           <Text style={styles.metaLine}>Total: {assessment.totalPoints || totalPoints} pts</Text>
           <Text style={styles.metaLine}>Due: {dueLabel}</Text>
+          <Text style={styles.metaLine}>Answered: {answeredCount}/{questions.length}</Text>
 
           {Number(assessment?.dueDate || 0) > 0 ? (
             <View style={styles.timerPill}>
@@ -364,6 +404,52 @@ export default function TakeAssessment() {
           )}
         </View>
 
+        {questions.length > 0 ? (
+          <View style={styles.navCard}>
+            <Text style={styles.navTitle}>Questions</Text>
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={styles.navPillsRow}
+            >
+              {questions.map((q, index) => {
+                const a = answers[q.id];
+                const isAnswered =
+                  a &&
+                  (
+                    (a.type === "written" &&
+                      (!!String(a.textAnswer || "").trim() || Object.keys(a.imageUrls || {}).length > 0)) ||
+                    (a.type !== "written" && !!String(a.value || "").trim())
+                  );
+
+                const isActive = index === activeQuestionIndex;
+
+                return (
+                  <TouchableOpacity
+                    key={q.id}
+                    style={[
+                      styles.navPill,
+                      isActive && styles.navPillActive,
+                      isAnswered && !isActive && styles.navPillDone,
+                    ]}
+                    onPress={() => jumpToQuestion(index)}
+                  >
+                    <Text
+                      style={[
+                        styles.navPillText,
+                        isActive && styles.navPillTextActive,
+                        isAnswered && !isActive && styles.navPillTextDone,
+                      ]}
+                    >
+                      Q{index + 1}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </ScrollView>
+          </View>
+        ) : null}
+
         {alreadySubmitted && (
           <View style={styles.infoBox}>
             <Ionicons name="checkmark-circle" size={16} color={PRIMARY} />
@@ -375,7 +461,13 @@ export default function TakeAssessment() {
           const writtenHasImage = Object.keys(answers[q.id]?.imageUrls || {}).length > 0;
 
           return (
-            <View key={q.id} style={styles.card}>
+            <View
+              key={q.id}
+              style={styles.card}
+              onLayout={(e) => {
+                questionLayoutsRef.current[idx] = e.nativeEvent.layout.y;
+              }}
+            >
               <View style={styles.qHeader}>
                 <Text style={styles.qNumber}>Q{idx + 1}</Text>
                 <Text style={styles.qPoints}>{q.points || 0} pts</Text>
@@ -722,6 +814,55 @@ const styles = StyleSheet.create({
     color: MUTED,
     fontWeight: "800",
     fontSize: 12,
+  },
+
+  navCard: {
+    borderWidth: 1,
+    borderColor: BORDER,
+    borderRadius: 18,
+    padding: 12,
+    backgroundColor: "#fff",
+    marginBottom: 12,
+  },
+  navTitle: {
+    fontSize: 13,
+    fontWeight: "900",
+    color: TEXT,
+    marginBottom: 10,
+  },
+  navPillsRow: {
+    paddingRight: 4,
+  },
+  navPill: {
+    minWidth: 46,
+    height: 38,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#DCE8FF",
+    backgroundColor: "#fff",
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 8,
+    paddingHorizontal: 10,
+  },
+  navPillActive: {
+    backgroundColor: PRIMARY,
+    borderColor: PRIMARY,
+  },
+  navPillDone: {
+    backgroundColor: "#EEF8F1",
+    borderColor: "#CDEFD8",
+  },
+  navPillText: {
+    color: TEXT,
+    fontWeight: "800",
+    fontSize: 12,
+  },
+  navPillTextActive: {
+    color: "#fff",
+  },
+  navPillTextDone: {
+    color: SUCCESS,
   },
 
   infoBox: {
