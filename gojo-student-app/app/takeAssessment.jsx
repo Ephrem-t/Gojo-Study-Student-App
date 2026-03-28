@@ -33,7 +33,26 @@ const DANGER = "#EF4444";
 export default function TakeAssessment() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
-  const { assessmentId } = useLocalSearchParams();
+  const params = useLocalSearchParams();
+  const { assessmentId } = params;
+
+  const handleBackNavigation = () => {
+    if (String(params?.returnTo || "") === "subjectAssessments") {
+      router.replace({
+        pathname: "/subjectAssessments",
+        params: {
+          courseId: String(params?.returnCourseId || ""),
+          subject: String(params?.returnSubject || ""),
+          grade: String(params?.returnGrade || ""),
+          section: String(params?.returnSection || ""),
+          returnTo: "exam",
+          returnExamFilter: String(params?.returnExamFilter || "school"),
+        },
+      });
+      return;
+    }
+    router.back();
+  };
 
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
@@ -328,7 +347,7 @@ export default function TakeAssessment() {
         isAuto ? "Time up" : "Submitted",
         isAuto ? "Assessment auto-submitted." : "Your assessment has been submitted."
       );
-      router.back();
+      handleBackNavigation();
     } catch {
       Alert.alert("Submit failed", "Please try again.");
     } finally {
@@ -369,7 +388,7 @@ export default function TakeAssessment() {
         showsVerticalScrollIndicator={false}
       >
         <View style={styles.topNav}>
-          <TouchableOpacity onPress={() => router.back()} style={styles.backIconBtn}>
+          <TouchableOpacity onPress={handleBackNavigation} style={styles.backIconBtn}>
             <Ionicons name="arrow-back" size={20} color={PRIMARY} />
           </TouchableOpacity>
         </View>

@@ -536,6 +536,11 @@ export default function PackageSubjects() {
     ? notifications
     : notifications.filter((n) => Number(n.createdAt || 0) > lastSeenNotificationsAt);
 
+  const totalRounds = useMemo(
+    () => (subjects || []).reduce((sum, s) => sum + ((s.rounds || []).length || 0), 0),
+    [subjects]
+  );
+
   if (loading) {
     return (
       <SafeAreaView style={[styles.screen, styles.center, { paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight || 0) : 0 }]}>
@@ -547,26 +552,18 @@ export default function PackageSubjects() {
   return (
     <SafeAreaView style={[styles.screen, { paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight || 0) : 0 }]}>
       <View style={styles.header}>
-        <TouchableOpacity onPress={() => router.back()} style={styles.backBtn}>
+        <TouchableOpacity
+          onPress={() => router.replace({ pathname: "/dashboard/exam", params: { activeFilter: "gojo" } })}
+          style={styles.backBtn}
+        >
           <Ionicons name="chevron-back" size={22} color={TEXT} />
         </TouchableOpacity>
-        <View style={{ flex: 1 }}>
-          <Text style={styles.title}>{packageName}</Text>
-          <Text style={styles.subtitle}>Choose a subject and start a round</Text>
+        <View style={styles.headerTitleWrap}>
+          <Text numberOfLines={1} ellipsizeMode="tail" style={styles.title}>{packageName}</Text>
+          <Text numberOfLines={1} style={styles.subtitle}>Choose a subject and start a round</Text>
         </View>
 
-        <TouchableOpacity onPress={() => setShowNotifModal(true)} style={{ marginRight: 10 }}>
-          <View>
-            <Ionicons name="notifications-outline" size={22} color={TEXT} />
-            {unreadCount > 0 ? (
-              <View style={styles.badge}>
-                <Text style={styles.badgeTxt}>{unreadCount > 99 ? "99+" : unreadCount}</Text>
-              </View>
-            ) : null}
-          </View>
-        </TouchableOpacity>
-
-        <TouchableOpacity onPress={() => setShowHeartInfoModal(true)} style={{ alignItems: "flex-end", minWidth: 72 }}>
+        <TouchableOpacity onPress={() => setShowHeartInfoModal(true)} style={{ alignItems: "flex-end", minWidth: 72, marginRight: 10 }}>
           <View style={{ flexDirection: "row", alignItems: "center" }}>
             <Ionicons
               name={globalLives != null && globalLives > 0 ? "heart" : "heart-outline"}
@@ -576,6 +573,17 @@ export default function PackageSubjects() {
             <Text style={{ marginLeft: 6, color: PRIMARY, fontWeight: "900" }}>
               {globalLives != null ? `${globalLives}` : "—"}
             </Text>
+          </View>
+        </TouchableOpacity>
+
+        <TouchableOpacity onPress={() => setShowNotifModal(true)}>
+          <View>
+            <Ionicons name="notifications-outline" size={22} color={TEXT} />
+            {unreadCount > 0 ? (
+              <View style={styles.badge}>
+                <Text style={styles.badgeTxt}>{unreadCount > 99 ? "99+" : unreadCount}</Text>
+              </View>
+            ) : null}
           </View>
         </TouchableOpacity>
       </View>
@@ -607,34 +615,77 @@ export default function PackageSubjects() {
         </View>
       ) : null}
 
+      <View style={styles.heroWrap}>
+        <View style={styles.heroGlowA} />
+        <View style={styles.heroGlowB} />
+        <View style={styles.heroRow}>
+          <View style={styles.heroChip}>
+            <MaterialCommunityIcons
+              name={isPractice ? "brain" : "trophy-outline"}
+              size={14}
+              color={PRIMARY}
+            />
+            <Text style={styles.heroChipText}>{isPractice ? "Practice" : "Competitive"}</Text>
+          </View>
+        </View>
+
+        <Text style={styles.heroTitle}>{packageName}</Text>
+        <Text style={styles.heroSubtitle}>Master each subject, then unlock every round confidently.</Text>
+
+        <View style={styles.heroStatsRow}>
+          <View style={styles.heroStatCard}>
+            <Text style={styles.heroStatValue}>{subjects.length}</Text>
+            <Text style={styles.heroStatLabel}>Subjects</Text>
+          </View>
+          <View style={styles.heroStatCard}>
+            <Text style={styles.heroStatValue}>{totalRounds}</Text>
+            <Text style={styles.heroStatLabel}>Rounds</Text>
+          </View>
+          <View style={styles.heroStatCard}>
+            <Text style={styles.heroStatValue}>{globalLives != null ? globalLives : "-"}</Text>
+            <Text style={styles.heroStatLabel}>Lives</Text>
+          </View>
+        </View>
+      </View>
+
       <FlatList
         data={subjects}
         keyExtractor={(s) => s.id}
-        contentContainerStyle={{ padding: 16, paddingBottom: 24 }}
-        ItemSeparatorComponent={() => <View style={{ height: 12 }} />}
+        contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 24, paddingTop: 8 }}
+        ItemSeparatorComponent={() => <View style={{ height: 14 }} />}
         renderItem={({ item }) => {
           const expanded = expandedId === item.id;
           const v = getSubjectVisual(item.keyName, item.name);
 
           return (
-            <View style={styles.subjectCard}>
-              <TouchableOpacity style={styles.subjectTop} activeOpacity={0.9} onPress={() => toggle(item.id)}>
+            <View style={[styles.subjectCard, expanded && styles.subjectCardExpanded]}>
+              <TouchableOpacity
+                style={[styles.subjectTop, expanded && styles.subjectTopExpanded]}
+                activeOpacity={0.92}
+                onPress={() => toggle(item.id)}
+              >
+                <View style={styles.subjectTopLeft}>
                 <View style={[styles.subjectIconWrap, { backgroundColor: v.bg }]}>
                   <MaterialCommunityIcons name={v.icon} size={24} color={v.color} />
                 </View>
 
-                <View style={{ flex: 1, marginLeft: 12 }}>
+                  <View style={styles.subjectTextWrap}>
                   <Text style={styles.subjectName}>{titleize(item.name)}</Text>
                   <Text style={styles.subjectChapter}>{item.chapter}</Text>
-                  <Text style={styles.roundCount}>{(item.rounds || []).length} rounds</Text>
+                    <View style={styles.subjectMetaRow}>
+                      <Text style={styles.subjectMetaChip}>{(item.rounds || []).length} rounds</Text>
+                    </View>
+                  </View>
                 </View>
 
-                <Ionicons name={expanded ? "chevron-up" : "chevron-down"} size={20} color={MUTED} />
+                <View style={[styles.subjectChevronWrap, expanded && styles.subjectChevronWrapActive]}>
+                  <Ionicons name={expanded ? "chevron-up" : "chevron-down"} size={18} color={PRIMARY} />
+                </View>
               </TouchableOpacity>
 
               {expanded && (
                 <View style={styles.expandArea}>
-                  {(item.rounds || []).map((r) => {
+                  {(item.rounds || []).map((r, idx) => {
                     const attemptState = deriveAttemptState(r, nowTs);
                     const disabledByAttempts = attemptState.left <= 0;
                     const disabledByLives = isPractice && globalLives === 0;
@@ -643,11 +694,16 @@ export default function PackageSubjects() {
                     return (
                       <View key={`${r.roundId}_${r.examId}`} style={{ marginBottom: 10 }}>
                         <View style={styles.roundRow}>
-                          <View style={{ flex: 1 }}>
+                          <View style={styles.roundMain}>
+                            <View style={styles.roundOrderBadge}>
+                              <Text style={styles.roundOrderText}>{idx + 1}</Text>
+                            </View>
+                            <View style={styles.roundTextWrap}>
                             <Text style={styles.roundName}>{r.name}</Text>
                             <Text style={styles.roundMeta}>
                               {(r.totalQuestions || 0)} Qs • {Math.round((r.timeLimit || 0) / 60)} min • {r.difficulty}
                             </Text>
+                            </View>
                           </View>
 
                           <TouchableOpacity
@@ -661,11 +717,15 @@ export default function PackageSubjects() {
                                   examId: r.examId,
                                   questionBankId: r.questionBankId,
                                   mode: "start",
+                                  returnTo: "packageSubjects",
+                                  returnPackageId: packageId || "",
+                                  returnPackageName: packageName || "",
+                                  returnStudentGrade: incomingGrade || "",
                                 },
                               })
                             }
                           >
-                            <Text style={styles.startBtnText}>{disabled ? "Locked" : "Start"}</Text>
+                            <Text style={styles.startBtnText}>{disabled ? "Locked" : isPractice ? "Start" : "Enter"}</Text>
                           </TouchableOpacity>
                         </View>
 
@@ -790,7 +850,8 @@ const styles = StyleSheet.create({
     marginRight: 10,
     backgroundColor: "#F7F9FF",
   },
-  title: { fontSize: 21, fontWeight: "900", color: TEXT },
+  headerTitleWrap: { flex: 1, minWidth: 0, marginRight: 8 },
+  title: { fontSize: 21, fontWeight: "900", color: TEXT, flexShrink: 1 },
   subtitle: { marginTop: 2, color: MUTED, fontSize: 12 },
 
   badge: {
@@ -826,57 +887,255 @@ const styles = StyleSheet.create({
   newTitle: { color: TEXT, fontWeight: "800", fontSize: 12, flex: 1 },
   newSub: { color: MUTED, marginTop: 6, fontSize: 11 },
 
-  subjectCard: {
-    backgroundColor: "#fff",
-    borderRadius: 16,
+  heroWrap: {
+    marginHorizontal: 16,
+    marginTop: 6,
+    marginBottom: 10,
+    borderRadius: 22,
     borderWidth: 1,
-    borderColor: "#EAF0FF",
-    padding: 12,
-    shadowColor: "#000",
-    shadowOpacity: 0.04,
-    shadowRadius: 8,
+    borderColor: "#DDE9FF",
+    backgroundColor: "#F8FBFF",
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    overflow: "hidden",
+  },
+  heroGlowA: {
+    position: "absolute",
+    width: 150,
+    height: 150,
+    borderRadius: 75,
+    backgroundColor: "rgba(11,114,255,0.12)",
+    top: -70,
+    right: -32,
+  },
+  heroGlowB: {
+    position: "absolute",
+    width: 120,
+    height: 120,
+    borderRadius: 60,
+    backgroundColor: "rgba(59,130,246,0.09)",
+    bottom: -55,
+    left: -22,
+  },
+  heroRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "flex-end",
+  },
+  heroChip: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+    backgroundColor: "#EDF4FF",
+    borderWidth: 1,
+    borderColor: "#D8E7FF",
+  },
+  heroChipText: {
+    marginLeft: 6,
+    fontSize: 11,
+    fontWeight: "800",
+    color: PRIMARY,
+  },
+  heroTitle: {
+    marginTop: 6,
+    color: TEXT,
+    fontSize: 18,
+    fontWeight: "900",
+  },
+  heroSubtitle: {
+    marginTop: 2,
+    color: MUTED,
+    fontSize: 12,
+    lineHeight: 16,
+  },
+  heroStatsRow: {
+    marginTop: 8,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+  },
+  heroStatCard: {
+    flex: 1,
+    backgroundColor: "#FFFFFF",
+    borderWidth: 1,
+    borderColor: "#E6EEFD",
+    borderRadius: 14,
+    paddingVertical: 7,
+    alignItems: "center",
+  },
+  heroStatValue: {
+    color: PRIMARY,
+    fontSize: 16,
+    fontWeight: "900",
+  },
+  heroStatLabel: {
+    marginTop: 2,
+    color: MUTED,
+    fontSize: 11,
+    fontWeight: "700",
+  },
+
+  subjectCard: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 22,
+    borderWidth: 1,
+    borderColor: "#E7EDF8",
+    overflow: "hidden",
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.025,
+    shadowRadius: 10,
+    elevation: 1,
+  },
+  subjectCardExpanded: {
+    borderColor: "#B9D4FF",
+    shadowColor: PRIMARY,
+    shadowOpacity: 0.05,
     elevation: 2,
   },
-  subjectTop: { flexDirection: "row", alignItems: "center" },
+  subjectTop: {
+    paddingHorizontal: 16,
+    paddingVertical: 15,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  subjectTopExpanded: {
+    backgroundColor: "#FCFDFF",
+    borderBottomWidth: 1,
+    borderBottomColor: "#EAF0FB",
+  },
+  subjectTopLeft: {
+    flexDirection: "row",
+    alignItems: "center",
+    flex: 1,
+  },
   subjectIconWrap: {
-    width: 48,
-    height: 48,
+    width: 56,
+    height: 74,
     borderRadius: 14,
+    justifyContent: "center",
+    alignItems: "center",
+    backgroundColor: "#F7F9FC",
+    borderWidth: 1,
+    borderColor: "#EEF2F8",
+  },
+  subjectTextWrap: {
+    marginLeft: 12,
+    flex: 1,
+  },
+  subjectName: {
+    fontWeight: "900",
+    fontSize: 17,
+    color: TEXT,
+  },
+  subjectChapter: {
+    color: "#667085",
+    marginTop: 4,
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  subjectMetaRow: {
+    flexDirection: "row",
+    marginTop: 6,
+    flexWrap: "wrap",
+  },
+  subjectMetaChip: {
+    marginRight: 6,
+    marginBottom: 6,
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+    borderRadius: 999,
+    backgroundColor: "#F4F7FD",
+    borderWidth: 1,
+    borderColor: "#E7EDF8",
+    color: PRIMARY,
+    fontSize: 11,
+    fontWeight: "700",
+    overflow: "hidden",
+  },
+  subjectChevronWrap: {
+    width: 34,
+    height: 34,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#E5ECFA",
+    backgroundColor: "#F8FBFF",
+    alignItems: "center",
+    justifyContent: "center",
+    marginLeft: 10,
+  },
+  subjectChevronWrapActive: {
+    borderColor: "#CFE0FF",
+    backgroundColor: "#EEF5FF",
+  },
+
+  expandArea: {
+    paddingHorizontal: 14,
+    paddingTop: 12,
+    paddingBottom: 14,
+    backgroundColor: "#F8FBFF",
+  },
+  roundRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingVertical: 12,
+    paddingHorizontal: 10,
+    marginTop: 8,
+    borderWidth: 1,
+    borderColor: "#E4ECFA",
+    borderRadius: 16,
+    backgroundColor: "#FFFFFF",
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.018,
+    shadowRadius: 6,
+    elevation: 0,
+  },
+  roundMain: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    marginRight: 10,
+  },
+  roundOrderBadge: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    backgroundColor: "#EDF4FF",
     alignItems: "center",
     justifyContent: "center",
   },
-  subjectName: { color: TEXT, fontWeight: "900", fontSize: 16 },
-  subjectChapter: { marginTop: 2, color: MUTED, fontSize: 12 },
-  roundCount: { marginTop: 5, color: PRIMARY, fontWeight: "700", fontSize: 12 },
-
-  expandArea: {
-    marginTop: 10,
-    borderTopWidth: 1,
-    borderTopColor: "#EEF4FF",
-    paddingTop: 10,
+  roundOrderText: {
+    color: PRIMARY,
+    fontSize: 12,
+    fontWeight: "800",
   },
-
-  roundRow: {
-    backgroundColor: "#FBFCFF",
-    borderWidth: 1,
-    borderColor: "#EEF4FF",
-    borderRadius: 12,
-    paddingHorizontal: 10,
-    paddingVertical: 10,
-    flexDirection: "row",
-    alignItems: "center",
+  roundTextWrap: {
+    flex: 1,
+    marginLeft: 10,
+    paddingRight: 10,
   },
-  roundName: { color: TEXT, fontWeight: "800", fontSize: 14 },
+  roundName: { fontSize: 14, fontWeight: "800", color: "#1B2B45", marginRight: 6 },
   roundMeta: { marginTop: 3, color: MUTED, fontSize: 12 },
 
   startBtn: {
     backgroundColor: PRIMARY,
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-    borderRadius: 10,
+    paddingHorizontal: 15,
+    paddingVertical: 9,
+    borderRadius: 11,
+    shadowColor: "#1D4ED8",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.18,
+    shadowRadius: 8,
+    elevation: 2,
   },
   startBtnDisabled: { backgroundColor: "#DDE8FF" },
-  startBtnText: { color: "#fff", fontWeight: "800", fontSize: 12 },
+  startBtnText: { color: "#fff", fontWeight: "900", fontSize: 12, letterSpacing: 0.2 },
 
   lockInfo: {
     marginTop: 6,

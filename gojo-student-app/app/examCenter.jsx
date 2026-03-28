@@ -138,6 +138,31 @@ export default function ExamCenter() {
   const questionBankIdParam = params.questionBankId;
   const mode = params.mode || "start";
 
+  const handleBackNavigation = useCallback(() => {
+    const returnTo = String(params?.returnTo || "");
+    if (returnTo === "packageSubjects") {
+      router.replace({
+        pathname: "/packageSubjects",
+        params: {
+          packageId: String(params?.returnPackageId || ""),
+          packageName: String(params?.returnPackageName || "Package"),
+          studentGrade: String(params?.returnStudentGrade || ""),
+        },
+      });
+      return;
+    }
+    if (returnTo === "exam") {
+      router.replace({
+        pathname: "/dashboard/exam",
+        params: {
+          activeFilter: String(params?.returnExamFilter || "online"),
+        },
+      });
+      return;
+    }
+    router.back();
+  }, [params, router]);
+
   const [loading, setLoading] = useState(true);
   const [stage, setStage] = useState(mode === "review" ? "review" : "rules");
   const [roundMeta, setRoundMeta] = useState(null);
@@ -916,7 +941,7 @@ useEffect(() => {
         {stage === "rules" && (
           <View style={styles.panel}>
             <View style={styles.headerBar}>
-              <TouchableOpacity onPress={() => router.back()} style={styles.backBtn}><Ionicons name="chevron-back" size={22} color={C.text} /></TouchableOpacity>
+              <TouchableOpacity onPress={handleBackNavigation} style={styles.backBtn}><Ionicons name="chevron-back" size={22} color={C.text} /></TouchableOpacity>
               <View style={{ flex: 1 }}>
                 <Text style={styles.title}>{examMeta?.name || "Practice Test"}</Text>
                 <Text style={styles.subtitle}>{roundMeta?.name || ""}</Text>
@@ -1050,7 +1075,7 @@ useEffect(() => {
         {stage === "exam" && (
           <View style={styles.panel}>
             <View style={styles.headerBar}>
-              <TouchableOpacity onPress={() => router.back()} style={styles.backBtn}><Ionicons name="chevron-back" size={22} color={C.text} /></TouchableOpacity>
+              <TouchableOpacity onPress={handleBackNavigation} style={styles.backBtn}><Ionicons name="chevron-back" size={22} color={C.text} /></TouchableOpacity>
               <View style={{ flex: 1 }}>
                 <Text style={styles.title}>{examMeta?.name || "Exam"}</Text>
                 <Text style={styles.subtitle}>Question {Math.min(currentIndex + 1, totalQ)} / {totalQ}</Text>
@@ -1131,7 +1156,7 @@ useEffect(() => {
         {stage === "result" && showPostSubmitReview && (
           <View style={styles.panel}>
             <View style={styles.headerBar}>
-              <TouchableOpacity onPress={() => router.back()} style={styles.backBtn}>
+              <TouchableOpacity onPress={handleBackNavigation} style={styles.backBtn}>
                 <Ionicons name="chevron-back" size={22} color={C.text} />
               </TouchableOpacity>
               <View style={{ flex: 1 }}>
@@ -1201,7 +1226,7 @@ useEffect(() => {
                   <Text style={styles.primaryBtnText}>Next</Text>
                 </TouchableOpacity>
               ) : (
-                <TouchableOpacity style={styles.primaryBtnSmall} onPress={() => router.back()}>
+                <TouchableOpacity style={styles.primaryBtnSmall} onPress={handleBackNavigation}>
                   <Text style={styles.primaryBtnText}>Finish</Text>
                 </TouchableOpacity>
               )}
@@ -1287,7 +1312,7 @@ useEffect(() => {
             </TouchableOpacity>
           ) : null}
 
-          <TouchableOpacity style={[styles.primaryBtnSmall, { flex: 1 }]} onPress={() => router.back()}>
+          <TouchableOpacity style={[styles.primaryBtnSmall, { flex: 1 }]} onPress={handleBackNavigation}>
             <Text style={styles.primaryBtnText}>Back to Rounds</Text>
           </TouchableOpacity>
         </View>

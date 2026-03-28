@@ -29,6 +29,13 @@
     "plugins": [
       "expo-router",
       [
+        "expo-media-library",
+        {
+          "photosPermission": "Allow Gojo Student App to access your photos.",
+          "savePhotosPermission": "Allow Gojo Student App to save images to your gallery."
+        }
+      ],
+      [
         "expo-splash-screen",
         {
           "image": "./assets/images/splash-icon.png",

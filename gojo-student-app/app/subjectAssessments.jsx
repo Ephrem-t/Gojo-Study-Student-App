@@ -121,7 +121,19 @@ async function resolveSchoolKeyFast(studentId) {
 export default function SubjectAssessmentsScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
-  const { courseId, subject, grade, section } = useLocalSearchParams();
+  const params = useLocalSearchParams();
+  const { courseId, subject, grade, section, returnTo, returnExamFilter } = params;
+
+  const handleBackNavigation = useCallback(() => {
+    if (String(returnTo || "") === "exam") {
+      router.replace({
+        pathname: "/dashboard/exam",
+        params: { activeFilter: String(returnExamFilter || "school") },
+      });
+      return;
+    }
+    router.back();
+  }, [returnTo, returnExamFilter, router]);
 
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -226,9 +238,14 @@ export default function SubjectAssessmentsScreen() {
         ListHeaderComponent={
           <>
             <View style={[styles.header, { paddingTop: insets.top + 8 }]}>
-              <TouchableOpacity onPress={() => router.back()} style={styles.backIconBtn}>
+              <TouchableOpacity onPress={handleBackNavigation} style={styles.backIconBtn}>
                 <Ionicons name="arrow-back" size={20} color={PRIMARY} />
               </TouchableOpacity>
+
+              <View style={styles.headerTitleWrap}>
+                <Text numberOfLines={1} style={styles.headerTitle}>{subject || "Subject"}</Text>
+                <Text numberOfLines={1} style={styles.headerSubtitle}>School Assessments</Text>
+              </View>
 
               <TouchableOpacity onPress={onRefresh} style={styles.headerActionBtn}>
                 <Ionicons name="refresh-outline" size={18} color={PRIMARY} />
@@ -236,19 +253,19 @@ export default function SubjectAssessmentsScreen() {
             </View>
 
             <View style={styles.heroCard}>
-              <View style={[styles.heroIconWrap, { backgroundColor: `${visual.color}16` }]}>
-                <MaterialCommunityIcons name={visual.icon} size={26} color={visual.color} />
+              <View style={styles.heroGlowA} />
+              <View style={styles.heroGlowB} />
+
+              <View style={styles.heroRow}>
+                <View style={styles.heroChip}>
+                  <MaterialCommunityIcons name={visual.icon} size={14} color={PRIMARY} />
+                  <Text style={styles.heroChipText}>School</Text>
+                </View>
               </View>
 
-              <View style={{ flex: 1 }}>
-                <Text style={styles.heroTitle}>{subject || "Subject"}</Text>
-                <Text style={styles.heroSubTitle}>
-                  Grade {grade || "--"} • Section {section || "--"}
-                </Text>
-                <Text style={styles.heroText}>
-                  View available school assessments and continue where needed.
-                </Text>
-              </View>
+              <Text style={styles.heroTitle}>{subject || "Subject"}</Text>
+              <Text style={styles.heroSubTitle}>Grade {grade || "--"} • Section {section || "--"}</Text>
+              <Text style={styles.heroText}>View available school assessments and continue where needed.</Text>
             </View>
 
             <View style={styles.statsRow}>
@@ -285,7 +302,7 @@ export default function SubjectAssessmentsScreen() {
             </Text>
           </View>
         }
-        renderItem={({ item }) => {
+        renderItem={({ item, index }) => {
           const status = getAssessmentStatus({
             submitted: item.submitted,
             finalScore: item.finalScore,
@@ -306,57 +323,55 @@ export default function SubjectAssessmentsScreen() {
                     assessmentId: item.assessmentId,
                     courseId: item.courseId,
                     title: item.title || "Assessment",
+                    returnTo: "subjectAssessments",
+                    returnCourseId: String(courseId || ""),
+                    returnSubject: String(subject || ""),
+                    returnGrade: String(grade || ""),
+                    returnSection: String(section || ""),
+                    returnExamFilter: String(returnExamFilter || "school"),
                   },
                 })
               }
             >
-              <View style={styles.cardTopRow}>
-                <View style={styles.typeBadge}>
-                  <Ionicons name={typeMeta.icon} size={11} color={PRIMARY} />
-                  <Text style={styles.typeText}>{typeMeta.label}</Text>
+              <View style={styles.cardMain}>
+                <View style={styles.cardOrderBadge}>
+                  <Text style={styles.cardOrderText}>{index + 1}</Text>
                 </View>
 
-                <View style={[styles.statusBadge, { backgroundColor: `${status.color}18` }]}>
-                  <Ionicons name={status.icon} size={11} color={status.color} />
-                  <Text style={[styles.statusText, { color: status.color }]}>{status.label}</Text>
-                </View>
-              </View>
-
-              <Text style={styles.cardTitle} numberOfLines={1}>
-                {item.title || "Assessment"}
-              </Text>
-
-              <View style={styles.metaGrid}>
-                <View style={styles.metaChip}>
-                  <Ionicons name="calendar-outline" size={12} color={MUTED} />
-                  <Text style={styles.metaChipText}>{dueLabel}</Text>
-                </View>
-
-                <View style={styles.metaChip}>
-                  <Ionicons name="help-circle-outline" size={12} color={MUTED} />
-                  <Text style={styles.metaChipText}>{Number(item.questionCount || 0)} Qs</Text>
-                </View>
-
-                <View style={styles.metaChip}>
-                  <Ionicons name="ribbon-outline" size={12} color={MUTED} />
-                  <Text style={styles.metaChipText}>{Number(item.totalPoints || 0)} pts</Text>
-                </View>
-
-                <View style={styles.metaChip}>
-                  <Ionicons name="time-outline" size={12} color={MUTED} />
-                  <Text style={styles.metaChipText}>
-                    {item.timeLimitMinutes ? `${item.timeLimitMinutes} min` : "No limit"}
+                <View style={styles.cardTextWrap}>
+                  <Text style={styles.cardTitle} numberOfLines={1}>
+                    {item.title || "Assessment"}
                   </Text>
+
+                  <Text style={styles.cardMetaPrimary} numberOfLines={1}>
+                    {typeMeta.label} • {Number(item.questionCount || 0)} Qs • {Number(item.totalPoints || 0)} pts
+                  </Text>
+
+                  <View style={styles.cardChipRow}>
+                    <View style={styles.metaChip}>
+                      <Ionicons name="calendar-outline" size={12} color={MUTED} />
+                      <Text style={styles.metaChipText}>{dueLabel}</Text>
+                    </View>
+
+                    <View style={[styles.statusBadge, { backgroundColor: `${status.color}18` }]}>
+                      <Ionicons name={status.icon} size={11} color={status.color} />
+                      <Text style={[styles.statusText, { color: status.color }]}>{status.label}</Text>
+                    </View>
+                  </View>
                 </View>
               </View>
 
               <View style={styles.cardFooter}>
-                <View style={{ flex: 1 }}>
+                <View style={styles.cardScoreWrap}>
                   {typeof item.finalScore === "number" ? (
                     <Text style={styles.scoreText}>Score: {item.finalScore}</Text>
                   ) : (
                     <Text style={styles.scoreHint}>
-                      {item.submitted ? "Waiting for result" : "Ready to start"}
+                      {item.submitted
+                        ? "Waiting for result"
+                        : item.timeLimitMinutes
+                        ? `${item.timeLimitMinutes} min limit`
+                        : "No time limit"}
                     </Text>
                   )}
                 </View>
@@ -379,52 +394,101 @@ const styles = StyleSheet.create({
   center: { flex: 1, alignItems: "center", justifyContent: "center" },
 
   header: {
-    paddingHorizontal: 14,
+    paddingHorizontal: 16,
     paddingBottom: 8,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
   },
+  headerTitleWrap: {
+    flex: 1,
+    minWidth: 0,
+    marginHorizontal: 10,
+  },
+  headerTitle: {
+    fontSize: 18,
+    fontWeight: "900",
+    color: TEXT,
+  },
+  headerSubtitle: {
+    marginTop: 2,
+    color: MUTED,
+    fontSize: 12,
+    fontWeight: "700",
+  },
   backIconBtn: {
-    width: 38,
-    height: 38,
-    borderRadius: 12,
-    backgroundColor: "#EEF4FF",
+    width: 34,
+    height: 34,
+    borderRadius: 10,
+    backgroundColor: "#F7F9FF",
     alignItems: "center",
     justifyContent: "center",
   },
   headerActionBtn: {
-    width: 38,
-    height: 38,
-    borderRadius: 12,
-    backgroundColor: "#F7FAFF",
+    width: 34,
+    height: 34,
+    borderRadius: 10,
+    backgroundColor: "#F7F9FF",
     borderWidth: 1,
-    borderColor: BORDER,
+    borderColor: "#EAF0FF",
     alignItems: "center",
     justifyContent: "center",
   },
 
   heroCard: {
-    marginHorizontal: 14,
-    marginTop: 4,
-    padding: 16,
+    marginHorizontal: 16,
+    marginTop: 6,
+    marginBottom: 4,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
     borderRadius: 22,
     borderWidth: 1,
-    borderColor: BORDER,
+    borderColor: "#DDE9FF",
     backgroundColor: "#F8FBFF",
-    flexDirection: "row",
-    alignItems: "flex-start",
+    overflow: "hidden",
   },
-  heroIconWrap: {
-    width: 54,
-    height: 54,
-    borderRadius: 16,
+  heroGlowA: {
+    position: "absolute",
+    width: 150,
+    height: 150,
+    borderRadius: 75,
+    backgroundColor: "rgba(11,114,255,0.12)",
+    top: -70,
+    right: -32,
+  },
+  heroGlowB: {
+    position: "absolute",
+    width: 120,
+    height: 120,
+    borderRadius: 60,
+    backgroundColor: "rgba(59,130,246,0.09)",
+    bottom: -55,
+    left: -22,
+  },
+  heroRow: {
+    flexDirection: "row",
     alignItems: "center",
-    justifyContent: "center",
-    marginRight: 14,
+    justifyContent: "flex-end",
+  },
+  heroChip: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+    backgroundColor: "#EDF4FF",
+    borderWidth: 1,
+    borderColor: "#D8E7FF",
+  },
+  heroChipText: {
+    marginLeft: 6,
+    fontSize: 11,
+    fontWeight: "800",
+    color: PRIMARY,
   },
   heroTitle: {
-    fontSize: 21,
+    marginTop: 6,
+    fontSize: 18,
     fontWeight: "900",
     color: TEXT,
   },
@@ -435,34 +499,34 @@ const styles = StyleSheet.create({
     fontWeight: "700",
   },
   heroText: {
-    marginTop: 8,
+    marginTop: 2,
     color: MUTED,
-    fontSize: 13,
-    lineHeight: 18,
+    fontSize: 12,
+    lineHeight: 16,
   },
 
   statsRow: {
     flexDirection: "row",
-    paddingHorizontal: 14,
-    marginTop: 12,
+    paddingHorizontal: 16,
+    marginTop: 8,
   },
   statCard: {
     flex: 1,
     marginRight: 10,
     backgroundColor: CARD,
     borderWidth: 1,
-    borderColor: BORDER,
-    borderRadius: 16,
-    paddingVertical: 13,
+    borderColor: "#E6EEFD",
+    borderRadius: 14,
+    paddingVertical: 8,
     alignItems: "center",
   },
   statCardLast: {
     flex: 1,
     backgroundColor: CARD,
     borderWidth: 1,
-    borderColor: BORDER,
-    borderRadius: 16,
-    paddingVertical: 13,
+    borderColor: "#E6EEFD",
+    borderRadius: 14,
+    paddingVertical: 8,
     alignItems: "center",
   },
   statValue: {
@@ -478,7 +542,7 @@ const styles = StyleSheet.create({
   },
 
   sectionHeader: {
-    paddingHorizontal: 14,
+    paddingHorizontal: 16,
     paddingTop: 18,
     paddingBottom: 8,
   },
@@ -495,7 +559,7 @@ const styles = StyleSheet.create({
   },
 
   emptyWrap: {
-    marginHorizontal: 14,
+    marginHorizontal: 16,
     marginTop: 8,
     borderWidth: 1,
     borderColor: BORDER,
@@ -526,32 +590,59 @@ const styles = StyleSheet.create({
   },
 
   card: {
-    marginHorizontal: 14,
-    marginBottom: 10,
+    marginHorizontal: 16,
+    marginBottom: 12,
     borderWidth: 1,
-    borderColor: BORDER,
-    borderRadius: 18,
-    padding: 12,
-    backgroundColor: CARD,
+    borderColor: "#E4ECFA",
+    borderRadius: 16,
+    paddingVertical: 12,
+    paddingHorizontal: 10,
+    backgroundColor: "#FFFFFF",
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.018,
+    shadowRadius: 6,
+    elevation: 0,
   },
-  cardTopRow: {
+  cardMain: {
     flexDirection: "row",
+    alignItems: "center",
     justifyContent: "space-between",
-    alignItems: "center",
   },
-  typeBadge: {
+  cardOrderBadge: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    backgroundColor: "#EDF4FF",
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 10,
+  },
+  cardOrderText: {
+    color: PRIMARY,
+    fontSize: 12,
+    fontWeight: "800",
+  },
+  cardTextWrap: {
+    flex: 1,
+    marginRight: 10,
+  },
+  cardTitle: {
+    fontSize: 14,
+    fontWeight: "800",
+    color: "#1B2B45",
+  },
+  cardMetaPrimary: {
+    marginTop: 3,
+    color: MUTED,
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  cardChipRow: {
+    marginTop: 8,
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "#EEF4FF",
-    borderRadius: 999,
-    paddingHorizontal: 9,
-    paddingVertical: 5,
-  },
-  typeText: {
-    marginLeft: 5,
-    color: PRIMARY,
-    fontSize: 10.5,
-    fontWeight: "800",
+    flexWrap: "wrap",
   },
   statusBadge: {
     flexDirection: "row",
@@ -565,28 +656,15 @@ const styles = StyleSheet.create({
     fontSize: 10.5,
     fontWeight: "800",
   },
-
-  cardTitle: {
-    marginTop: 10,
-    fontSize: 15,
-    fontWeight: "900",
-    color: TEXT,
-  },
-
-  metaGrid: {
-    marginTop: 10,
-    flexDirection: "row",
-    flexWrap: "wrap",
-  },
   metaChip: {
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "#F8FAFF",
+    backgroundColor: "#F4F7FD",
     borderWidth: 1,
-    borderColor: "#F1F4FA",
+    borderColor: "#E7EDF8",
     borderRadius: 999,
-    paddingHorizontal: 8,
-    paddingVertical: 6,
+    paddingHorizontal: 9,
+    paddingVertical: 5,
     marginRight: 8,
     marginBottom: 8,
   },
@@ -605,6 +683,9 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
+  },
+  cardScoreWrap: {
+    flex: 1,
   },
   scoreText: {
     color: SUCCESS,

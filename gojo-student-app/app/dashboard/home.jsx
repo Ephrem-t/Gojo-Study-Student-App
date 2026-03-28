@@ -16,6 +16,8 @@ import {
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import * as FileSystem from "expo-file-system/legacy";
+import * as MediaLibrary from "expo-media-library";
 import {
   ref,
   query,
@@ -42,6 +44,30 @@ import { queryUserByUsernameInSchool, queryUserByChildInSchool } from "../lib/us
 const SCREEN_WIDTH = Dimensions.get("window").width;
 const IMAGE_HEIGHT = Math.round(SCREEN_WIDTH * 0.9 * 0.65);
 const PAGE_SIZE = 20;
+const DESCRIPTION_PREVIEW_LENGTH = 140;
+
+function getFileExtensionFromUrl(url) {
+  if (!url) return "jpg";
+  const cleanUrl = url.split("?")[0] || "";
+  const ext = cleanUrl.split(".").pop()?.toLowerCase();
+  if (!ext || ext.length > 5) return "jpg";
+  return ext;
+}
+
+function getMimeTypeFromExtension(ext) {
+  switch (ext) {
+    case "png":
+      return "image/png";
+    case "webp":
+      return "image/webp";
+    case "gif":
+      return "image/gif";
+    case "heic":
+      return "image/heic";
+    default:
+      return "image/jpeg";
+  }
+}
 
 function timeAgo(iso) {
   if (!iso) return "";
@@ -61,6 +87,14 @@ function timeAgo(iso) {
   return `${years}y`;
 }
 
+function formatTargetRoleLabel(data) {
+  const raw = data?.targetRole ?? data?.target ?? "all";
+  const normalized = String(raw).trim().toLowerCase();
+
+  if (!normalized || normalized === "all") return "All";
+  return normalized.charAt(0).toUpperCase() + normalized.slice(1);
+}
+
 export default function HomeScreen() {
   const [postsLatest, setPostsLatest] = useState([]);
   const [postsOlder, setPostsOlder] = useState([]);
@@ -69,6 +103,8 @@ export default function HomeScreen() {
   const [loadingMore, setLoadingMore] = useState(false);
   const [hasMore, setHasMore] = useState(true);
   const [userId, setUserId] = useState(null);
+  const [expandedDescriptions, setExpandedDescriptions] = useState({});
+  const [postMenuPostId, setPostMenuPostId] = useState(null);
 
   // large image viewer state
   const [viewerVisible, setViewerVisible] = useState(false);
@@ -466,12 +502,108 @@ export default function HomeScreen() {
     }
   };
 
+  const toggleDescription = useCallback((postId) => {
+    setExpandedDescriptions((prev) => ({
+      ...prev,
+      [postId]: !prev[postId],
+    }));
+  }, []);
+
+  const closePostMenu = useCallback(() => {
+    setPostMenuPostId(null);
+  }, []);
+
+  const openPostMenu = useCallback((postId) => {
+    setPostMenuPostId(postId);
+  }, []);
+
+  const handleReportPost = useCallback(() => {
+    (async () => {
+      const uid = userId || (await loadUserContext());
+      const postId = postMenuPostId;
+
+      closePostMenu();
+
+      if (!uid) {
+        Alert.alert("Not signed in", "You must be signed in to report posts.");
+        return;
+      }
+
+      if (!postId) return;
+
+      try {
+        const schoolKey = await AsyncStorage.getItem("schoolKey");
+        const reportPath = schoolKey
+          ? `Platform1/Schools/${schoolKey}/Posts/${postId}/reportBy/${uid}`
+          : `Posts/${postId}/reportBy/${uid}`;
+
+        const updates = {};
+        updates[reportPath] = true;
+        await update(ref(database), updates);
+
+        Alert.alert("Report", "This post has been reported.");
+      } catch (error) {
+        console.warn("report post failed:", error);
+        Alert.alert("Error", "Unable to report this post. Please try again.");
+      }
+    })();
+  }, [closePostMenu, loadUserContext, postMenuPostId, userId]);
+
+  const handleAboutAccount = useCallback(() => {
+    const selectedPost = combinedPosts.find((post) => post.postId === postMenuPostId);
+    closePostMenu();
+
+    if (!selectedPost) return;
+
+    const accountName = selectedPost.admin?.name || selectedPost.admin?.username || "School Admin";
+    const targetRole = formatTargetRoleLabel(selectedPost.data);
+
+    Alert.alert("About this account", `Posted by ${accountName}\nAudience: ${targetRole}`);
+  }, [combinedPosts, postMenuPostId, closePostMenu]);
+
+  const handleDownloadPost = useCallback(async () => {
+    const selectedPost = combinedPosts.find((post) => post.postId === postMenuPostId);
+    closePostMenu();
+
+    if (!selectedPost?.data?.postUrl) {
+      Alert.alert("Download", "This post does not have an image to download.");
+      return;
+    }
+
+    try {
+      const permission = await MediaLibrary.requestPermissionsAsync();
+      if (permission.status !== "granted") {
+        Alert.alert("Permission needed", "Allow photo access to save downloaded images.");
+        return;
+      }
+
+      const ext = getFileExtensionFromUrl(selectedPost.data.postUrl);
+      const fileName = `gojo-post-${selectedPost.postId || Date.now()}.${ext}`;
+      const downloadPath = `${FileSystem.cacheDirectory}${fileName}`;
+
+      await FileSystem.downloadAsync(selectedPost.data.postUrl, downloadPath);
+      await MediaLibrary.saveToLibraryAsync(downloadPath);
+      await FileSystem.deleteAsync(downloadPath, { idempotent: true });
+
+      Alert.alert("Download", "Image saved to your gallery.");
+    } catch (error) {
+      console.warn("download post failed:", error);
+      Alert.alert("Error", "Unable to download this image. Please try again.");
+    }
+  }, [combinedPosts, postMenuPostId, closePostMenu]);
+
   function PostCard({ item }) {
     const { postId, data, admin, likesMap = {}, seenMap = {} } = item;
     const likesCount = data.likeCount || Object.keys(likesMap || {}).length;
-    const seenCount = Object.keys(seenMap || {}).length;
     const isLiked = userId ? !!likesMap[userId] : false;
     const imageUri = data.postUrl || null;
+    const message = String(data.message || "").trim();
+    const targetRoleLabel = formatTargetRoleLabel(data);
+    const isExpanded = !!expandedDescriptions[postId];
+    const shouldTruncate = message.length > DESCRIPTION_PREVIEW_LENGTH;
+    const previewMessage = shouldTruncate && !isExpanded
+      ? `${message.slice(0, DESCRIPTION_PREVIEW_LENGTH).trimEnd()}...`
+      : message;
 
     const scale = useRef(new Animated.Value(1)).current;
     const animateHeart = () => {
@@ -492,40 +624,51 @@ export default function HomeScreen() {
             source={(admin && admin.profileImage) ? { uri: admin.profileImage } : require("../../assets/images/avatar_placeholder.png")}
             style={styles.avatar}
           />
-          <View style={{ flex: 1 }}>
+          <View style={styles.headerTextWrap}>
             <Text style={styles.username}>{admin?.name || admin?.username || "School Admin"}</Text>
-            <Text style={styles.time}>{timeAgo(data.time)}</Text>
+            <View style={styles.headerMetaRow}>
+              <Text style={styles.time}>{timeAgo(data.time)}</Text>
+              <Text style={styles.headerDot}>·</Text>
+              <Text style={styles.targetRoleText}>{targetRoleLabel}</Text>
+            </View>
           </View>
+          <TouchableOpacity style={styles.moreBtn} activeOpacity={0.8} onPress={() => openPostMenu(postId)}>
+            <Ionicons name="ellipsis-horizontal" size={20} color="#65676B" />
+          </TouchableOpacity>
         </View>
 
-        {/* FEATURE #2: tap to open large view */}
+        {message ? (
+          <View style={styles.messageWrap}>
+            <Text style={styles.messageText}>{previewMessage}</Text>
+            {shouldTruncate ? (
+              <TouchableOpacity activeOpacity={0.8} onPress={() => toggleDescription(postId)}>
+                <Text style={styles.seeMoreText}>{isExpanded ? "See less" : "See more"}</Text>
+              </TouchableOpacity>
+            ) : null}
+          </View>
+        ) : null}
+
         {imageUri ? (
-          <TouchableOpacity activeOpacity={0.95} onPress={() => { setViewerImage(imageUri); setViewerVisible(true); }}>
+          <TouchableOpacity
+            activeOpacity={0.95}
+            onPress={() => {
+              setViewerImage(imageUri);
+              setViewerVisible(true);
+            }}
+          >
             <Image source={{ uri: imageUri }} style={styles.postImage} resizeMode="cover" />
           </TouchableOpacity>
         ) : null}
 
-        <View style={styles.actionsRow}>
-          <View style={styles.leftActions}>
-            <TouchableOpacity onPress={onHeartPress} style={styles.iconBtn} activeOpacity={0.8}>
-              <Animated.View style={{ transform: [{ scale }] }}>
-                <Ionicons name={isLiked ? "heart" : "heart-outline"} size={28} color={isLiked ? "#E0245E" : "#111"} />
-              </Animated.View>
-            </TouchableOpacity>
+        <View style={styles.reactionsSummary}>
+          <View style={styles.reactionsLeft}>
+            <Text style={styles.reactionCountText}>{likesCount} {likesCount === 1 ? "like" : "likes"}</Text>
           </View>
-        </View>
-
-        <View style={styles.meta}>
-          <Text style={styles.likesText}>{likesCount} {likesCount === 1 ? "like" : "likes"}</Text>
-          <Text style={styles.messageText}>
-            <Text style={styles.username}>{admin?.username || admin?.name || ""}</Text>
-            {"  "}
-            {data.message}
-          </Text>
-          <View style={styles.bottomMetaRow}>
-            <Text style={styles.seenText}>{seenCount} seen</Text>
-            <Text style={styles.timeSmall}> • {new Date(data.time).toLocaleString?.() ?? ""}</Text>
-          </View>
+          <TouchableOpacity style={styles.likeIconOnlyBtn} activeOpacity={0.85} onPress={onHeartPress}>
+            <Animated.View style={{ transform: [{ scale }] }}>
+              <Ionicons name={isLiked ? "heart" : "heart-outline"} size={24} color={isLiked ? "#ED4956" : "#262626"} />
+            </Animated.View>
+          </TouchableOpacity>
         </View>
       </View>
     );
@@ -586,6 +729,31 @@ export default function HomeScreen() {
         ListFooterComponent={<ListFooter />}
       />
 
+      <Modal visible={!!postMenuPostId} transparent animationType="fade" onRequestClose={closePostMenu}>
+        <View style={styles.menuOverlay}>
+          <Pressable style={styles.menuBackdrop} onPress={closePostMenu} />
+          <View style={styles.menuSheetWrap}>
+            <View style={styles.menuSheetHandle} />
+            <View style={styles.menuSheet}>
+              <TouchableOpacity style={styles.menuItem} activeOpacity={0.85} onPress={handleAboutAccount}>
+                <Ionicons name="information-circle-outline" size={20} color="#262626" />
+                <Text style={styles.menuItemText}>About this account</Text>
+              </TouchableOpacity>
+              <View style={styles.menuDivider} />
+              <TouchableOpacity style={styles.menuItem} activeOpacity={0.85} onPress={handleDownloadPost}>
+                <Ionicons name="download-outline" size={20} color="#262626" />
+                <Text style={styles.menuItemText}>Download</Text>
+              </TouchableOpacity>
+              <View style={styles.menuDivider} />
+              <TouchableOpacity style={styles.menuItem} activeOpacity={0.85} onPress={handleReportPost}>
+                <Ionicons name="flag-outline" size={20} color="#ED4956" />
+                <Text style={[styles.menuItemText, styles.menuItemDanger]}>Report</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
       {/* FEATURE #2: full-screen image modal */}
       <Modal visible={viewerVisible} transparent animationType="fade" onRequestClose={() => setViewerVisible(false)}>
         <View style={styles.viewerBg}>
@@ -606,50 +774,128 @@ export default function HomeScreen() {
 }
 
 const styles = StyleSheet.create({
-  list: { paddingVertical: 12, paddingHorizontal: 12, backgroundColor: "#fff" },
-  center: { flex: 1, alignItems: "center", justifyContent: "center", padding: 20, backgroundColor: "#fff" },
+  list: { paddingVertical: 10, backgroundColor: "#F0F2F5" },
+  center: { flex: 1, alignItems: "center", justifyContent: "center", padding: 20, backgroundColor: "#F0F2F5" },
   card: {
     backgroundColor: "#fff",
-    borderRadius: 12,
-    marginBottom: 16,
+    marginBottom: 10,
     overflow: "hidden",
-    borderColor: "#F1F3F8",
-    borderWidth: 1,
+    borderRadius: 0,
   },
   cardHeader: {
     flexDirection: "row",
     alignItems: "center",
-    padding: 12,
+    paddingHorizontal: 12,
+    paddingTop: 12,
+    paddingBottom: 8,
   },
-  avatar: { width: 46, height: 46, borderRadius: 23, marginRight: 10, backgroundColor: "#F6F8FF" },
+  avatar: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    marginRight: 10,
+    backgroundColor: "#E4E6EB",
+  },
 
-  username: { fontWeight: "700", color: "#111" },
-  time: { color: "#888", fontSize: 12, marginTop: 2 },
+  headerTextWrap: { flex: 1 },
+  username: { fontWeight: "700", color: "#050505", fontSize: 15 },
+  headerMetaRow: { flexDirection: "row", alignItems: "center", marginTop: 2 },
+  time: { color: "#65676B", fontSize: 12 },
+  headerDot: { color: "#65676B", fontSize: 12, marginHorizontal: 4 },
+  targetRoleText: { color: "#65676B", fontSize: 12, fontWeight: "600" },
+  moreBtn: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  messageWrap: { paddingHorizontal: 12, paddingBottom: 10 },
+  messageText: { color: "#050505", lineHeight: 20, fontSize: 15 },
+  seeMoreText: {
+    color: "#65676B",
+    fontSize: 14,
+    fontWeight: "600",
+    marginTop: 4,
+  },
 
   postImage: {
     width: "100%",
     height: IMAGE_HEIGHT,
-    backgroundColor: "#EEE",
+    backgroundColor: "#DDD",
   },
-
-  actionsRow: {
+  reactionsSummary: {
     flexDirection: "row",
     justifyContent: "space-between",
-    paddingHorizontal: 10,
-    paddingVertical: 8,
+    alignItems: "center",
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  reactionsLeft: {
+    flexDirection: "row",
     alignItems: "center",
   },
-  leftActions: { flexDirection: "row", alignItems: "center" },
-
-  iconBtn: { padding: 6 },
-
-  meta: { paddingHorizontal: 12, paddingBottom: 12 },
-  likesText: { fontWeight: "700", marginBottom: 6, color: "#111" },
-  messageText: { color: "#222", lineHeight: 20 },
-
-  bottomMetaRow: { flexDirection: "row", marginTop: 8, alignItems: "center" },
-  seenText: { color: "#888", fontSize: 12 },
-  timeSmall: { color: "#888", fontSize: 12 },
+  reactionCountText: {
+    color: "#262626",
+    fontSize: 13,
+    fontWeight: "700",
+  },
+  likeIconOnlyBtn: {
+    alignItems: "center",
+    justifyContent: "center",
+    width: 34,
+    height: 34,
+  },
+  menuOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.18)",
+  },
+  menuBackdrop: {
+    flex: 1,
+  },
+  menuSheetWrap: {
+    paddingHorizontal: 8,
+    paddingBottom: 10,
+  },
+  menuSheetHandle: {
+    alignSelf: "center",
+    width: 38,
+    height: 4,
+    borderRadius: 999,
+    backgroundColor: "rgba(255,255,255,0.7)",
+    marginBottom: 10,
+  },
+  menuSheet: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 22,
+    paddingVertical: 6,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: -4 },
+    shadowOpacity: 0.08,
+    shadowRadius: 18,
+    elevation: 12,
+  },
+  menuItem: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    paddingHorizontal: 18,
+    paddingVertical: 16,
+  },
+  menuItemText: {
+    color: "#262626",
+    fontSize: 16,
+    fontWeight: "600",
+  },
+  menuItemDanger: {
+    color: "#ED4956",
+  },
+  menuDivider: {
+    height: 1,
+    backgroundColor: "#F3F3F3",
+    marginHorizontal: 18,
+  },
 
   emptyContainer: { flex: 1, backgroundColor: "#fff", alignItems: "center", justifyContent: "center", padding: 28 },
   emptyImage: { width: 220, height: 160, marginBottom: 18 },

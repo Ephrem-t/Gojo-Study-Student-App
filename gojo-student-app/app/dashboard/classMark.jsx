@@ -454,7 +454,7 @@ export default function ClassMarkScreen() {
             </View>
 
             <TouchableOpacity style={styles.moreBtn} onPress={() => openSheet(courseKey, data.name || data.subject)}>
-              <Ionicons name="chevron-forward" size={22} color={MUTED} />
+              <Ionicons name="information-circle-outline" size={22} color={MUTED} />
             </TouchableOpacity>
           </View>
 
@@ -513,8 +513,7 @@ export default function ClassMarkScreen() {
 
   return (
     <View style={styles.container}>
-      <ScrollView contentContainerStyle={{ padding: 12, paddingBottom: 80 }}>
-        <Text style={styles.title}>Class Marks</Text>
+      <ScrollView contentContainerStyle={{ paddingHorizontal: 12, paddingTop: 0, paddingBottom: 80 }}>
         <Text style={styles.subtitle}>Tap a card to expand quick details. Open details for a complete breakdown.</Text>
 
         <FlatList
@@ -522,7 +521,7 @@ export default function ClassMarkScreen() {
           keyExtractor={(i) => i.key}
           renderItem={CourseTile}
           ItemSeparatorComponent={() => <View style={{ height: 12 }} />}
-          contentContainerStyle={{ paddingTop: 12 }}
+          contentContainerStyle={{ paddingTop: 6 }}
           scrollEnabled={false}
         />
       </ScrollView>
@@ -675,23 +674,73 @@ function CourseSheetInner({ courseKey, courseName, marks = {}, onClose, selected
 /* styles */
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#fff" },
-  title: { fontSize: 22, fontWeight: "700", color: "#111", padding: 12 },
   subtitle: { color: MUTED, paddingHorizontal: 12 },
   center: { flex: 1, alignItems: "center", justifyContent: "center" },
 
   cardWrapper: { marginBottom: 12 },
-  cardView: { backgroundColor: "#fff", borderRadius: 16, borderWidth: 1, borderColor: CARD_BORDER, padding: 12, elevation: 2, shadowColor: "#000", shadowOpacity: 0.03, shadowRadius: 6 },
-  cardInner: { flexDirection: "row", alignItems: "center" },
-  subjectImage: { width: 80, height: 80, borderRadius: 10 },
-  subjectName: { fontWeight: "700", fontSize: 16, color: "#111" },
-  gradeSection: { color: MUTED, marginTop: 6 },
-  smallMuted: { color: MUTED, fontSize: 12 },
+  cardView: {
+    backgroundColor: "#fff",
+    borderRadius: 22,
+    borderWidth: 1,
+    borderColor: "#E7EDF8",
+    overflow: "hidden",
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.025,
+    shadowRadius: 10,
+    elevation: 1,
+  },
+  cardInner: {
+    paddingHorizontal: 16,
+    paddingVertical: 15,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  subjectImage: {
+    width: 56,
+    height: 74,
+    borderRadius: 14,
+    backgroundColor: "#F7F9FC",
+    borderWidth: 1,
+    borderColor: "#EEF2F8",
+  },
+  subjectName: { fontWeight: "900", fontSize: 17, color: "#0B2540" },
+  gradeSection: { color: "#667085", marginTop: 4, fontSize: 12, fontWeight: "700" },
+  smallMuted: { color: MUTED, fontSize: 11, fontWeight: "700" },
   percentText: { fontWeight: "800" },
-  moreBtn: { paddingHorizontal: 6 },
+  moreBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#E5ECFA",
+    backgroundColor: "#F8FBFF",
+    alignItems: "center",
+    justifyContent: "center",
+    marginLeft: 10,
+  },
 
-  details: { marginTop: 12, paddingTop: 12, borderTopWidth: 1, borderTopColor: "#F1F3F8" },
-  semLabel: { fontWeight: "700", marginBottom: 8 },
-  assessmentRow: { flexDirection: "row", alignItems: "center", marginBottom: 8 },
+  details: {
+    paddingHorizontal: 14,
+    paddingTop: 12,
+    paddingBottom: 14,
+    backgroundColor: "#F8FBFF",
+    borderTopWidth: 1,
+    borderTopColor: "#EAF0FB",
+  },
+  semLabel: { fontWeight: "800", marginBottom: 10, color: "#0B2540" },
+  assessmentRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 8,
+    borderWidth: 1,
+    borderColor: "#E4ECFA",
+    borderRadius: 14,
+    backgroundColor: "#FFFFFF",
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+  },
   assName: { fontWeight: "600" },
   assMeta: { color: MUTED, marginTop: 4 },
   noAssess: { color: MUTED, fontStyle: "italic" },

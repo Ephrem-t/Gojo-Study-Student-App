@@ -9,7 +9,6 @@ import {
   ActivityIndicator,
   Image,
   RefreshControl,
-  TextInput,
   Platform,
   StatusBar,
   Modal,
@@ -83,28 +82,88 @@ async function resolveUserProfile(userId) {
 
 async function resolveStudentAndSchoolDetails(userId, fallbackSchoolCode) {
   try {
-    const schoolCode = fallbackSchoolCode || null;
-    if (!schoolCode) return { student: null, schoolInfo: null };
+    if (!userId) return { student: null, schoolInfo: null, schoolCode: null, user: null };
 
-    const usersSnap = await get(ref(database, `Platform1/Schools/${schoolCode}/Users/${userId}`));
-    const user = usersSnap?.exists() ? usersSnap.val() : null;
-    const studentId = user?.studentId || null;
+    const candidates = [];
+    if (fallbackSchoolCode) candidates.push(fallbackSchoolCode);
 
-    let student = null;
-    if (studentId) {
-      const st = await get(ref(database, `Platform1/Schools/${schoolCode}/Students/${studentId}`));
-      if (st?.exists()) student = st.val();
+    const { schoolCode: profileSchoolCode } = await resolveUserProfile(userId);
+    if (profileSchoolCode && !candidates.includes(profileSchoolCode)) {
+      candidates.push(profileSchoolCode);
     }
 
-    const schoolInfoSnap = await get(ref(database, `Platform1/Schools/${schoolCode}/schoolInfo`));
-    const schoolInfo = schoolInfoSnap?.exists() ? schoolInfoSnap.val() : null;
+    try {
+      const pref = String(userId).slice(0, 3).toUpperCase();
+      const idx = await get(ref(database, `Platform1/schoolCodeIndex/${pref}`));
+      const indexedSchoolCode = idx?.val() || null;
+      if (indexedSchoolCode && !candidates.includes(indexedSchoolCode)) {
+        candidates.push(indexedSchoolCode);
+      }
+    } catch {}
 
-    return { student, schoolInfo };
+    for (const schoolCode of candidates) {
+      if (!schoolCode) continue;
+
+      let user = null;
+
+      const usersSnap = await get(ref(database, `Platform1/Schools/${schoolCode}/Users/${userId}`));
+      if (usersSnap?.exists()) user = usersSnap.val();
+
+      if (!user) {
+        try {
+          const byUsername = await queryUserByUsernameInSchool(userId, schoolCode);
+          if (byUsername?.exists()) {
+            byUsername.forEach((c) => {
+              user = c.val();
+              return true;
+            });
+          }
+        } catch {}
+      }
+
+      if (!user) {
+        try {
+          const byUserId = await queryUserByChildInSchool("userId", userId, schoolCode);
+          if (byUserId?.exists()) {
+            byUserId.forEach((c) => {
+              user = c.val();
+              return true;
+            });
+          }
+        } catch {}
+      }
+
+      const studentId = user?.studentId || null;
+
+      let student = null;
+      if (studentId) {
+        const st = await get(ref(database, `Platform1/Schools/${schoolCode}/Students/${studentId}`));
+        if (st?.exists()) student = st.val();
+      }
+
+      const schoolInfoSnap = await get(ref(database, `Platform1/Schools/${schoolCode}/schoolInfo`));
+      const schoolInfo = schoolInfoSnap?.exists() ? schoolInfoSnap.val() : null;
+
+      if (user || student || schoolInfo) {
+        return { student, schoolInfo, schoolCode, user };
+      }
+    }
+
+    return { student: null, schoolInfo: null, schoolCode: fallbackSchoolCode || null, user: null };
   } catch {
-    return { student: null, schoolInfo: null };
+    return { student: null, schoolInfo: null, schoolCode: fallbackSchoolCode || null, user: null };
   }
 }
-function PodiumItem({ item, place, rankColor, animatedStyle }) {
+
+function extractStudentGrade(student) {
+  const raw =
+    student?.basicStudentInformation?.grade ||
+    student?.grade ||
+    "";
+  const normalized = normalizeGrade(raw);
+  return normalized ? `Grade ${normalized}` : "-";
+}
+function PodiumItem({ item, place, rankColor, animatedStyle, onPress }) {
   const isFirst = place === 1;
   const medalColor = rankColor(place);
 
@@ -145,37 +204,39 @@ function PodiumItem({ item, place, rankColor, animatedStyle }) {
 
   return (
     <Animated.View style={[styles.podiumCol, isFirst ? styles.podiumCenter : null, animatedStyle]}>
-      <View
-        style={[
-          styles.podiumAvatarWrap,
-          isFirst ? styles.podiumAvatarWrapFirst : null,
-          { borderColor: medalColor },
-        ]}
-      >
-        {item.avatar ? (
-          <Image source={{ uri: item.avatar }} style={styles.podiumAvatar} />
-        ) : (
-          <View style={styles.podiumAvatarFallback}>
-            <Text style={styles.initial}>{(item.name || "U")[0]}</Text>
+      <TouchableOpacity activeOpacity={0.9} onPress={onPress} style={styles.podiumTouch}>
+        <View
+          style={[
+            styles.podiumAvatarWrap,
+            isFirst ? styles.podiumAvatarWrapFirst : null,
+            { borderColor: medalColor },
+          ]}
+        >
+          {item.avatar ? (
+            <Image source={{ uri: item.avatar }} style={styles.podiumAvatar} />
+          ) : (
+            <View style={styles.podiumAvatarFallback}>
+              <Text style={styles.initial}>{(item.name || "U")[0]}</Text>
+            </View>
+          )}
+          <View style={[styles.medalBadge, { backgroundColor: medalColor }]}>
+            <Text style={styles.medalText}>{place}</Text>
           </View>
-        )}
-        <View style={[styles.medalBadge, { backgroundColor: medalColor }]}>
-          <Text style={styles.medalText}>{place}</Text>
         </View>
-      </View>
 
-      <Text numberOfLines={1} style={styles.podiumName}>{item.name}</Text>
-      <Text style={styles.podiumPts}>{item.totalPoints} pts</Text>
+        <Text numberOfLines={1} style={styles.podiumName}>{item.name}</Text>
+        <Text style={styles.podiumPts}>{item.totalPoints} pts</Text>
 
-      <View
-        style={[
-          styles.podiumBlock,
-          isFirst ? styles.podiumBlockFirst : styles.podiumBlockSide,
-          { backgroundColor: `${medalColor}33` },
-        ]}
-      >
-        <Text style={[styles.podiumBlockText, { color: medalColor }]}>#{place}</Text>
-      </View>
+        <View
+          style={[
+            styles.podiumBlock,
+            isFirst ? styles.podiumBlockFirst : styles.podiumBlockSide,
+            { backgroundColor: `${medalColor}33` },
+          ]}
+        >
+          <Text style={[styles.podiumBlockText, { color: medalColor }]}>#{place}</Text>
+        </View>
+      </TouchableOpacity>
     </Animated.View>
   );
 }
@@ -187,6 +248,7 @@ export default function LeaderboardScreen() {
 
   const [country, setCountry] = useState("Ethiopia");
   const [schoolCode, setSchoolCode] = useState(null);
+  const [schoolName, setSchoolName] = useState(null);
   const [grade, setGrade] = useState("7");
   const [scope, setScope] = useState("country");
 
@@ -194,7 +256,6 @@ export default function LeaderboardScreen() {
   const [schoolRows, setSchoolRows] = useState([]);
 
   const [myUserId, setMyUserId] = useState(null);
-  const [search, setSearch] = useState("");
 
   const [profileModalVisible, setProfileModalVisible] = useState(false);
   const [profileLoading, setProfileLoading] = useState(false);
@@ -206,7 +267,8 @@ export default function LeaderboardScreen() {
   const secondAnim = useRef(new Animated.Value(0)).current;
   const thirdAnim = useRef(new Animated.Value(0)).current;
 
-  const enrichRows = useCallback(async (valObj) => {
+  const enrichRows = useCallback(async (valObj, activeGrade) => {
+    const targetGrade = normalizeGrade(activeGrade);
     const base = Object.keys(valObj || {}).map((uid) => ({
       userId: uid,
       rank: Number(valObj[uid]?.rank || 9999),
@@ -214,17 +276,26 @@ export default function LeaderboardScreen() {
     }));
     base.sort((a, b) => a.rank - b.rank);
 
-    return Promise.all(
+    const resolved = await Promise.all(
       base.map(async (r) => {
         const { profile, schoolCode: resolvedSchool } = await resolveUserProfile(r.userId);
+        const details = await resolveStudentAndSchoolDetails(r.userId, resolvedSchool);
+        const studentGrade = normalizeGrade(
+          details?.student?.basicStudentInformation?.grade ||
+          details?.student?.grade ||
+          ""
+        );
         return {
           ...r,
           name: profile?.name || profile?.username || r.userId,
           avatar: profile?.profileImage || null,
           schoolCode: resolvedSchool || null,
+          studentGrade,
         };
       })
     );
+
+    return resolved.filter((r) => !!r.studentGrade && r.studentGrade === targetGrade);
   }, []);
 
   const load = useCallback(async () => {
@@ -254,6 +325,17 @@ export default function LeaderboardScreen() {
       } catch {}
     }
     setSchoolCode(mySchool);
+    if (mySchool) {
+      try {
+        const schoolInfoSnap = await get(ref(database, `Platform1/Schools/${mySchool}/schoolInfo`));
+        const info = schoolInfoSnap?.exists() ? schoolInfoSnap.val() : null;
+        setSchoolName(info?.name || info?.schoolName || mySchool);
+      } catch {
+        setSchoolName(mySchool);
+      }
+    } else {
+      setSchoolName(null);
+    }
 
     const gradeKey = `grade${g}`;
     const countryPath = `Platform1/rankings/country/${c}/${gradeKey}/leaderboard`;
@@ -261,13 +343,14 @@ export default function LeaderboardScreen() {
 
     const countrySnapLb = await getSnapshot([countryPath]);
     const countryVal = countrySnapLb?.val ? countrySnapLb.val() : null;
-    const enrichedCountry = countryVal ? await enrichRows(countryVal) : [];
+    const enrichedCountry = countryVal ? await enrichRows(countryVal, g) : [];
     setCountryRows(enrichedCountry);
 
     if (schoolPath) {
       const schoolSnapLb = await getSnapshot([schoolPath]);
-      const schoolVal = schoolSnapLb?.val ? schoolSnapLb.val() : null;
-      const enrichedSchool = schoolVal ? await enrichRows(schoolVal) : [];
+      const schoolValRaw = schoolSnapLb?.val ? schoolSnapLb.val() : null;
+      const schoolVal = schoolValRaw?.leaderboard || schoolValRaw;
+      const enrichedSchool = schoolVal ? await enrichRows(schoolVal, g) : [];
       setSchoolRows(enrichedSchool);
     } else {
       setSchoolRows([]);
@@ -288,15 +371,6 @@ export default function LeaderboardScreen() {
     () => (scope === "school" ? schoolRows : countryRows),
     [scope, schoolRows, countryRows]
   );
-
-  const filteredRows = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    if (!q) return rows;
-    return rows.filter((r) =>
-      String(r.name || "").toLowerCase().includes(q) ||
-      String(r.userId || "").toLowerCase().includes(q)
-    );
-  }, [rows, search]);
 
   const top3 = useMemo(() => rows.filter((r) => r.rank <= 3).sort((a, b) => a.rank - b.rank), [rows]);
   const myRow = useMemo(() => rows.find((r) => r.userId === myUserId) || null, [rows, myUserId]);
@@ -401,14 +475,26 @@ export default function LeaderboardScreen() {
     setProfileLoading(true);
     setSelectedProfile(null);
 
-    const { student, schoolInfo } = await resolveStudentAndSchoolDetails(item.userId, item.schoolCode);
+    const { student, schoolInfo, schoolCode: resolvedSchoolCode, user } =
+      await resolveStudentAndSchoolDetails(item.userId, item.schoolCode);
 
-    const gender = student?.basicStudentInformation?.gender || student?.gender || "";
-    const dob = student?.basicStudentInformation?.dob || student?.dob || "";
-    const age = yearsFromDob(dob);
+    const gender =
+      student?.basicStudentInformation?.gender ||
+      student?.gender ||
+      user?.gender ||
+      "";
+    const gradeLabel = extractStudentGrade(student);
+    const schoolName =
+      schoolInfo?.name ||
+      schoolInfo?.schoolName ||
+      user?.schoolName ||
+      user?.schoolCode ||
+      item.schoolName ||
+      resolvedSchoolCode ||
+      item.schoolCode ||
+      "";
 
     const city =
-      student?.addressInformation?.city ||
       schoolInfo?.city ||
       schoolInfo?.address?.city ||
       "";
@@ -425,9 +511,8 @@ export default function LeaderboardScreen() {
       points: item.totalPoints,
       avatar: item.avatar,
       gender,
-      age,
-      schoolName: schoolInfo?.name || "",
-      schoolCode: item.schoolCode || "",
+      grade: gradeLabel,
+      school: schoolName,
       city,
       region,
     });
@@ -450,7 +535,7 @@ export default function LeaderboardScreen() {
       <StatusBar barStyle="dark-content" backgroundColor={C.bg} />
 
       <View style={styles.header}>
-        <TouchableOpacity onPress={() => router.back()} style={styles.backBtn}>
+        <TouchableOpacity onPress={() => router.replace("/dashboard/exam")} style={styles.backBtn}>
           <Ionicons name="chevron-back" size={22} color={C.text} />
         </TouchableOpacity>
         <View style={{ flex: 1 }}>
@@ -458,12 +543,12 @@ export default function LeaderboardScreen() {
           <Text style={styles.sub}>
             {scope === "country"
               ? `${country} • Grade ${grade}`
-              : `${schoolCode || "My School"} • Grade ${grade}`}
+              : `${schoolName || "My School"} • Grade ${grade}`}
           </Text>
         </View>
       </View>
 
-      <View style={styles.toggleWrap}>
+      <View style={styles.toggleWrapTopOnly}>
         <TouchableOpacity
           onPress={() => setScope("country")}
           style={[styles.toggleBtn, scope === "country" ? styles.toggleOn : styles.toggleOff]}
@@ -475,44 +560,43 @@ export default function LeaderboardScreen() {
 
         <TouchableOpacity
           onPress={() => setScope("school")}
-          style={[styles.toggleBtn, scope === "school" ? styles.toggleOn : styles.toggleOff]}
+          style={[styles.toggleBtn, scope === "school" ? styles.toggleOn : styles.toggleOff, !schoolCode ? styles.toggleDisabled : null]}
           disabled={!schoolCode}
         >
           <Text style={scope === "school" ? styles.toggleTextOn : styles.toggleTextOff}>
-            School
+            Your School
           </Text>
         </TouchableOpacity>
       </View>
 
-      <View style={styles.searchWrap}>
-        <Ionicons name="search-outline" size={18} color={C.muted} />
-        <TextInput
-          value={search}
-          onChangeText={setSearch}
-          placeholder="Search student by name or ID"
-          placeholderTextColor="#9CA7CF"
-          style={styles.searchInput}
-        />
-      </View>
-
-      {myRow ? (
-        <View style={styles.meCard}>
-          <Text style={styles.meText}>Your Rank</Text>
-          <Text style={styles.meRank}>#{myRow.rank}</Text>
-          <Text style={styles.mePts}>{myRow.totalPoints} pts</Text>
-        </View>
-      ) : null}
-
       {hasPodium ? (
         <View style={styles.podiumWrap}>
-          <PodiumItem item={podium.second} place={2} rankColor={rankColor} animatedStyle={secondAnimatedStyle} />
-          <PodiumItem item={podium.first} place={1} rankColor={rankColor} animatedStyle={firstAnimatedStyle} />
-          <PodiumItem item={podium.third} place={3} rankColor={rankColor} animatedStyle={thirdAnimatedStyle} />
+          <PodiumItem
+            item={podium.second}
+            place={2}
+            rankColor={rankColor}
+            animatedStyle={secondAnimatedStyle}
+            onPress={() => podium.second && openStudentProfile(podium.second)}
+          />
+          <PodiumItem
+            item={podium.first}
+            place={1}
+            rankColor={rankColor}
+            animatedStyle={firstAnimatedStyle}
+            onPress={() => podium.first && openStudentProfile(podium.first)}
+          />
+          <PodiumItem
+            item={podium.third}
+            place={3}
+            rankColor={rankColor}
+            animatedStyle={thirdAnimatedStyle}
+            onPress={() => podium.third && openStudentProfile(podium.third)}
+          />
         </View>
       ) : null}
 
       <FlatList
-        data={filteredRows}
+        data={rows}
         keyExtractor={(i) => i.userId}
         contentContainerStyle={{ padding: 16, paddingBottom: 26 }}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={C.primary} />}
@@ -525,7 +609,9 @@ export default function LeaderboardScreen() {
         renderItem={({ item }) => (
           <TouchableOpacity activeOpacity={0.9} onPress={() => openStudentProfile(item)}>
             <View style={[styles.row, item.userId === myUserId ? styles.myRow : null]}>
-              <Text style={[styles.rank, { color: rankColor(item.rank) }]}>#{item.rank}</Text>
+              <View style={[styles.rankPill, { backgroundColor: `${rankColor(item.rank)}1E` }]}>
+                <Text style={[styles.rank, { color: rankColor(item.rank) }]}>#{item.rank}</Text>
+              </View>
               {item.avatar ? (
                 <Image source={{ uri: item.avatar }} style={styles.avatar} />
               ) : (
@@ -535,9 +621,14 @@ export default function LeaderboardScreen() {
               )}
               <View style={{ flex: 1, marginLeft: 10 }}>
                 <Text numberOfLines={1} style={styles.name}>{item.name}</Text>
-                <Text style={styles.points}>{item.totalPoints} points</Text>
+                <View style={styles.pointsChip}>
+                  <Ionicons name="trophy-outline" size={12} color={C.primary} />
+                  <Text style={styles.points}>{item.totalPoints} points</Text>
+                </View>
               </View>
-              <Ionicons name="chevron-forward" size={18} color={C.muted} />
+              <View style={styles.rowChevronWrap}>
+                <Ionicons name="chevron-forward" size={16} color={C.muted} />
+              </View>
             </View>
           </TouchableOpacity>
         )}
@@ -571,10 +662,9 @@ export default function LeaderboardScreen() {
                 </View>
 
                 <View style={styles.infoGrid}>
-                  <InfoRow label="Age" value={selectedProfile?.age || "-"} />
+                  <InfoRow label="Grade" value={selectedProfile?.grade || "-"} />
                   <InfoRow label="Gender" value={selectedProfile?.gender || "-"} />
-                  <InfoRow label="School" value={selectedProfile?.schoolName || "-"} />
-                  <InfoRow label="School Code" value={selectedProfile?.schoolCode || "-"} />
+                  <InfoRow label="School" value={selectedProfile?.school || "-"} />
                   <InfoRow label="Region" value={selectedProfile?.region || "-"} />
                   <InfoRow label="City" value={selectedProfile?.city || "-"} />
                 </View>
@@ -623,15 +713,86 @@ const styles = StyleSheet.create({
   title: { fontSize: 22, fontWeight: "900", color: C.text },
   sub: { color: C.muted, marginTop: 2 },
 
-  toggleWrap: { flexDirection: "row", paddingHorizontal: 16, gap: 8, marginTop: 6 },
-  toggleBtn: { paddingVertical: 8, paddingHorizontal: 14, borderRadius: 10, borderWidth: 1 },
-  toggleOn: { backgroundColor: C.primary, borderColor: C.primary },
-  toggleOff: { backgroundColor: "#fff", borderColor: C.border },
-  toggleTextOn: { color: "#fff", fontWeight: "800" },
-  toggleTextOff: { color: C.text, fontWeight: "800" },
+  heroPanel: {
+    marginHorizontal: 16,
+    marginTop: 8,
+    borderRadius: 22,
+    borderWidth: 1,
+    borderColor: "#DDE9FF",
+    backgroundColor: "#F8FBFF",
+    padding: 14,
+    overflow: "hidden",
+  },
+  heroGlowA: {
+    position: "absolute",
+    width: 150,
+    height: 150,
+    borderRadius: 75,
+    backgroundColor: "rgba(11,114,255,0.12)",
+    top: -70,
+    right: -32,
+  },
+  heroGlowB: {
+    position: "absolute",
+    width: 120,
+    height: 120,
+    borderRadius: 60,
+    backgroundColor: "rgba(59,130,246,0.09)",
+    bottom: -55,
+    left: -22,
+  },
+  heroTopRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  heroChip: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#EDF4FF",
+    borderWidth: 1,
+    borderColor: "#D8E7FF",
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+  },
+  heroChipText: {
+    marginLeft: 6,
+    color: C.primary,
+    fontSize: 11,
+    fontWeight: "800",
+  },
+  heroMeta: {
+    color: C.muted,
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  toggleWrapTopOnly: {
+    flexDirection: "row",
+    gap: 8,
+    marginTop: 6,
+    paddingHorizontal: 16,
+    paddingBottom: 10,
+  },
+  toggleWrap: { flexDirection: "row", gap: 8, marginTop: 12 },
+  toggleBtn: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: "#DCE7FF",
+    backgroundColor: "#FFFFFF",
+    alignItems: "center",
+    justifyContent: "center",
+    flex: 1,
+  },
+  toggleOn: { backgroundColor: "#EEF4FF", borderColor: "#BBD3FF" },
+  toggleOff: { backgroundColor: "#fff", borderColor: "#DCE7FF" },
+  toggleDisabled: { opacity: 0.55 },
+  toggleTextOn: { color: C.primary, fontSize: 12, fontWeight: "700" },
+  toggleTextOff: { color: C.muted, fontSize: 12, fontWeight: "700" },
 
   searchWrap: {
-    marginHorizontal: 16,
     marginTop: 10,
     flexDirection: "row",
     alignItems: "center",
@@ -644,6 +805,32 @@ const styles = StyleSheet.create({
   },
   searchInput: { marginLeft: 8, flex: 1, color: C.text, fontWeight: "600" },
 
+  heroStatsRow: {
+    marginTop: 10,
+    flexDirection: "row",
+    gap: 8,
+  },
+  heroStatCard: {
+    flex: 1,
+    backgroundColor: "#FFFFFF",
+    borderWidth: 1,
+    borderColor: "#E6EEFD",
+    borderRadius: 14,
+    paddingVertical: 8,
+    alignItems: "center",
+  },
+  heroStatValue: {
+    color: C.primary,
+    fontSize: 16,
+    fontWeight: "900",
+  },
+  heroStatLabel: {
+    marginTop: 2,
+    color: C.muted,
+    fontSize: 11,
+    fontWeight: "700",
+  },
+
   meCard: {
     marginHorizontal: 16,
     marginTop: 10,
@@ -653,6 +840,10 @@ const styles = StyleSheet.create({
     borderRadius: 14,
     padding: 12,
     backgroundColor: "#F8FAFF",
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.03,
+    shadowRadius: 8,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
@@ -671,6 +862,7 @@ const styles = StyleSheet.create({
   },
   podiumCol: { flex: 1, alignItems: "center" },
   podiumCenter: { marginHorizontal: 4 },
+  podiumTouch: { width: "100%", alignItems: "center" },
 
   podiumAvatarWrap: {
     width: 66,
@@ -730,16 +922,29 @@ const styles = StyleSheet.create({
 
   row: {
     borderWidth: 1,
-    borderColor: C.border,
-    borderRadius: 14,
+    borderColor: "#E4ECFA",
+    borderRadius: 16,
     backgroundColor: "#fff",
     paddingHorizontal: 12,
-    paddingVertical: 10,
+    paddingVertical: 11,
     flexDirection: "row",
     alignItems: "center",
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.02,
+    shadowRadius: 6,
   },
   myRow: { backgroundColor: "#F1F7FF", borderColor: "#CFE1FF" },
-  rank: { width: 44, fontWeight: "900", fontSize: 16 },
+  rankPill: {
+    minWidth: 50,
+    height: 32,
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 10,
+  },
+  rank: { fontWeight: "900", fontSize: 15 },
   avatar: { width: 42, height: 42, borderRadius: 21 },
   avatarFallback: {
     width: 42,
@@ -751,7 +956,29 @@ const styles = StyleSheet.create({
   },
   initial: { color: "#fff", fontWeight: "900" },
   name: { color: C.text, fontWeight: "800", fontSize: 14 },
-  points: { color: C.muted, marginTop: 2, fontSize: 12 },
+  pointsChip: {
+    marginTop: 4,
+    alignSelf: "flex-start",
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#EEF4FF",
+    borderWidth: 1,
+    borderColor: "#DDE9FF",
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+  },
+  points: { color: C.primary, marginLeft: 5, fontSize: 11, fontWeight: "800" },
+  rowChevronWrap: {
+    width: 30,
+    height: 30,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#E5ECFA",
+    backgroundColor: "#F8FBFF",
+    alignItems: "center",
+    justifyContent: "center",
+  },
 
   emptyWrap: { alignItems: "center", paddingVertical: 30 },
   emptyText: { color: C.muted, fontWeight: "700" },
@@ -769,6 +996,8 @@ const styles = StyleSheet.create({
     backgroundColor: "#fff",
     borderRadius: 22,
     padding: 18,
+    borderWidth: 1,
+    borderColor: "#E6EEFD",
   },
   profileHero: {
     alignItems: "center",
@@ -784,6 +1013,8 @@ const styles = StyleSheet.create({
   modalRankBadge: {
     marginTop: 8,
     backgroundColor: "#EEF4FF",
+    borderWidth: 1,
+    borderColor: "#DCE8FF",
     borderRadius: 999,
     paddingHorizontal: 12,
     paddingVertical: 7,

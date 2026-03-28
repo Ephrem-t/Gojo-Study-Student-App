@@ -8,9 +8,9 @@ import {
   ActivityIndicator,
   Image,
   StatusBar,
-  Alert,
   ScrollView,
   RefreshControl,
+  TextInput,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import AsyncStorage from "@react-native-async-storage/async-storage";
@@ -26,7 +26,7 @@ const PRIMARY = "#007AFB";
 const MUTED = "#6B78A8";
 const AVATAR_PLACEHOLDER = require("../assets/images/avatar_placeholder.png");
 
-const FILTERS = ["All", "Management", "Teachers", "Parents"];
+const FILTERS = ["Parents", "Teachers", "Management", "Support"];
 const debounceWindowMs = 15 * 1000;
 
 function shortText(s, n = 60) {
@@ -54,9 +54,11 @@ export default function ChatsScreen() {
 
   const [loadingInitial, setLoadingInitial] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [filter, setFilter] = useState("All");
+  const [filter, setFilter] = useState(FILTERS[0]);
   const [contacts, setContacts] = useState([]);
   const [currentUserId, setCurrentUserId] = useState(null);
+  const [searchActive, setSearchActive] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
 
   const cacheRef = useRef({
     studentNodeKey: null,
@@ -202,6 +204,7 @@ export default function ChatsScreen() {
 
       // management sources: School_Admins + Registerers + Finances (NO HR)
       const managementMap = new Map(); // userId -> role label
+      const supportMap = new Map(); // userId -> role label
 
       try {
         const saSnap = await get(await getDbRef("School_Admins"));
@@ -233,10 +236,31 @@ export default function ChatsScreen() {
         }
       } catch {}
 
+      try {
+        const supportSnap = await get(await getDbRef("Support"));
+        if (supportSnap.exists()) {
+          supportSnap.forEach((child) => {
+            const v = child.val();
+            if (v?.userId) supportMap.set(String(v.userId), "Support");
+          });
+        }
+      } catch {}
+
+      try {
+        const supportsSnap = await get(await getDbRef("Supports"));
+        if (supportsSnap.exists()) {
+          supportsSnap.forEach((child) => {
+            const v = child.val();
+            if (v?.userId) supportMap.set(String(v.userId), "Support");
+          });
+        }
+      } catch {}
+
       const userNodeKeysToLoad = new Set([
         ...Array.from(teacherUserNodeKeys),
         ...Array.from(parentUserNodeKeys),
         ...Array.from(managementMap.keys()),
+        ...Array.from(supportMap.keys()),
       ]);
 
       const userProfiles = {};
@@ -301,6 +325,27 @@ export default function ChatsScreen() {
           role: roleLabel, // Registerer / Finance / Management
           profileImage: p?.profileImage || null,
           type: "management",
+          chatId: null,
+          lastMessage: null,
+          lastTime: null,
+          lastSenderId: null,
+          lastSeen: false,
+          unread: 0,
+        });
+      }
+
+      for (const nodeK of Array.from(supportMap.keys())) {
+        if (contactsMap.has(nodeK)) continue;
+        const p = userProfiles[nodeK] || null;
+        const roleLabel = supportMap.get(nodeK) || "Support";
+
+        contactsMap.set(nodeK, {
+          key: nodeK,
+          userId: p?.userId || nodeK,
+          name: p?.name || p?.username || roleLabel,
+          role: roleLabel,
+          profileImage: p?.profileImage || null,
+          type: "support",
           chatId: null,
           lastMessage: null,
           lastTime: null,
@@ -397,6 +442,16 @@ export default function ChatsScreen() {
     loadData({ background: false });
   }, [loadData]);
 
+  const onBackPress = useCallback(() => {
+    if (searchActive) {
+      setSearchActive(false);
+      setSearchQuery("");
+      return;
+    }
+
+    router.back();
+  }, [router, searchActive]);
+
   const onOpenChat = async (contact) => {
     if (!contact) return;
 
@@ -454,12 +509,24 @@ export default function ChatsScreen() {
     router.push("/messages");
   };
 
+  const normalizedSearchQuery = searchQuery.trim().toLowerCase();
+  const shouldShowSearchResults = normalizedSearchQuery.length > 0;
+
   const filteredContacts = contacts.filter((c) => {
-    if (filter === "All") return true;
+    if (normalizedSearchQuery) {
+      const haystack = [c.name, c.role, c.lastMessage]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+
+      return haystack.includes(normalizedSearchQuery);
+    }
+
     if (filter === "Management") return c.type === "management";
     if (filter === "Teachers") return c.type === "teacher";
     if (filter === "Parents") return c.type === "parent";
-    return true;
+    if (filter === "Support") return c.type === "support";
+    return false;
   });
 
   return (
@@ -467,33 +534,74 @@ export default function ChatsScreen() {
       <StatusBar barStyle="dark-content" backgroundColor="#ffffff" translucent={false} />
       <View style={styles.container}>
         <View style={styles.headerRow}>
-          <TouchableOpacity onPress={() => router.back()} style={styles.backButton}>
+          <TouchableOpacity onPress={onBackPress} style={styles.backButton}>
             <Ionicons name="chevron-back" size={22} color="#222" />
           </TouchableOpacity>
 
-          <Text style={styles.headerTitle}>Messages</Text>
+          {searchActive ? (
+            <View style={styles.searchBar}>
+              <Ionicons name="search-outline" size={18} color={MUTED} />
+              <TextInput
+                autoFocus
+                value={searchQuery}
+                onChangeText={setSearchQuery}
+                placeholder="Search"
+                placeholderTextColor="#93A1C6"
+                style={styles.searchInput}
+                returnKeyType="search"
+              />
+              {searchQuery ? (
+                <TouchableOpacity onPress={() => setSearchQuery("")} style={styles.searchIconButton}>
+                  <Ionicons name="close-circle" size={18} color={MUTED} />
+                </TouchableOpacity>
+              ) : null}
+            </View>
+          ) : (
+            <Text style={styles.headerTitle}>Messages</Text>
+          )}
 
-          <TouchableOpacity onPress={() => Alert.alert("Search", "Search not implemented yet")}>
-            <Ionicons name="search-outline" size={20} color={MUTED} />
+          <TouchableOpacity
+            onPress={() => {
+              if (searchActive) {
+                setSearchActive(false);
+                setSearchQuery("");
+                return;
+              }
+              setSearchActive(true);
+            }}
+            style={styles.searchToggle}
+          >
+            <Ionicons name={searchActive ? "close" : "search-outline"} size={20} color={MUTED} />
           </TouchableOpacity>
         </View>
 
-        <View style={styles.filterContainer}>
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.filterScrollContent}>
-            {FILTERS.map((f) => (
-              <TouchableOpacity key={f} onPress={() => setFilter(f)} activeOpacity={0.85} style={[styles.filterPill, filter === f ? styles.filterPillActive : null]}>
-                <Text style={[styles.filterPillText, filter === f ? styles.filterPillTextActive : null]}>{f}</Text>
-              </TouchableOpacity>
-            ))}
-          </ScrollView>
-        </View>
+        {!searchActive ? (
+          <View style={styles.filterContainer}>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.filterScrollContent}>
+              {FILTERS.map((f) => (
+                <TouchableOpacity key={f} onPress={() => setFilter(f)} activeOpacity={0.85} style={[styles.filterPill, filter === f ? styles.filterPillActive : null]}>
+                  <Text style={[styles.filterPillText, filter === f ? styles.filterPillTextActive : null]}>{f}</Text>
+                </TouchableOpacity>
+              ))}
+            </ScrollView>
+          </View>
+        ) : null}
 
         {loadingInitial && contacts.length === 0 ? (
           <View style={styles.center}><ActivityIndicator size="large" color={PRIMARY} /></View>
+        ) : searchActive && !shouldShowSearchResults ? (
+          <View style={styles.emptyWrap}>
+            <Text style={styles.emptyTitle}>Search chats</Text>
+            <Text style={styles.emptySubtitle}>Type a name, role, or message to find a user.</Text>
+          </View>
         ) : filteredContacts.length === 0 ? (
           <View style={styles.emptyWrap}>
             <Text style={styles.emptyTitle}>No contacts</Text>
-            <Text style={styles.emptySubtitle}>No {filter.toLowerCase()} contacts found yet.</Text>
+            <Text style={styles.emptySubtitle}>
+              {normalizedSearchQuery
+                ? `No results for "${searchQuery.trim()}".`
+                : `No ${filter.toLowerCase()} contacts found yet.`}
+            </Text>
           </View>
         ) : (
           <FlatList
@@ -550,22 +658,62 @@ const styles = StyleSheet.create({
   headerRow: { paddingHorizontal: 12, paddingTop: 12, paddingBottom: 6, flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
   backButton: { width: 36, height: 36, alignItems: "center", justifyContent: "center" },
   headerTitle: { fontSize: 20, fontWeight: "800", color: "#111" },
+  searchToggle: { width: 36, height: 36, alignItems: "center", justifyContent: "center" },
+  searchBar: {
+    flex: 1,
+    height: 42,
+    marginHorizontal: 10,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "#DCE7FF",
+    backgroundColor: "#F8FBFF",
+    paddingHorizontal: 12,
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  searchInput: {
+    flex: 1,
+    marginLeft: 8,
+    color: "#111",
+    fontSize: 14,
+    fontWeight: "600",
+    paddingVertical: 0,
+  },
+  searchIconButton: {
+    width: 22,
+    height: 22,
+    alignItems: "center",
+    justifyContent: "center",
+    marginLeft: 6,
+  },
 
-  filterContainer: { height: 52, justifyContent: "center" },
-  filterScrollContent: { paddingHorizontal: 12, alignItems: "center" },
+  filterContainer: {
+    flexDirection: "row",
+    paddingHorizontal: 16,
+    paddingTop: 6,
+    paddingBottom: 6,
+  },
+  filterScrollContent: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
   filterPill: {
-    height: 36,
-    paddingHorizontal: 14,
-    borderRadius: 18,
-    backgroundColor: "#F8FAFF",
-    marginRight: 10,
-    minWidth: 88,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: "#DCE7FF",
+    backgroundColor: "#FFFFFF",
     justifyContent: "center",
     alignItems: "center",
   },
-  filterPillActive: { backgroundColor: PRIMARY },
-  filterPillText: { color: MUTED, fontWeight: "700", fontSize: 13 },
-  filterPillTextActive: { color: "#fff" },
+  filterPillActive: {
+    backgroundColor: "#EEF4FF",
+    borderColor: "#BBD3FF",
+  },
+  filterPillText: { color: MUTED, fontWeight: "700", fontSize: 12 },
+  filterPillTextActive: { color: PRIMARY },
 
   itemWrapper: { paddingHorizontal: 0 },
   row: { flexDirection: "row", alignItems: "center", paddingVertical: 12, backgroundColor: "#fff" },

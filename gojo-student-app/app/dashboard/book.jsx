@@ -11,12 +11,14 @@ import {
   Modal,
   SafeAreaView,
   Pressable,
+  ScrollView,
   TextInput,
   Switch,
   Animated,
+  PanResponder,
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { ref, get } from "firebase/database";
+import { ref, get, remove, update } from "firebase/database";
 import { database } from "../../constants/firebaseConfig";
 import { Ionicons } from "@expo/vector-icons";
 import * as FileSystem from "expo-file-system/legacy";
@@ -30,6 +32,7 @@ const CARD = "#FFFFFF";
 const BORDER = "#EAF0FF";
 const BG = "#ffffff";
 const SUCCESS = "#12B76A";
+const MAX_NOTES_PER_CHAPTER = 5;
 
 const BOOKS_DIR = `${FileSystem.documentDirectory}books/`;
 const DOWNLOAD_INDEX_KEY = "downloaded_books_index_v1";
@@ -115,6 +118,132 @@ function getSubjectColor(subjectName) {
   return '#90A4AE';
 }
 
+function normalizeChapterNotes(value) {
+  if (!value || typeof value !== "object") return [];
+
+  const nestedNotes = value.notes && typeof value.notes === "object"
+    ? Object.entries(value.notes)
+        .map(([noteId, note]) => ({ ...(note || {}), noteId }))
+        .filter((note) => typeof note === "object")
+    : [];
+
+  if (typeof value.text === "string" || typeof value.title === "string") {
+    return [{ ...value, noteId: value.noteId || "legacy" }, ...nestedNotes];
+  }
+
+  return nestedNotes.length
+    ? nestedNotes
+    : Object.entries(value)
+    .map(([noteId, note]) => ({ ...(note || {}), noteId }))
+    .filter((note) => typeof note === "object" && (typeof note.text === "string" || typeof note.title === "string"));
+}
+
+function escapeHtml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function buildPremiumPdfReaderHtml(fileUrl, title) {
+  const safeJsFileUrl = JSON.stringify(String(fileUrl || ""));
+  const safeTitle = escapeHtml(title || "Chapter Reader");
+
+  return `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+    <title>${safeTitle}</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <style>
+      :root { --bg:#F4F7FF; --card:#FFFFFF; --line:#DCE6FA; --text:#13284B; --muted:#5D6F99; --primary:#0B72FF; }
+      html, body { margin:0; padding:0; background:var(--bg); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; color:var(--text); overflow-x:hidden; }
+      .wrap { min-height:100vh; display:flex; flex-direction:column; }
+      .pages { padding:0; display:flex; flex-direction:column; gap:0; }
+      .pageCard { background:var(--card); border:none; border-radius:0; padding:0; box-shadow:none; }
+      canvas { width:100% !important; height:auto !important; border-radius:10px; display:block; }
+      .state { margin:16px 12px; border:1px dashed var(--line); border-radius:14px; background:#fff; padding:14px; text-align:center; color:var(--muted); font-weight:700; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div id="state" class="state">Loading chapter...</div>
+      <div id="pages" class="pages"></div>
+    </div>
+
+    <script>
+      const fileUrl = ${safeJsFileUrl};
+      const stateEl = document.getElementById("state");
+      const pagesEl = document.getElementById("pages");
+
+      let pdfDoc = null;
+      let zoomFactor = 1;
+
+      async function renderAllPages() {
+        if (!pdfDoc) return;
+        pagesEl.innerHTML = "";
+
+        for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum += 1) {
+          const page = await pdfDoc.getPage(pageNum);
+          const baseViewport = page.getViewport({ scale: 1 });
+          const containerWidth = Math.max(320, pagesEl.clientWidth || window.innerWidth || 360);
+          const fitScale = containerWidth / baseViewport.width;
+          const viewport = page.getViewport({ scale: fitScale * zoomFactor });
+
+          const card = document.createElement("div");
+          card.className = "pageCard";
+
+          const canvas = document.createElement("canvas");
+          const context = canvas.getContext("2d");
+          canvas.width = viewport.width;
+          canvas.height = viewport.height;
+
+          card.appendChild(canvas);
+          pagesEl.appendChild(card);
+
+          await page.render({ canvasContext: context, viewport }).promise;
+        }
+      }
+
+      function setStateError(msg) {
+        stateEl.style.display = "block";
+        stateEl.textContent = msg;
+      }
+
+      function clearState() {
+        stateEl.style.display = "none";
+      }
+
+      window.addEventListener("resize", () => {
+        renderAllPages();
+      });
+
+      (async () => {
+        try {
+          if (!window.pdfjsLib) {
+            setStateError("Reader engine could not load.");
+            window.ReactNativeWebView?.postMessage(JSON.stringify({ type: "pdf_error", message: "pdfjs_unavailable" }));
+            return;
+          }
+
+          pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+          pdfDoc = await pdfjsLib.getDocument({ url: fileUrl, withCredentials: false }).promise;
+
+          clearState();
+          await renderAllPages();
+        } catch (err) {
+          setStateError("Could not render this PDF.");
+          window.ReactNativeWebView?.postMessage(JSON.stringify({ type: "pdf_error", message: String(err?.message || err || "error") }));
+        }
+      })();
+    </script>
+  </body>
+</html>`;
+}
+
 export default function BooksScreen() {
   const router = useRouter();
 
@@ -142,8 +271,21 @@ export default function BooksScreen() {
   const [downloadedFilesList, setDownloadedFilesList] = useState([]);
   const [managerVisible, setManagerVisible] = useState(false);
 
-  const [viewer, setViewer] = useState({ visible: false, uri: null, title: "" });
+  const [viewer, setViewer] = useState({
+    visible: false,
+    html: null,
+    title: "",
+    subjectName: "",
+    sourceUrl: null,
+    localUri: null,
+    isOffline: false,
+    hasRetriedPremium: false,
+  });
+  const [viewerLoading, setViewerLoading] = useState(false);
   const [notesMap, setNotesMap] = useState({});
+  const [noteSheet, setNoteSheet] = useState({ visible: false, subject: null, unit: null });
+  const [noteReader, setNoteReader] = useState({ visible: false, subject: null, unit: null, note: null });
+  const [brokenCoverMap, setBrokenCoverMap] = useState({});
 
   const [showFloatingIndicators, setShowFloatingIndicators] = useState(false);
 
@@ -356,9 +498,55 @@ export default function BooksScreen() {
     }
   }, [ensureBooksDir, getLocalPathForUrl, registerDownloadMetadata, refreshDownloadedFiles]);
 
-  const openRemotePdfInViewer = useCallback((remoteUrl, title) => {
-    const gview = `https://docs.google.com/gview?embedded=1&url=${encodeURIComponent(remoteUrl)}`;
-    setViewer({ visible: true, uri: gview, title });
+  const closeViewer = useCallback(() => {
+    setViewerLoading(false);
+    setViewer({
+      visible: false,
+      html: null,
+      title: "",
+      subjectName: "",
+      sourceUrl: null,
+      localUri: null,
+      isOffline: false,
+      hasRetriedPremium: false,
+    });
+  }, []);
+
+  const openRemotePdfInViewer = useCallback((remoteUrl, title, subjectName = "", localUri = null) => {
+    const sourceForPremium = localUri || remoteUrl;
+    const premiumHtml = buildPremiumPdfReaderHtml(sourceForPremium, title);
+
+    setViewerLoading(true);
+    setViewer({
+      visible: true,
+      html: premiumHtml,
+      title,
+      subjectName,
+      sourceUrl: remoteUrl,
+      localUri: localUri || null,
+      isOffline: !!localUri,
+      hasRetriedPremium: false,
+    });
+  }, []);
+
+  const retryPremiumWithOnlineSource = useCallback(() => {
+    let changed = false;
+    setViewer((prev) => {
+      if (prev.hasRetriedPremium || !prev.sourceUrl) return prev;
+      changed = true;
+      return {
+        ...prev,
+        html: buildPremiumPdfReaderHtml(prev.sourceUrl, prev.title),
+        isOffline: false,
+        hasRetriedPremium: true,
+      };
+    });
+
+    if (changed) {
+      setViewerLoading(true);
+      return true;
+    }
+    return false;
   }, []);
 
   const deleteFile = useCallback(async (file) => {
@@ -428,8 +616,15 @@ export default function BooksScreen() {
         Object.keys(val).forEach((subjectKey) => {
           const subjectUnits = val[subjectKey] || {};
           Object.keys(subjectUnits).forEach((unitKey) => {
-            const note = subjectUnits[unitKey] || {};
-            next[`${subjectKey}__${unitKey}`] = note;
+            const chapterValue = subjectUnits[unitKey] || {};
+            const notes = normalizeChapterNotes(chapterValue)
+              .sort((a, b) => {
+                const ap = a?.pinned ? 1 : 0;
+                const bp = b?.pinned ? 1 : 0;
+                if (ap !== bp) return bp - ap;
+                return (b?.updatedAt || b?.createdAt || 0) - (a?.updatedAt || a?.createdAt || 0);
+              });
+            next[`${subjectKey}__${unitKey}`] = notes;
           });
         });
       }
@@ -484,7 +679,10 @@ export default function BooksScreen() {
           subjectKey,
           subjectName: titleize(subjectKey),
           title: b.title || titleize(subjectKey),
-          coverUrl: b.coverUrl || null,
+          coverUrl:
+            String(
+              b.coverUrl || b.cover || b.image || b.coverImage || ""
+            ).trim() || null,
           language: b.language || "",
           region: b.region || "",
           units,
@@ -493,6 +691,7 @@ export default function BooksScreen() {
       });
 
       setSubjects(list);
+  setBrokenCoverMap({});
 
       if (settings.autoExpandSubjects) {
         const expandedMap = {};
@@ -577,7 +776,8 @@ export default function BooksScreen() {
     getLocalPathForUrl,
   ]);
 
-  const openNoteEditor = useCallback((subject, unit) => {
+  const openNoteEditorWithId = useCallback((subject, unit, noteId = null) => {
+    const safeNoteId = typeof noteId === "string" ? noteId : "";
     router.push({
       pathname: "../chapterNote",
       params: {
@@ -588,36 +788,123 @@ export default function BooksScreen() {
         subjectTitle: subject.title,
         unitKey: unit.unitKey,
         unitTitle: unit.title,
+        noteId: safeNoteId,
       },
     });
   }, [router, schoolCode, studentId, studentGrade]);
+
+  const openNoteEditor = useCallback((subject, unit) => {
+    openNoteEditorWithId(subject, unit, null);
+  }, [openNoteEditorWithId]);
+
+  const openNoteSheet = useCallback((subject, unit) => {
+    setNoteSheet({ visible: true, subject, unit });
+  }, []);
+
+  const closeNoteSheet = useCallback(() => {
+    setNoteSheet({ visible: false, subject: null, unit: null });
+  }, []);
+
+  const openNoteReader = useCallback((note) => {
+    if (!noteSheet.subject || !noteSheet.unit || !note) return;
+    setNoteReader({
+      visible: true,
+      subject: noteSheet.subject,
+      unit: noteSheet.unit,
+      note,
+    });
+    closeNoteSheet();
+  }, [closeNoteSheet, noteSheet.subject, noteSheet.unit]);
+
+  const closeNoteReader = useCallback(() => {
+    setNoteReader({ visible: false, subject: null, unit: null, note: null });
+  }, []);
+
+  const selectedChapterNotes = useMemo(() => {
+    if (!noteSheet.subject || !noteSheet.unit) return null;
+    const noteKey = `${noteSheet.subject.subjectKey}__${noteSheet.unit.unitKey}`;
+    return notesMap[noteKey] || [];
+  }, [noteSheet.subject, noteSheet.unit, notesMap]);
+
+  const openNoteEditorFromSheet = useCallback((noteId = null) => {
+    if (!noteSheet.subject || !noteSheet.unit) return;
+    if (!noteId && (selectedChapterNotes?.length || 0) >= MAX_NOTES_PER_CHAPTER) {
+      Alert.alert(
+        "Note limit reached",
+        `You can only create ${MAX_NOTES_PER_CHAPTER} notes in one chapter. Edit or delete an old note to add another one.`
+      );
+      return;
+    }
+    const subject = noteSheet.subject;
+    const unit = noteSheet.unit;
+    closeNoteSheet();
+    openNoteEditorWithId(subject, unit, noteId);
+  }, [closeNoteSheet, noteSheet.subject, noteSheet.unit, openNoteEditorWithId, selectedChapterNotes]);
+
+  const canAddMoreNotesToSelectedChapter = useMemo(() => {
+    return (selectedChapterNotes?.length || 0) < MAX_NOTES_PER_CHAPTER;
+  }, [selectedChapterNotes]);
+
+  const openNoteEditorFromReader = useCallback(() => {
+    if (!noteReader.subject || !noteReader.unit || !noteReader.note) return;
+    const { subject, unit, note } = noteReader;
+    closeNoteReader();
+    openNoteEditorWithId(subject, unit, note.noteId || null);
+  }, [closeNoteReader, noteReader, openNoteEditorWithId]);
+
+  const deleteNoteFromSheet = useCallback(async (note) => {
+    if (!noteSheet.subject || !noteSheet.unit || !note || !schoolCode || !studentId || !studentGrade) return;
+
+    const gradeKey = normalizeGradeKey(studentGrade);
+    const unitPath = `Platform1/Schools/${schoolCode}/StudentBookNotes/${studentId}/${gradeKey}/${noteSheet.subject.subjectKey}/${noteSheet.unit.unitKey}`;
+    const noteId = note.noteId || "";
+
+    try {
+      if (noteId === "legacy") {
+        await update(ref(database, unitPath), {
+          noteId: null,
+          studentId: null,
+          gradeKey: null,
+          subjectKey: null,
+          unitKey: null,
+          title: null,
+          text: null,
+          pinned: null,
+          colorTag: null,
+          createdAt: null,
+          updatedAt: null,
+        });
+      } else {
+        await remove(ref(database, `${unitPath}/notes/${noteId}`));
+      }
+
+      await loadNotes({ schoolCode, studentId, grade: studentGrade });
+    } catch {
+      Alert.alert("Delete failed", "Could not remove this note.");
+    }
+  }, [loadNotes, noteSheet.subject, noteSheet.unit, schoolCode, studentGrade, studentId]);
 
   const openUnit = useCallback(async (unit, subjectName) => {
     const url = unit.pdfUrl;
     if (!url) return Alert.alert("No PDF", "This unit has no pdfUrl.");
 
-    const localPath = getLocalPathForUrl(url);
-    const info = await FileSystem.getInfoAsync(localPath);
+    let localUri = null;
+    try {
+      const localPath = getLocalPathForUrl(url);
+      const info = localPath ? await FileSystem.getInfoAsync(localPath) : { exists: false };
+      if (info.exists) localUri = localPath;
+    } catch {}
 
-    if (info.exists) {
-      return openRemotePdfInViewer(url, unit.title);
+    if (!localUri) {
+      try {
+        localUri = await downloadToLocal(url, { title: unit.title, subjectName });
+      } catch {
+        Alert.alert("Download required", "This chapter must be downloaded before opening in the reader.");
+        return;
+      }
     }
 
-    Alert.alert("Read Unit", "Choose action.", [
-      { text: "Cancel", style: "cancel" },
-      { text: "Read Online", onPress: () => openRemotePdfInViewer(url, unit.title) },
-      {
-        text: "Download",
-        onPress: async () => {
-          try {
-            await downloadToLocal(url, { title: unit.title, subjectName });
-            Alert.alert("Downloaded", "Saved for offline cache.");
-          } catch {
-            Alert.alert("Download failed", "Unable to download this unit.");
-          }
-        },
-      },
-    ]);
+    openRemotePdfInViewer(url, unit.title, subjectName, localUri);
   }, [downloadToLocal, getLocalPathForUrl, openRemotePdfInViewer]);
 
   const downloadOrCancel = useCallback(async (unit, subjectName) => {
@@ -650,7 +937,7 @@ export default function BooksScreen() {
   );
 
   const totalNotes = useMemo(() => {
-    return Object.values(notesMap).filter((n) => String(n?.text || "").trim()).length;
+    return Object.values(notesMap).reduce((sum, notes) => sum + (Array.isArray(notes) ? notes.length : 0), 0);
   }, [notesMap]);
 
   const activeIndicators = useMemo(() => {
@@ -678,14 +965,23 @@ export default function BooksScreen() {
     <View>
       <View style={styles.statsRow}>
         <View style={styles.statCard}>
+          <View style={[styles.statIconWrap, styles.statIconBlue]}>
+            <Ionicons name="library-outline" size={15} color={PRIMARY} />
+          </View>
           <Text style={styles.statValue}>{subjects.length}</Text>
           <Text style={styles.statLabel}>Subjects</Text>
         </View>
         <View style={styles.statCard}>
+          <View style={[styles.statIconWrap, styles.statIconPurple]}>
+            <Ionicons name="reader-outline" size={15} color="#7C3AED" />
+          </View>
           <Text style={styles.statValue}>{totalUnits}</Text>
           <Text style={styles.statLabel}>Chapters</Text>
         </View>
         <View style={[styles.statCard, { marginRight: 0 }]}>
+          <View style={[styles.statIconWrap, styles.statIconGreen]}>
+            <Ionicons name="document-text-outline" size={15} color={SUCCESS} />
+          </View>
           <Text style={styles.statValue}>{totalNotes}</Text>
           <Text style={styles.statLabel}>Notes</Text>
         </View>
@@ -700,6 +996,153 @@ export default function BooksScreen() {
       </View>
     </View>
   );
+
+  const formatNoteDate = useCallback((value) => {
+    if (!value) return "Saved note";
+    try {
+      return new Date(value).toLocaleString([], {
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+      });
+    } catch {
+      return "Saved note";
+    }
+  }, []);
+
+  const formatFileSize = useCallback((bytes) => {
+    const size = Number(bytes || 0);
+    if (size <= 0) return "0 KB";
+
+    const units = ["KB", "MB", "GB", "TB"];
+    let value = size / 1024;
+    let unitIndex = 0;
+
+    while (value >= 1024 && unitIndex < units.length - 1) {
+      value /= 1024;
+      unitIndex += 1;
+    }
+
+    const digits = value >= 100 ? 0 : value >= 10 ? 1 : 2;
+    return `${value.toFixed(digits)} ${units[unitIndex]}`;
+  }, []);
+
+  function SwipeableNoteCard({ note }) {
+    const translateX = useRef(new Animated.Value(0)).current;
+    const openRef = useRef(false);
+    const ACTION_WIDTH = 116;
+
+    const animateTo = useCallback((toValue) => {
+      openRef.current = toValue < 0;
+      Animated.spring(translateX, {
+        toValue,
+        useNativeDriver: true,
+        bounciness: 0,
+        speed: 18,
+      }).start();
+    }, [translateX]);
+
+    const panResponder = useRef(
+      PanResponder.create({
+        onMoveShouldSetPanResponder: (_, gestureState) => {
+          return Math.abs(gestureState.dx) > 10 && Math.abs(gestureState.dx) > Math.abs(gestureState.dy);
+        },
+        onPanResponderMove: (_, gestureState) => {
+          const nextX = openRef.current
+            ? Math.min(0, Math.max(-ACTION_WIDTH, -ACTION_WIDTH + gestureState.dx))
+            : Math.min(0, Math.max(-ACTION_WIDTH, gestureState.dx));
+          translateX.setValue(nextX);
+        },
+        onPanResponderRelease: (_, gestureState) => {
+          const shouldOpen = openRef.current
+            ? gestureState.dx < 28
+            : gestureState.dx < -36;
+          animateTo(shouldOpen ? -ACTION_WIDTH : 0);
+        },
+        onPanResponderTerminate: () => {
+          animateTo(openRef.current ? -ACTION_WIDTH : 0);
+        },
+      })
+    ).current;
+
+    return (
+      <View style={styles.noteSwipeRow}>
+        <View style={styles.noteSwipeActions}>
+          <TouchableOpacity
+            style={[styles.noteSwipeActionBtn, styles.noteSwipeEditBtn]}
+            activeOpacity={0.9}
+            onPress={() => openNoteEditorFromSheet(note.noteId || null)}
+          >
+            <Ionicons name="create-outline" size={18} color="#fff" />
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.noteSwipeActionBtn, styles.noteSwipeDeleteBtn]}
+            activeOpacity={0.9}
+            onPress={() =>
+              Alert.alert("Delete note", "Remove this note from the chapter list?", [
+                { text: "Cancel", style: "cancel" },
+                {
+                  text: "Delete",
+                  style: "destructive",
+                  onPress: () => deleteNoteFromSheet(note),
+                },
+              ])
+            }
+          >
+            <Ionicons name="trash-outline" size={18} color="#fff" />
+          </TouchableOpacity>
+        </View>
+
+        <Animated.View
+          style={[
+            styles.noteSwipeCardWrap,
+            { transform: [{ translateX }] },
+          ]}
+          {...panResponder.panHandlers}
+        >
+          <TouchableOpacity
+            style={styles.noteListCard}
+            activeOpacity={0.9}
+            onPress={() => {
+              if (openRef.current) {
+                animateTo(0);
+                return;
+              }
+              openNoteReader(note);
+            }}
+          >
+            <View style={styles.noteListHeader}>
+              <View style={styles.noteListIconWrap}>
+                <Ionicons name="create-outline" size={16} color={PRIMARY} />
+              </View>
+              <View style={styles.noteListTextWrap}>
+                <View style={styles.noteListTopLine}>
+                  <Text style={styles.noteListTitle} numberOfLines={1}>
+                    {note.title || `${noteSheet.unit?.title || "Chapter"} Note`}
+                  </Text>
+                  {note.pinned ? (
+                    <View style={styles.notePinnedPill}>
+                      <Ionicons name="pin" size={10} color={PRIMARY} />
+                      <Text style={styles.notePinnedText}>Pinned</Text>
+                    </View>
+                  ) : null}
+                </View>
+                <Text style={styles.noteListPreview} numberOfLines={2}>
+                  {note.text || ""}
+                </Text>
+              </View>
+              <View style={styles.noteSwipeHint}>
+                <Ionicons name="chevron-back" size={12} color={MUTED} />
+                <Text style={styles.noteSwipeHintText}>Swipe left</Text>
+              </View>
+            </View>
+          </TouchableOpacity>
+        </Animated.View>
+      </View>
+    );
+  }
 
   if (loading) {
     return (
@@ -730,27 +1173,34 @@ export default function BooksScreen() {
     const isDownloading = !!downloadingMap[url];
     const progress = Math.round((downloadProgress[url] || 0) * 100);
     const noteKey = `${subject.subjectKey}__${unit.unitKey}`;
-    const hasNote = !!notesMap[noteKey]?.text?.trim();
+    const chapterNotes = notesMap[noteKey] || [];
+    const hasNote = chapterNotes.length > 0;
 
     const downloaded = !!url && downloadedUriSet.has(getLocalPathForUrl(url));
 
     return (
       <View style={[styles.unitRow, settings.compactMode && styles.unitRowCompact]}>
-        <View style={styles.unitOrderBadge}>
-          <Text style={styles.unitOrderText}>{unit.order || index + 1}</Text>
-        </View>
-
-        <View style={{ flex: 1, marginLeft: 10 }}>
-          <View style={styles.unitTitleRow}>
-            <Text style={styles.unitTitle}>{unit.title}</Text>
-            {hasNote ? (
-              <View style={styles.noteBadge}>
-                <Ionicons name="document-text" size={12} color={PRIMARY} />
-                <Text style={styles.noteBadgeText}>Note</Text>
-              </View>
-            ) : null}
+        <TouchableOpacity
+          style={styles.unitMainTap}
+          activeOpacity={0.75}
+          onPress={() => openUnit(unit, subject.subjectName)}
+        >
+          <View style={styles.unitOrderBadge}>
+            <Text style={styles.unitOrderText}>{unit.order || index + 1}</Text>
           </View>
-        </View>
+
+          <View style={styles.unitTextWrap}>
+            <View style={styles.unitTitleRow}>
+              <Text style={styles.unitTitle}>{unit.title}</Text>
+              {hasNote ? (
+                <View style={styles.noteBadge}>
+                  <Ionicons name="create-outline" size={12} color={PRIMARY} />
+                  <Text style={styles.noteBadgeText}>{chapterNotes.length} Note{chapterNotes.length === 1 ? "" : "s"}</Text>
+                </View>
+              ) : null}
+            </View>
+          </View>
+        </TouchableOpacity>
 
         {isDownloading ? (
           <TouchableOpacity onPress={() => cancelDownload(url)} style={styles.progressWrap}>
@@ -759,12 +1209,13 @@ export default function BooksScreen() {
           </TouchableOpacity>
         ) : (
           <View style={styles.unitActions}>
-            <TouchableOpacity onPress={() => openNoteEditor(subject, unit)} style={styles.iconBtnSoft}>
-              <Ionicons name={hasNote ? "create" : "create-outline"} size={18} color={PRIMARY} />
-            </TouchableOpacity>
-
-            <TouchableOpacity onPress={() => openUnit(unit, subject.subjectName)} style={styles.readBtn}>
-              <Text style={styles.readBtnText}>Read</Text>
+            <TouchableOpacity
+              onPress={() => openNoteSheet(subject, unit)}
+              style={[styles.noteActionBtn, hasNote && styles.noteActionBtnActive]}
+            >
+              <View style={[styles.noteActionIconWrap, hasNote && styles.noteActionIconWrapActive]}>
+                <Ionicons name={hasNote ? "create" : "create-outline"} size={16} color={hasNote ? "#FFFFFF" : PRIMARY} />
+              </View>
             </TouchableOpacity>
 
             <TouchableOpacity
@@ -788,7 +1239,9 @@ export default function BooksScreen() {
       <View style={styles.stickyWrap}>
         <View style={styles.topUtilityRow}>
           <View style={styles.searchCard}>
-            <Ionicons name="search-outline" size={18} color={MUTED} />
+            <View style={styles.searchIconWrap}>
+              <Ionicons name="search-outline" size={16} color={PRIMARY} />
+            </View>
             <TextInput
               value={search}
               onChangeText={setSearch}
@@ -805,14 +1258,15 @@ export default function BooksScreen() {
               setManagerVisible(true);
             }}
           >
-            <Ionicons name="cloud-outline" size={20} color={PRIMARY} />
+            <Ionicons name="cloud-download-outline" size={18} color={PRIMARY} />
+            {downloadedFilesList.length ? <View style={styles.topActionDot} /> : null}
           </TouchableOpacity>
 
           <TouchableOpacity
             style={styles.topActionBtn}
             onPress={() => setSettingsVisible(true)}
           >
-            <Ionicons name="settings-outline" size={20} color={PRIMARY} />
+            <Ionicons name="options-outline" size={18} color={PRIMARY} />
           </TouchableOpacity>
         </View>
 
@@ -856,13 +1310,21 @@ export default function BooksScreen() {
         onScroll={handleScroll}
         scrollEventThrottle={16}
         renderItem={({ item }) => (
-          <View style={styles.card}>
-            <View style={styles.cardHeader}>
+          <View style={[styles.card, expanded[item.subjectKey] && styles.cardSelected]}>
+            <TouchableOpacity
+              style={[styles.cardHeader, expanded[item.subjectKey] && styles.cardHeaderExpanded]}
+              activeOpacity={0.92}
+              onPress={() => toggleExpand(item.subjectKey)}
+            >
               <View style={styles.cardHeaderLeft}>
-                {item.coverUrl ? (
+                {item.coverUrl && !brokenCoverMap[item.subjectKey] ? (
                   <Image
                     source={{ uri: item.coverUrl }}
                     style={styles.cover}
+                    resizeMode="cover"
+                    onError={() =>
+                      setBrokenCoverMap((prev) => ({ ...prev, [item.subjectKey]: true }))
+                    }
                   />
                 ) : (
                   <View style={[styles.cover, styles.subjectIconContainer]}>
@@ -886,14 +1348,14 @@ export default function BooksScreen() {
                 </View>
               </View>
 
-              <TouchableOpacity style={styles.expandBtn} onPress={() => toggleExpand(item.subjectKey)}>
+              <View style={[styles.cardHeaderToggle, expanded[item.subjectKey] && styles.cardHeaderToggleActive]}>
                 <Ionicons
-                  name={expanded[item.subjectKey] ? "chevron-up-outline" : "chevron-down-outline"}
-                  size={24}
-                  color="#444"
+                  name={expanded[item.subjectKey] ? "chevron-up" : "chevron-down"}
+                  size={18}
+                  color={expanded[item.subjectKey] ? PRIMARY : MUTED}
                 />
-              </TouchableOpacity>
-            </View>
+              </View>
+            </TouchableOpacity>
 
             {expanded[item.subjectKey] && (
               <View style={styles.unitsContainer}>
@@ -905,6 +1367,141 @@ export default function BooksScreen() {
           </View>
         )}
       />
+
+      <Modal visible={noteSheet.visible} transparent animationType="slide" onRequestClose={closeNoteSheet}>
+        <Pressable style={styles.modalBackdrop} onPress={closeNoteSheet} />
+        <View style={styles.noteSheetWrap}>
+          <View style={styles.sheetHandle} />
+          <Text style={styles.sheetTitle}>Chapter Notes</Text>
+          <Text style={styles.noteSheetSubtitle}>{noteSheet.unit?.title || "Select a chapter note"}</Text>
+
+          <View style={styles.noteLimitCard}>
+            <View style={{ flex: 1, marginRight: 10 }}>
+              <Text style={styles.noteLimitTitle}>Note slots</Text>
+              <Text style={styles.noteLimitText}>
+                {selectedChapterNotes?.length || 0}/{MAX_NOTES_PER_CHAPTER} used in this chapter.
+              </Text>
+            </View>
+            <View style={[styles.noteLimitPill, !canAddMoreNotesToSelectedChapter && styles.noteLimitPillFull]}>
+              <Text style={[styles.noteLimitPillText, !canAddMoreNotesToSelectedChapter && styles.noteLimitPillTextFull]}>
+                {canAddMoreNotesToSelectedChapter ? "Can add" : "Full"}
+              </Text>
+            </View>
+          </View>
+
+          {selectedChapterNotes?.length ? (
+            <View>
+              {selectedChapterNotes.map((note) => (
+                <SwipeableNoteCard
+                  key={note.noteId || `${note.title || "note"}-${note.updatedAt || note.createdAt || 0}`}
+                  note={note}
+                />
+              ))}
+              <TouchableOpacity
+                style={[
+                  styles.noteAddAnotherBtn,
+                  !canAddMoreNotesToSelectedChapter && styles.noteAddAnotherBtnDisabled,
+                ]}
+                activeOpacity={0.88}
+                onPress={() => openNoteEditorFromSheet(null)}
+                disabled={!canAddMoreNotesToSelectedChapter}
+              >
+                <Ionicons
+                  name={canAddMoreNotesToSelectedChapter ? "add-outline" : "lock-closed-outline"}
+                  size={16}
+                  color={canAddMoreNotesToSelectedChapter ? PRIMARY : MUTED}
+                />
+                <Text
+                  style={[
+                    styles.noteAddAnotherText,
+                    !canAddMoreNotesToSelectedChapter && styles.noteAddAnotherTextDisabled,
+                  ]}
+                >
+                  {canAddMoreNotesToSelectedChapter ? "Add New Note" : "5 notes reached"}
+                </Text>
+              </TouchableOpacity>
+            </View>
+          ) : (
+            <TouchableOpacity style={styles.noteEmptyState} activeOpacity={0.86} onPress={() => openNoteEditorFromSheet(null)}>
+              <View style={styles.noteEmptyIconWrap}>
+                <Ionicons name="document-text-outline" size={20} color={PRIMARY} />
+              </View>
+              <Text style={styles.noteEmptyTitle}>No note yet</Text>
+              <Text style={styles.noteEmptyText}>Create a note for this chapter from here.</Text>
+              <View style={styles.noteInlinePrimaryAction}>
+                <Ionicons name="add-outline" size={16} color="#fff" />
+                <Text style={styles.noteInlinePrimaryActionText}>Add New Note</Text>
+              </View>
+            </TouchableOpacity>
+          )}
+        </View>
+      </Modal>
+
+      <Modal visible={noteReader.visible} animationType="slide" onRequestClose={closeNoteReader}>
+        <SafeAreaView style={styles.noteReaderScreen}>
+          <View style={styles.noteReaderTopBar}>
+            <TouchableOpacity style={styles.noteReaderIconBtn} onPress={closeNoteReader}>
+              <Ionicons name="arrow-back" size={20} color={TEXT} />
+            </TouchableOpacity>
+
+            <View style={styles.noteReaderTopText}>
+              <Text numberOfLines={1} style={styles.noteReaderUnitTitle}>
+                {noteReader.unit?.title || "Chapter Note"}
+              </Text>
+              <Text numberOfLines={1} style={styles.noteReaderTopSubtitle}>
+                {noteReader.subject?.title || "Subject"}
+              </Text>
+            </View>
+
+            <TouchableOpacity style={styles.noteReaderEditBtn} onPress={openNoteEditorFromReader}>
+              <Text style={styles.noteReaderEditText}>Edit</Text>
+            </TouchableOpacity>
+          </View>
+
+          <ScrollView
+            contentContainerStyle={styles.noteReaderScroll}
+            showsVerticalScrollIndicator={false}
+          >
+            <View style={styles.noteReaderHero}>
+              <View style={styles.noteReaderHeaderRow}>
+                <View style={styles.noteReaderTypePill}>
+                  <Ionicons name="time-outline" size={12} color={PRIMARY} />
+                  <Text style={styles.noteReaderTypeText}>
+                    {formatNoteDate(noteReader.note?.updatedAt || noteReader.note?.createdAt)}
+                  </Text>
+                </View>
+                {noteReader.note?.pinned ? (
+                  <View style={styles.noteReaderPinnedPill}>
+                    <Ionicons name="pin" size={12} color={PRIMARY} />
+                    <Text style={styles.noteReaderPinnedText}>Pinned</Text>
+                  </View>
+                ) : null}
+              </View>
+
+              <Text style={styles.noteReaderTitle}>
+                {noteReader.note?.title || `${noteReader.unit?.title || "Chapter"} Note`}
+              </Text>
+            </View>
+
+            <View style={[styles.noteReaderBodyCard, { backgroundColor: noteReader.note?.colorTag || "#F8FBFF" }]}>
+              <View style={styles.noteReaderBodyHeader}>
+                <Ionicons name="create-outline" size={15} color={PRIMARY} />
+                <Text style={styles.noteReaderBodyLabel}>Note Content</Text>
+              </View>
+              <View style={styles.noteReaderDivider} />
+              <Text
+                selectable
+                style={[
+                  styles.noteReaderBodyText,
+                  !noteReader.note?.text && styles.noteReaderBodyTextEmpty,
+                ]}
+              >
+                {noteReader.note?.text || "No saved note content yet."}
+              </Text>
+            </View>
+          </ScrollView>
+        </SafeAreaView>
+      </Modal>
 
       <Modal visible={settingsVisible} transparent animationType="slide" onRequestClose={() => setSettingsVisible(false)}>
         <Pressable style={styles.modalBackdrop} onPress={() => setSettingsVisible(false)} />
@@ -986,47 +1583,109 @@ export default function BooksScreen() {
         </View>
       </Modal>
 
-      <Modal visible={viewer.visible} animationType="slide" onRequestClose={() => setViewer({ visible: false, uri: null, title: "" })}>
+      <Modal visible={viewer.visible} animationType="slide" onRequestClose={closeViewer}>
         <SafeAreaView style={styles.readerContainer}>
           <View style={styles.readerHeader}>
-            <TouchableOpacity onPress={() => setViewer({ visible: false, uri: null, title: "" })} style={{ padding: 8 }}>
-              <Ionicons name="close" size={22} color="#222" />
+            <TouchableOpacity onPress={closeViewer} style={styles.readerHeaderIconBtn}>
+              <Ionicons name="arrow-back" size={20} color={TEXT} />
             </TouchableOpacity>
-            <Text style={styles.readerTitle} numberOfLines={1}>{viewer.title}</Text>
-            <View style={{ width: 36 }} />
+
+            <View style={styles.readerTitleWrap}>
+              <Text style={styles.readerTitle} numberOfLines={1}>{viewer.title}</Text>
+              {!!viewer.subjectName && (
+                <Text style={styles.readerSubtitle} numberOfLines={1}>{viewer.subjectName}</Text>
+              )}
+              <Text style={styles.readerStatusText} numberOfLines={1}>
+                {viewer.isOffline ? "Downloaded chapter (offline-ready)" : "Opening online chapter"}
+              </Text>
+            </View>
+
+            <TouchableOpacity
+              onPress={() =>
+                setViewer((prev) => {
+                  const sourceForPremium = prev.localUri || prev.sourceUrl || "";
+                  return {
+                    ...prev,
+                    html: buildPremiumPdfReaderHtml(sourceForPremium, prev.title),
+                  };
+                })
+              }
+              style={styles.readerHeaderIconBtn}
+            >
+              <Ionicons name="refresh" size={18} color={PRIMARY} />
+            </TouchableOpacity>
           </View>
 
-          {viewer.uri ? (
-            <WebView
-              source={{ uri: viewer.uri }}
-              originWhitelist={["*"]}
-              javaScriptEnabled
-              domStorageEnabled
-              startInLoadingState
-              style={{ flex: 1, backgroundColor: "#fff" }}
-              onError={() => Alert.alert("Unable to load", "Could not open online reader for this PDF.")}
-            />
-          ) : (
-            <View style={styles.center}>
-              <Text style={{ color: MUTED }}>No document selected</Text>
-            </View>
-          )}
+          <View style={styles.readerBodyWrap}>
+            {viewer.html ? (
+              <>
+                <WebView
+                  source={{ html: viewer.html }}
+                  originWhitelist={["*"]}
+                  javaScriptEnabled
+                  domStorageEnabled
+                  startInLoadingState
+                  style={styles.readerWebView}
+                  onLoadStart={() => setViewerLoading(true)}
+                  onLoadEnd={() => setViewerLoading(false)}
+                  onMessage={(event) => {
+                    try {
+                      const payload = JSON.parse(event?.nativeEvent?.data || "{}");
+                      if (payload?.type === "pdf_error") {
+                        setViewerLoading(false);
+                        if (!retryPremiumWithOnlineSource()) {
+                          Alert.alert("Unable to load", "Could not render this chapter in the premium reader.");
+                        }
+                      }
+                    } catch {}
+                  }}
+                  onError={() => {
+                    setViewerLoading(false);
+                    if (!retryPremiumWithOnlineSource()) {
+                      Alert.alert("Unable to load", "Could not open this chapter in the premium reader.");
+                    }
+                  }}
+                  onHttpError={() => {
+                    setViewerLoading(false);
+                    if (!retryPremiumWithOnlineSource()) {
+                      Alert.alert("Unable to load", "Could not open this chapter in the premium reader.");
+                    }
+                  }}
+                  mixedContentMode="always"
+                  allowFileAccess
+                  allowUniversalAccessFromFileURLs
+                  setSupportMultipleWindows={false}
+                />
+
+                {viewerLoading ? (
+                  <View style={styles.readerLoadingOverlay}>
+                    <ActivityIndicator size="large" color={PRIMARY} />
+                    <Text style={styles.readerLoadingText}>Opening chapter...</Text>
+                  </View>
+                ) : null}
+              </>
+            ) : (
+              <View style={styles.center}>
+                <Text style={{ color: MUTED }}>No document selected</Text>
+              </View>
+            )}
+          </View>
         </SafeAreaView>
       </Modal>
 
       <Modal visible={managerVisible} animationType="slide" onRequestClose={() => setManagerVisible(false)}>
         <SafeAreaView style={styles.managerContainer}>
           <View style={styles.managerHeader}>
-            <TouchableOpacity onPress={() => setManagerVisible(false)} style={{ padding: 8 }}>
-              <Ionicons name="close" size={22} color="#222" />
+            <TouchableOpacity onPress={() => setManagerVisible(false)} style={styles.managerIconBtn}>
+              <Ionicons name="arrow-back" size={20} color={TEXT} />
             </TouchableOpacity>
-            <View style={{ alignItems: "center" }}>
+            <View style={styles.managerHeaderTextWrap}>
               <Text style={styles.managerTitle}>Downloads</Text>
-              <Text style={{ color: MUTED, fontSize: 12 }}>
+              <Text style={styles.managerSubtitle}>
                 {downloadedFilesList.length} files • {totalDownloadedSizeMB} MB
               </Text>
             </View>
-            <TouchableOpacity onPress={() => refreshDownloadedFiles()} style={{ padding: 8 }}>
+            <TouchableOpacity onPress={() => refreshDownloadedFiles()} style={styles.managerIconBtn}>
               <Ionicons name="refresh" size={20} color={PRIMARY} />
             </TouchableOpacity>
           </View>
@@ -1039,24 +1698,38 @@ export default function BooksScreen() {
             <FlatList
               data={downloadedFilesList}
               keyExtractor={(f) => f.uri}
+              contentContainerStyle={styles.managerListContent}
               renderItem={({ item }) => (
                 <View style={styles.fileRow}>
-                  <View style={{ flex: 1 }}>
-                    <Text style={styles.fileName}>{item.title}</Text>
-                    <Text style={styles.fileMeta}>
-                      {(item.size / 1024).toFixed(1)} KB • {item.subjectName || ""}
-                    </Text>
+                  <View style={styles.fileIconWrap}>
+                    <Ionicons name="document-text-outline" size={20} color={PRIMARY} />
                   </View>
 
-                  <View style={{ flexDirection: "row", alignItems: "center" }}>
+                  <View style={styles.fileMainContent}>
+                    <Text style={styles.fileName} numberOfLines={1}>{item.title}</Text>
+
+                    <View style={styles.fileMetaRow}>
+                      <View style={styles.fileMetaPill}>
+                        <Ionicons name="download-outline" size={12} color={PRIMARY} />
+                        <Text style={styles.fileMetaPillText}>{formatFileSize(item.size)}</Text>
+                      </View>
+                      {!!item.subjectName && (
+                        <View style={styles.fileMetaPillMuted}>
+                          <Text style={styles.fileMetaPillMutedText} numberOfLines={1}>{item.subjectName}</Text>
+                        </View>
+                      )}
+                    </View>
+                  </View>
+
+                  <View style={styles.fileActionGroup}>
                     <TouchableOpacity
                       onPress={() => {
-                        if (item.url) openRemotePdfInViewer(item.url, item.title);
+                        if (item.url || item.uri) openRemotePdfInViewer(item.url || item.uri, item.title, item.subjectName || "", item.uri || null);
                         else Alert.alert("No online link", "This cached file has no source URL.");
                       }}
-                      style={{ marginRight: 12 }}
+                      style={[styles.fileActionBtn, styles.fileOpenBtn]}
                     >
-                      <Ionicons name="open-outline" size={22} color={PRIMARY} />
+                      <Ionicons name="open-outline" size={18} color={PRIMARY} />
                     </TouchableOpacity>
 
                     <TouchableOpacity
@@ -1077,8 +1750,9 @@ export default function BooksScreen() {
                           },
                         ])
                       }
+                      style={[styles.fileActionBtn, styles.fileDeleteBtn]}
                     >
-                      <Ionicons name="trash-outline" size={22} color="#d23f44" />
+                      <Ionicons name="trash-outline" size={18} color="#d23f44" />
                     </TouchableOpacity>
                   </View>
                 </View>
@@ -1095,72 +1769,129 @@ const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: BG },
 
   stickyWrap: {
-    backgroundColor: "#fff",
+    backgroundColor: "#F8FAFF",
     borderBottomWidth: 1,
     borderBottomColor: BORDER,
+    paddingBottom: 2,
   },
 
   topUtilityRow: {
     flexDirection: "row",
     alignItems: "center",
     paddingHorizontal: 16,
-    paddingTop: 14,
-    paddingBottom: 8,
+    paddingTop: 8,
+    paddingBottom: 6,
   },
   searchCard: {
     flex: 1,
     borderWidth: 1,
-    borderColor: BORDER,
-    borderRadius: 14,
-    backgroundColor: "#fff",
-    paddingHorizontal: 12,
+    borderColor: "#E4ECFF",
+    borderRadius: 16,
+    backgroundColor: "#FFFFFF",
+    paddingHorizontal: 10,
     flexDirection: "row",
     alignItems: "center",
-    height: 48,
+    height: 42,
+    shadowColor: "#2563EB",
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.025,
+    shadowRadius: 8,
+    elevation: 1,
+  },
+  searchIconWrap: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    backgroundColor: "#EDF4FF",
+    alignItems: "center",
+    justifyContent: "center",
   },
   searchInput: {
     flex: 1,
     color: TEXT,
-    marginLeft: 8,
+    marginLeft: 10,
+    fontSize: 14,
+    fontWeight: "500",
   },
   topActionBtn: {
-    width: 46,
-    height: 46,
+    width: 42,
+    height: 42,
     borderRadius: 14,
     borderWidth: 1,
-    borderColor: BORDER,
-    backgroundColor: "#fff",
+    borderColor: "#E4ECFF",
+    backgroundColor: "#FFFFFF",
     alignItems: "center",
     justifyContent: "center",
     marginLeft: 10,
+    shadowColor: "#2563EB",
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.05,
+    shadowRadius: 14,
+    elevation: 3,
+    position: "relative",
+  },
+  topActionDot: {
+    position: "absolute",
+    top: 9,
+    right: 9,
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: SUCCESS,
+    borderWidth: 1.5,
+    borderColor: "#FFFFFF",
   },
 
   statsRow: {
     flexDirection: "row",
     paddingHorizontal: 16,
-    paddingTop: 10,
-    paddingBottom: 10,
+    paddingTop: 8,
+    paddingBottom: 8,
   },
   statCard: {
     flex: 1,
-    backgroundColor: "#fff",
+    backgroundColor: "#FFFFFF",
     borderWidth: 1,
-    borderColor: BORDER,
-    borderRadius: 16,
-    paddingVertical: 14,
+    borderColor: "#E5ECFA",
+    borderRadius: 18,
+    paddingVertical: 10,
+    paddingHorizontal: 10,
     alignItems: "center",
     marginRight: 10,
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.04,
+    shadowRadius: 10,
+    elevation: 1,
+  },
+  statIconWrap: {
+    width: 28,
+    height: 28,
+    borderRadius: 10,
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: 6,
+  },
+  statIconBlue: {
+    backgroundColor: "#EDF4FF",
+  },
+  statIconPurple: {
+    backgroundColor: "#F3EEFF",
+  },
+  statIconGreen: {
+    backgroundColor: "#EAFBF3",
   },
   statValue: {
-    fontSize: 18,
+    fontSize: 20,
     fontWeight: "900",
     color: TEXT,
+    lineHeight: 22,
   },
   statLabel: {
-    marginTop: 4,
-    fontSize: 12,
-    color: MUTED,
-    fontWeight: "600",
+    marginTop: 2,
+    fontSize: 11,
+    color: "#52607A",
+    fontWeight: "700",
   },
 
   inlineIndicatorsWrap: {
@@ -1196,76 +1927,133 @@ const styles = StyleSheet.create({
 
   card: {
     backgroundColor: CARD,
-    borderRadius: 18,
-    marginBottom: 14,
+    borderRadius: 22,
+    marginBottom: 16,
     borderWidth: 1,
-    borderColor: BORDER,
+    borderColor: "#E7EDF8",
     overflow: "hidden",
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.025,
+    shadowRadius: 10,
+    elevation: 1,
+  },
+  cardSelected: {
+    borderColor: "#B9D4FF",
+    shadowColor: PRIMARY,
+    shadowOpacity: 0.05,
+    elevation: 2,
   },
   cardHeader: {
-    padding: 14,
+    paddingHorizontal: 16,
+    paddingVertical: 15,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
+  },
+  cardHeaderExpanded: {
+    backgroundColor: "#FCFDFF",
+    borderBottomWidth: 1,
+    borderBottomColor: "#EAF0FB",
   },
   cardHeaderLeft: {
     flexDirection: "row",
     alignItems: "center",
     flex: 1,
   },
+  cardHeaderToggle: {
+    width: 34,
+    height: 34,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#E5ECFA",
+    backgroundColor: "#F8FBFF",
+    alignItems: "center",
+    justifyContent: "center",
+    marginLeft: 10,
+  },
+  cardHeaderToggleActive: {
+    borderColor: "#CFE0FF",
+    backgroundColor: "#EEF5FF",
+  },
   subjectIconContainer: {
     justifyContent: "center",
     alignItems: "center",
-    backgroundColor: "#f8f9fa",
+    backgroundColor: "#F7F9FC",
+    borderWidth: 1,
+    borderColor: "#EEF2F8",
   },
   cover: {
     width: 56,
     height: 74,
-    borderRadius: 10,
-    backgroundColor: "#f8f9fa",
+    borderRadius: 14,
+    backgroundColor: "#F7F9FC",
   },
   subjectName: {
     fontWeight: "900",
-    fontSize: 16,
+    fontSize: 17,
     color: TEXT,
   },
   subjectSub: {
-    color: MUTED,
+    color: "#667085",
     marginTop: 4,
     fontSize: 12,
+    fontWeight: "700",
   },
   metaChip: {
     marginRight: 6,
     marginBottom: 6,
-    paddingHorizontal: 8,
-    paddingVertical: 4,
+    paddingHorizontal: 9,
+    paddingVertical: 5,
     borderRadius: 999,
-    backgroundColor: "#F1F5FF",
+    backgroundColor: "#F4F7FD",
+    borderWidth: 1,
+    borderColor: "#E7EDF8",
     color: PRIMARY,
     fontSize: 11,
+    fontWeight: "700",
     overflow: "hidden",
   },
-  expandBtn: { paddingHorizontal: 8, paddingVertical: 6 },
-
   unitsContainer: {
     paddingHorizontal: 14,
-    paddingBottom: 12,
+    paddingTop: 12,
+    paddingBottom: 14,
+    backgroundColor: "#F8FBFF",
   },
   unitRow: {
     flexDirection: "row",
     alignItems: "center",
     paddingVertical: 12,
-    borderTopColor: BORDER,
-    borderTopWidth: 1,
+    paddingHorizontal: 10,
+    marginTop: 8,
+    borderWidth: 1,
+    borderColor: "#E4ECFA",
+    borderRadius: 16,
+    backgroundColor: "#FFFFFF",
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.018,
+    shadowRadius: 6,
+    elevation: 0,
+  },
+  unitMainTap: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  unitTextWrap: {
+    flex: 1,
+    marginLeft: 10,
+    paddingRight: 10,
   },
   unitRowCompact: {
-    paddingVertical: 8,
+    paddingVertical: 9,
   },
   unitOrderBadge: {
-    width: 28,
-    height: 28,
-    borderRadius: 14,
-    backgroundColor: "#EEF4FF",
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    backgroundColor: "#EDF4FF",
     alignItems: "center",
     justifyContent: "center",
   },
@@ -1303,39 +2091,44 @@ const styles = StyleSheet.create({
   unitActions: {
     flexDirection: "row",
     alignItems: "center",
-    marginLeft: 8,
+    marginLeft: 10,
   },
-  iconBtnSoft: {
+  noteActionBtn: {
     width: 40,
     height: 40,
-    borderRadius: 10,
+    borderRadius: 12,
     borderWidth: 1,
-    borderColor: BORDER,
-    backgroundColor: "#fff",
+    borderColor: "#D9E7FF",
+    backgroundColor: "#F8FBFF",
     alignItems: "center",
     justifyContent: "center",
     marginRight: 8,
   },
-  readBtn: {
+  noteActionBtnActive: {
+    borderColor: "#B8D1FF",
+    backgroundColor: "#EEF5FF",
+  },
+  noteActionIconWrap: {
+    width: 26,
+    height: 26,
+    borderRadius: 9,
+    backgroundColor: "#EAF2FF",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  noteActionIconWrapActive: {
     backgroundColor: PRIMARY,
-    paddingHorizontal: 14,
-    paddingVertical: 9,
-    borderRadius: 10,
-    alignItems: "center",
-    justifyContent: "center",
-    marginRight: 8,
   },
-  readBtnText: { color: "#fff", fontWeight: "800" },
 
   iconDownload: {
     width: 40,
     height: 40,
-    borderRadius: 10,
+    borderRadius: 12,
     borderWidth: 1,
     borderColor: PRIMARY,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "#fff",
+    backgroundColor: "#F7FAFF",
   },
   iconDownloaded: {
     backgroundColor: SUCCESS,
@@ -1369,50 +2162,218 @@ const styles = StyleSheet.create({
   emptyTitle: { fontSize: 20, fontWeight: "800", color: "#222", marginBottom: 6 },
   emptySubtitle: { fontSize: 14, color: MUTED, textAlign: "center" },
 
-  readerContainer: { flex: 1, backgroundColor: "#fff" },
+  readerContainer: { flex: 1, backgroundColor: "#F4F8FF" },
   readerHeader: {
-    height: 56,
+    minHeight: 74,
     flexDirection: "row",
     alignItems: "center",
-    justifyContent: "space-between",
-    paddingHorizontal: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
     borderBottomWidth: 1,
-    borderBottomColor: BORDER,
+    borderBottomColor: "#E2EAF8",
+    backgroundColor: "#FFFFFF",
+  },
+  readerHeaderIconBtn: {
+    width: 42,
+    height: 42,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "#DCE6F7",
+    backgroundColor: "#F8FBFF",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  readerTitleWrap: {
+    flex: 1,
+    marginHorizontal: 10,
+  },
+  readerLabel: {
+    fontSize: 10,
+    fontWeight: "800",
+    color: PRIMARY,
+    textTransform: "uppercase",
+    letterSpacing: 0.6,
   },
   readerTitle: {
-    fontWeight: "700",
+    marginTop: 2,
+    fontWeight: "900",
     fontSize: 15,
-    color: "#222",
+    color: TEXT,
+  },
+  readerSubtitle: {
+    marginTop: 2,
+    fontSize: 12,
+    fontWeight: "600",
+    color: MUTED,
+  },
+  readerStatusText: {
+    marginTop: 2,
+    fontSize: 11,
+    fontWeight: "700",
+    color: PRIMARY,
+  },
+  readerBodyWrap: {
     flex: 1,
-    textAlign: "center",
+    margin: 0,
+    borderRadius: 0,
+    overflow: "hidden",
+    borderWidth: 0,
+    backgroundColor: "#FFFFFF",
+  },
+  readerWebView: {
+    flex: 1,
+    backgroundColor: "#fff",
+  },
+  readerLoadingOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(255,255,255,0.85)",
+  },
+  readerLoadingText: {
+    marginTop: 10,
+    fontSize: 13,
+    fontWeight: "700",
+    color: TEXT,
   },
 
   managerContainer: { flex: 1, backgroundColor: "#fff" },
   managerHeader: {
-    height: 56,
+    minHeight: 72,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    paddingHorizontal: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
     borderBottomWidth: 1,
     borderBottomColor: BORDER,
+    backgroundColor: "#F8FBFF",
   },
-  managerTitle: { fontWeight: "700", fontSize: 16, color: "#222" },
+  managerIconBtn: {
+    width: 42,
+    height: 42,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "#E1EAFE",
+    backgroundColor: "#FFFFFF",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  managerHeaderTextWrap: {
+    flex: 1,
+    alignItems: "center",
+    paddingHorizontal: 12,
+  },
+  managerTitle: { fontWeight: "900", fontSize: 18, color: TEXT },
+  managerSubtitle: { marginTop: 3, color: MUTED, fontSize: 12, fontWeight: "600" },
+  managerListContent: {
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+  },
 
   fileRow: {
     flexDirection: "row",
     alignItems: "center",
     paddingHorizontal: 12,
     paddingVertical: 12,
-    borderBottomColor: BORDER,
-    borderBottomWidth: 1,
+    borderWidth: 1,
+    borderColor: "#E7EDF8",
+    borderRadius: 18,
+    backgroundColor: "#FFFFFF",
+    marginBottom: 10,
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.025,
+    shadowRadius: 10,
+    elevation: 1,
   },
-  fileName: { fontSize: 13, fontWeight: "700", color: "#111" },
-  fileMeta: { fontSize: 12, color: MUTED, marginTop: 4 },
+  fileIconWrap: {
+    width: 44,
+    height: 44,
+    borderRadius: 14,
+    backgroundColor: "#EDF4FF",
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 12,
+  },
+  fileMainContent: {
+    flex: 1,
+    minWidth: 0,
+  },
+  fileName: { fontSize: 14, fontWeight: "800", color: TEXT },
+  fileMetaRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    flexWrap: "nowrap",
+    marginTop: 7,
+  },
+  fileMetaPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#EEF5FF",
+    borderRadius: 999,
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+    marginRight: 8,
+    marginBottom: 0,
+  },
+  fileMetaPillText: {
+    marginLeft: 4,
+    fontSize: 11,
+    fontWeight: "700",
+    color: PRIMARY,
+  },
+  fileMetaPillMuted: {
+    backgroundColor: "#F5F7FB",
+    borderRadius: 999,
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+    marginBottom: 0,
+    flexShrink: 1,
+    minWidth: 0,
+  },
+  fileMetaPillMutedText: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: MUTED,
+  },
+  fileActionGroup: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginLeft: 12,
+  },
+  fileActionBtn: {
+    width: 40,
+    height: 40,
+    borderRadius: 12,
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 1,
+  },
+  fileOpenBtn: {
+    backgroundColor: "#F7FAFF",
+    borderColor: "#D9E7FF",
+    marginRight: 8,
+  },
+  fileDeleteBtn: {
+    backgroundColor: "#FFF6F6",
+    borderColor: "#FFD8D8",
+  },
 
   modalBackdrop: {
     flex: 1,
     backgroundColor: "rgba(9, 20, 42, 0.35)",
+  },
+  noteSheetWrap: {
+    position: "absolute",
+    bottom: 0,
+    width: "100%",
+    backgroundColor: "#fff",
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    paddingHorizontal: 16,
+    paddingTop: 10,
+    paddingBottom: 24,
   },
   bottomSheet: {
     position: "absolute",
@@ -1439,6 +2400,379 @@ const styles = StyleSheet.create({
     fontWeight: "900",
     color: TEXT,
     marginBottom: 14,
+  },
+  noteSheetSubtitle: {
+    fontSize: 13,
+    color: MUTED,
+    fontWeight: "600",
+    marginTop: -6,
+    marginBottom: 14,
+  },
+  noteLimitCard: {
+    marginBottom: 14,
+    borderWidth: 1,
+    borderColor: "#E2ECFF",
+    borderRadius: 16,
+    backgroundColor: "#F8FBFF",
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  noteLimitTitle: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: TEXT,
+  },
+  noteLimitText: {
+    marginTop: 4,
+    fontSize: 11,
+    fontWeight: "600",
+    color: MUTED,
+  },
+  noteLimitPill: {
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    backgroundColor: "#EAFBF3",
+  },
+  noteLimitPillFull: {
+    backgroundColor: "#FEF2F2",
+  },
+  noteLimitPillText: {
+    fontSize: 11,
+    fontWeight: "800",
+    color: SUCCESS,
+  },
+  noteLimitPillTextFull: {
+    color: "#EF4444",
+  },
+  noteListCard: {
+    marginBottom: 0,
+    borderWidth: 1,
+    borderColor: "#E2ECFF",
+    borderRadius: 16,
+    backgroundColor: "#FCFDFF",
+    paddingHorizontal: 12,
+    paddingVertical: 11,
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.05,
+    shadowRadius: 12,
+    elevation: 2,
+  },
+  noteSwipeRow: {
+    marginBottom: 10,
+    position: "relative",
+  },
+  noteSwipeActions: {
+    position: "absolute",
+    top: 0,
+    right: 0,
+    bottom: 0,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "flex-end",
+    gap: 8,
+    paddingRight: 2,
+  },
+  noteSwipeCardWrap: {
+    zIndex: 2,
+  },
+  noteSwipeActionBtn: {
+    width: 50,
+    height: 50,
+    borderRadius: 16,
+    alignItems: "center",
+    justifyContent: "center",
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.12,
+    shadowRadius: 12,
+    elevation: 4,
+  },
+  noteSwipeEditBtn: {
+    backgroundColor: PRIMARY,
+  },
+  noteSwipeDeleteBtn: {
+    backgroundColor: "#EF4444",
+  },
+  noteListHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  noteListIconWrap: {
+    width: 38,
+    height: 38,
+    borderRadius: 13,
+    backgroundColor: "#ECF3FF",
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 10,
+  },
+  noteListTextWrap: {
+    flex: 1,
+    marginRight: 8,
+  },
+  noteListTopLine: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 4,
+  },
+  noteListTitle: {
+    fontSize: 14,
+    fontWeight: "800",
+    color: TEXT,
+    flex: 1,
+    marginRight: 8,
+  },
+  notePinnedPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#EEF4FF",
+    borderRadius: 999,
+    paddingHorizontal: 7,
+    paddingVertical: 4,
+    gap: 4,
+  },
+  notePinnedText: {
+    fontSize: 10,
+    fontWeight: "800",
+    color: PRIMARY,
+  },
+  noteListPreview: {
+    fontSize: 12,
+    lineHeight: 17,
+    color: MUTED,
+  },
+  noteSwipeHint: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "flex-end",
+    paddingLeft: 8,
+    marginLeft: 10,
+    opacity: 0.85,
+  },
+  noteSwipeHintText: {
+    marginLeft: 4,
+    color: MUTED,
+    fontSize: 10,
+    fontWeight: "700",
+  },
+  noteAddAnotherBtn: {
+    height: 44,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "#DCE8FF",
+    backgroundColor: "#F8FBFF",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    marginBottom: 14,
+  },
+  noteAddAnotherText: {
+    color: PRIMARY,
+    fontSize: 13,
+    fontWeight: "800",
+  },
+  noteAddAnotherBtnDisabled: {
+    borderColor: "#E2E8F0",
+    backgroundColor: "#F8FAFC",
+  },
+  noteAddAnotherTextDisabled: {
+    color: MUTED,
+  },
+  noteEmptyState: {
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 22,
+    marginBottom: 14,
+    borderWidth: 1,
+    borderColor: "#E6EDF8",
+    borderRadius: 18,
+    backgroundColor: "#FBFCFF",
+  },
+  noteReaderScreen: {
+    flex: 1,
+    backgroundColor: "#F5F7FB",
+  },
+  noteReaderTopBar: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 16,
+    paddingTop: 10,
+    paddingBottom: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: "#E7ECF6",
+    backgroundColor: "#FFFFFF",
+  },
+  noteReaderIconBtn: {
+    width: 42,
+    height: 42,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "#DFE9FA",
+    backgroundColor: "#FFFFFF",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  noteReaderTopText: {
+    flex: 1,
+    marginHorizontal: 12,
+  },
+  noteReaderUnitTitle: {
+    fontSize: 16,
+    fontWeight: "900",
+    color: TEXT,
+  },
+  noteReaderTopSubtitle: {
+    marginTop: 2,
+    fontSize: 12,
+    fontWeight: "600",
+    color: MUTED,
+  },
+  noteReaderEditBtn: {
+    minWidth: 58,
+    height: 42,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "#DCE6F7",
+    backgroundColor: "#F8FBFF",
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 14,
+  },
+  noteReaderEditText: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: PRIMARY,
+  },
+  noteReaderScroll: {
+    padding: 16,
+    paddingBottom: 40,
+  },
+  noteReaderHero: {
+    borderRadius: 18,
+    backgroundColor: "#FFFFFF",
+    borderWidth: 1,
+    borderColor: "#E6ECF7",
+    padding: 16,
+    marginBottom: 12,
+  },
+  noteReaderHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 12,
+  },
+  noteReaderTypePill: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#EEF4FF",
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  noteReaderTypeText: {
+    marginLeft: 6,
+    fontSize: 11,
+    fontWeight: "800",
+    color: MUTED,
+  },
+  noteReaderPinnedPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#F5F7FB",
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+    gap: 4,
+  },
+  noteReaderPinnedText: {
+    fontSize: 11,
+    fontWeight: "800",
+    color: MUTED,
+  },
+  noteReaderTitle: {
+    fontSize: 21,
+    lineHeight: 29,
+    fontWeight: "900",
+    color: TEXT,
+  },
+  noteReaderBodyCard: {
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: "#E6ECF7",
+    paddingHorizontal: 16,
+    paddingTop: 14,
+    paddingBottom: 20,
+    minHeight: 260,
+  },
+  noteReaderBodyHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 7,
+  },
+  noteReaderBodyLabel: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: PRIMARY,
+    textTransform: "uppercase",
+    letterSpacing: 0.4,
+  },
+  noteReaderDivider: {
+    height: 1,
+    backgroundColor: "#E5EAF5",
+    marginTop: 12,
+    marginBottom: 14,
+  },
+  noteReaderBodyText: {
+    fontSize: 15,
+    lineHeight: 26,
+    color: TEXT,
+    fontWeight: "500",
+  },
+  noteReaderBodyTextEmpty: {
+    color: MUTED,
+    fontStyle: "italic",
+  },
+  noteEmptyIconWrap: {
+    width: 40,
+    height: 40,
+    borderRadius: 14,
+    backgroundColor: "#ECF3FF",
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: 10,
+  },
+  noteEmptyTitle: {
+    fontSize: 14,
+    fontWeight: "800",
+    color: TEXT,
+    marginBottom: 4,
+  },
+  noteEmptyText: {
+    fontSize: 12,
+    color: MUTED,
+    textAlign: "center",
+  },
+  noteInlinePrimaryAction: {
+    marginTop: 14,
+    height: 42,
+    borderRadius: 12,
+    backgroundColor: PRIMARY,
+    alignItems: "center",
+    justifyContent: "center",
+    flexDirection: "row",
+    gap: 8,
+    paddingHorizontal: 16,
+  },
+  noteInlinePrimaryActionText: {
+    color: "#fff",
+    fontSize: 13,
+    fontWeight: "800",
   },
 
   settingsSectionTitle: {

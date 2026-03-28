@@ -3,12 +3,19 @@ import { Tabs, useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 import { Text, TouchableOpacity, View, Image, StyleSheet } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { ref, get, onValue, off } from "firebase/database";
+import { ref, get, onValue, off, query, orderByChild, equalTo } from "firebase/database";
 import { database } from "../../constants/firebaseConfig";
 import { StatusBar } from "expo-status-bar";
 
 const PRIMARY = "#007AFB";
 const WHITE = "#FFFFFF";
+
+function isValidProfileUri(value) {
+  if (!value || typeof value !== "string") return false;
+  const v = value.trim();
+  if (!v) return false;
+  return /^(https?:\/\/|file:\/\/|data:image\/)/i.test(v);
+}
 
 export default function DashboardLayout() {
   const router = useRouter();
@@ -21,24 +28,118 @@ export default function DashboardLayout() {
 
     (async () => {
       try {
-        const userNodeKey =
-          (await AsyncStorage.getItem("userNodeKey")) ||
-          (await AsyncStorage.getItem("userId")) ||
-          null;
-
+        const userNodeKey = await AsyncStorage.getItem("userNodeKey");
+        const studentNodeKey = await AsyncStorage.getItem("studentNodeKey");
         const userId = await AsyncStorage.getItem("userId");
+        const username = await AsyncStorage.getItem("username");
+        const studentId = await AsyncStorage.getItem("studentId");
         const schoolKey = await AsyncStorage.getItem("schoolKey");
 
-        if (userNodeKey) {
-          const userPath = schoolKey
-            ? `Platform1/Schools/${schoolKey}/Users/${userNodeKey}`
-            : `Users/${userNodeKey}`;
+        const uniqueVals = Array.from(
+          new Set([userNodeKey, studentNodeKey, userId, username, studentId].filter(Boolean))
+        );
 
-          const snap = await get(ref(database, userPath));
-          if (mounted && snap.exists()) {
-            setProfileImage(snap.val()?.profileImage || null);
+        const tryDirectUser = async (key, useSchoolScope) => {
+          if (!key) return null;
+          const path = useSchoolScope && schoolKey
+            ? `Platform1/Schools/${schoolKey}/Users/${key}`
+            : `Users/${key}`;
+          const snap = await get(ref(database, path));
+          if (!snap.exists()) return null;
+          return snap.val()?.profileImage || null;
+        };
+
+        const tryCollectionByField = async (collectionPath, field, value) => {
+          if (!value) return null;
+          const q = query(ref(database, collectionPath), orderByChild(field), equalTo(value));
+          const snap = await get(q);
+          if (!snap.exists()) return null;
+          let found = null;
+          snap.forEach((child) => {
+            found = child.val()?.profileImage || null;
+            return true;
+          });
+          return found;
+        };
+
+        const tryDirectStudent = async (key, useSchoolScope) => {
+          if (!key) return null;
+          const path = useSchoolScope && schoolKey
+            ? `Platform1/Schools/${schoolKey}/Students/${key}`
+            : `Students/${key}`;
+          const snap = await get(ref(database, path));
+          if (!snap.exists()) return null;
+          return snap.val()?.profileImage || null;
+        };
+
+        const tryStudentCollectionByField = async (collectionPath, field, value) => {
+          if (!value) return null;
+          const q = query(ref(database, collectionPath), orderByChild(field), equalTo(value));
+          const snap = await get(q);
+          if (!snap.exists()) return null;
+          let found = null;
+          snap.forEach((child) => {
+            found = child.val()?.profileImage || null;
+            return true;
+          });
+          return found;
+        };
+
+        let resolvedProfileImage = null;
+
+        // 1) Fast path: direct node lookups from possible keys.
+        for (const key of uniqueVals) {
+          resolvedProfileImage = await tryDirectUser(key, true);
+          if (resolvedProfileImage) break;
+          resolvedProfileImage = await tryDirectUser(key, false);
+          if (resolvedProfileImage) break;
+
+          // Some accounts store avatar under Students rather than Users.
+          resolvedProfileImage = await tryDirectStudent(key, true);
+          if (resolvedProfileImage) break;
+          resolvedProfileImage = await tryDirectStudent(key, false);
+          if (resolvedProfileImage) break;
+        }
+
+        // 2) Fallback: query Users collections by common identifier fields.
+        if (!resolvedProfileImage) {
+          const collections = schoolKey
+            ? [`Platform1/Schools/${schoolKey}/Users`, "Users"]
+            : ["Users"];
+          const fields = ["userId", "username", "studentId"];
+
+          for (const col of collections) {
+            for (const val of uniqueVals) {
+              for (const field of fields) {
+                resolvedProfileImage = await tryCollectionByField(col, field, val);
+                if (resolvedProfileImage) break;
+              }
+              if (resolvedProfileImage) break;
+            }
+            if (resolvedProfileImage) break;
           }
         }
+
+        // 3) Final fallback: query Students collections by identity fields.
+        if (!resolvedProfileImage) {
+          const studentCollections = schoolKey
+            ? [`Platform1/Schools/${schoolKey}/Students`, "Students"]
+            : ["Students"];
+          const studentFields = ["studentId", "userId", "name"];
+
+          for (const col of studentCollections) {
+            for (const val of uniqueVals) {
+              for (const field of studentFields) {
+                resolvedProfileImage = await tryStudentCollectionByField(col, field, val);
+                if (resolvedProfileImage) break;
+              }
+              if (resolvedProfileImage) break;
+            }
+            if (resolvedProfileImage) break;
+          }
+        }
+
+        if (mounted) setProfileImage(resolvedProfileImage || null);
 
         if (!userId) return;
 
@@ -96,25 +197,27 @@ export default function DashboardLayout() {
     <Text style={styles.titleText}>Gojo Study</Text>
   );
 
+  const HomeHeaderLeft = () => (
+    <TouchableOpacity style={styles.iconButton} onPress={() => router.push("/chats")}>
+      <View style={styles.chatIconWrap}>
+        <Ionicons name="paper-plane-outline" size={21} color="#222" />
+        {totalUnread > 0 && (
+          <View style={styles.unreadBadge}>
+            <Text style={styles.unreadText}>
+              {totalUnread > 99 ? "99+" : totalUnread}
+            </Text>
+          </View>
+        )}
+      </View>
+    </TouchableOpacity>
+  );
+
   const HomeHeaderRight = () => (
     <View style={styles.headerRightRow}>
-      <TouchableOpacity style={styles.iconButton} onPress={() => router.push("/chats")}>
-        <View style={styles.chatIconWrap}>
-          <Ionicons name="chatbubbles-outline" size={22} color="#222" />
-          {totalUnread > 0 && (
-            <View style={styles.unreadBadge}>
-              <Text style={styles.unreadText}>
-                {totalUnread > 99 ? "99+" : totalUnread}
-              </Text>
-            </View>
-          )}
-        </View>
-      </TouchableOpacity>
-
-      <TouchableOpacity onPress={() => router.push("../profiles")} style={{ marginLeft: 12 }}>
+      <TouchableOpacity onPress={() => router.push("../profiles")}> 
         <Image
           source={
-            profileImage
+            isValidProfileUri(profileImage)
               ? { uri: profileImage }
               : require("../../assets/images/avatar_placeholder.png")
           }
@@ -142,8 +245,9 @@ export default function DashboardLayout() {
           name="home"
           options={{
             title: "Home",
+            headerLeft: () => <HomeHeaderRight />,
             headerTitle: () => <HomeHeaderTitle />,
-            headerRight: () => <HomeHeaderRight />,
+            headerRight: () => <HomeHeaderLeft />,
             tabBarIcon: ({ color, size }) => (
               <Ionicons name="home-outline" size={size} color={color} />
             ),
@@ -154,7 +258,7 @@ export default function DashboardLayout() {
           name="book"
           options={{
             title: "Books",
-            headerTitle: "Books",
+            headerTitle: "Book Library",
             headerRight: () => null,
             tabBarIcon: ({ color, size }) => (
               <Ionicons name="book-outline" size={size} color={color} />
