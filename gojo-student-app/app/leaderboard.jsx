@@ -166,6 +166,7 @@ function extractStudentGrade(student) {
 function PodiumItem({ item, place, rankColor, animatedStyle, onPress }) {
   const isFirst = place === 1;
   const medalColor = rankColor(place);
+  const tiedItems = Array.isArray(item?.tiedItems) ? item.tiedItems : [];
 
   if (!item) {
     return (
@@ -227,6 +228,30 @@ function PodiumItem({ item, place, rankColor, animatedStyle, onPress }) {
         <Text numberOfLines={1} style={styles.podiumName}>{item.name}</Text>
         <Text style={styles.podiumPts}>{item.totalPoints} pts</Text>
 
+        {tiedItems.length > 1 ? (
+          <View style={styles.tiePreviewWrap}>
+            {tiedItems.slice(0, 4).map((p, idx) => (
+              <View
+                key={`${p.userId}-${idx}`}
+                style={[
+                  styles.tiePreviewAvatarWrap,
+                  { borderColor: medalColor },
+                  idx > 0 ? { marginLeft: -12 } : null,
+                ]}
+              >
+                {p.avatar ? (
+                  <Image source={{ uri: p.avatar }} style={styles.tiePreviewAvatar} />
+                ) : (
+                  <View style={styles.tiePreviewFallback}>
+                    <Text style={styles.tiePreviewInitial}>{(p.name || "U")[0]}</Text>
+                  </View>
+                )}
+              </View>
+            ))}
+            <Text style={[styles.tiePreviewText, { color: medalColor }]}>+{tiedItems.length - 1}</Text>
+          </View>
+        ) : null}
+
         <View
           style={[
             styles.podiumBlock,
@@ -260,6 +285,9 @@ export default function LeaderboardScreen() {
   const [profileModalVisible, setProfileModalVisible] = useState(false);
   const [profileLoading, setProfileLoading] = useState(false);
   const [selectedProfile, setSelectedProfile] = useState(null);
+  const [tiePickerVisible, setTiePickerVisible] = useState(false);
+  const [tieCandidates, setTieCandidates] = useState([]);
+  const [tieRank, setTieRank] = useState(null);
 
   const safeTop = Platform.OS === "android" ? (StatusBar.currentHeight || 0) : 0;
 
@@ -372,17 +400,26 @@ export default function LeaderboardScreen() {
     [scope, schoolRows, countryRows]
   );
 
-  const top3 = useMemo(() => rows.filter((r) => r.rank <= 3).sort((a, b) => a.rank - b.rank), [rows]);
+  const podiumGroups = useMemo(() => {
+    const byRank = { 1: [], 2: [], 3: [] };
+    rows.forEach((r) => {
+      if (r.rank >= 1 && r.rank <= 3) byRank[r.rank].push(r);
+    });
+    byRank[1].sort((a, b) => b.totalPoints - a.totalPoints);
+    byRank[2].sort((a, b) => b.totalPoints - a.totalPoints);
+    byRank[3].sort((a, b) => b.totalPoints - a.totalPoints);
+    return byRank;
+  }, [rows]);
   const myRow = useMemo(() => rows.find((r) => r.userId === myUserId) || null, [rows, myUserId]);
 
   const podium = useMemo(() => {
-    const first = top3.find((x) => x.rank === 1) || null;
-    const second = top3.find((x) => x.rank === 2) || null;
-    const third = top3.find((x) => x.rank === 3) || null;
+    const second = podiumGroups[2]?.[0] ? { ...podiumGroups[2][0], tiedItems: podiumGroups[2] } : null;
+    const first = podiumGroups[1]?.[0] ? { ...podiumGroups[1][0], tiedItems: podiumGroups[1] } : null;
+    const third = podiumGroups[3]?.[0] ? { ...podiumGroups[3][0], tiedItems: podiumGroups[3] } : null;
     return { first, second, third };
-  }, [top3]);
+  }, [podiumGroups]);
 
-  const hasPodium = !!(podium.first || podium.second || podium.third);
+  const hasPodium = !!((podiumGroups[1] && podiumGroups[1].length) || (podiumGroups[2] && podiumGroups[2].length) || (podiumGroups[3] && podiumGroups[3].length));
 
   useEffect(() => {
     firstAnim.setValue(0);
@@ -469,6 +506,17 @@ export default function LeaderboardScreen() {
 
   const rankColor = (rank) =>
     rank === 1 ? C.gold : rank === 2 ? C.silver : rank === 3 ? C.bronze : C.primary;
+
+  const handlePodiumPress = (rank, group) => {
+    if (!group?.length) return;
+    if (group.length === 1) {
+      openStudentProfile(group[0]);
+      return;
+    }
+    setTieRank(rank);
+    setTieCandidates(group);
+    setTiePickerVisible(true);
+  };
 
   const openStudentProfile = async (item) => {
     setProfileModalVisible(true);
@@ -571,27 +619,33 @@ export default function LeaderboardScreen() {
 
       {hasPodium ? (
         <View style={styles.podiumWrap}>
-          <PodiumItem
-            item={podium.second}
-            place={2}
-            rankColor={rankColor}
-            animatedStyle={secondAnimatedStyle}
-            onPress={() => podium.second && openStudentProfile(podium.second)}
-          />
-          <PodiumItem
-            item={podium.first}
-            place={1}
-            rankColor={rankColor}
-            animatedStyle={firstAnimatedStyle}
-            onPress={() => podium.first && openStudentProfile(podium.first)}
-          />
-          <PodiumItem
-            item={podium.third}
-            place={3}
-            rankColor={rankColor}
-            animatedStyle={thirdAnimatedStyle}
-            onPress={() => podium.third && openStudentProfile(podium.third)}
-          />
+          {podium.second ? (
+            <PodiumItem
+              item={podium.second}
+              place={2}
+              rankColor={rankColor}
+              animatedStyle={secondAnimatedStyle}
+              onPress={() => handlePodiumPress(2, podiumGroups[2])}
+            />
+          ) : null}
+          {podium.first ? (
+            <PodiumItem
+              item={podium.first}
+              place={1}
+              rankColor={rankColor}
+              animatedStyle={firstAnimatedStyle}
+              onPress={() => handlePodiumPress(1, podiumGroups[1])}
+            />
+          ) : null}
+          {podium.third ? (
+            <PodiumItem
+              item={podium.third}
+              place={3}
+              rankColor={rankColor}
+              animatedStyle={thirdAnimatedStyle}
+              onPress={() => handlePodiumPress(3, podiumGroups[3])}
+            />
+          ) : null}
         </View>
       ) : null}
 
@@ -674,6 +728,54 @@ export default function LeaderboardScreen() {
                 </TouchableOpacity>
               </>
             )}
+          </View>
+        </View>
+      </Modal>
+
+      <Modal
+        visible={tiePickerVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setTiePickerVisible(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.tieModalCard}>
+            <Text style={styles.tieModalTitle}>Rank #{tieRank} is tied</Text>
+            <Text style={styles.tieModalSubtitle}>Choose a student to view full profile details.</Text>
+
+            <FlatList
+              data={tieCandidates}
+              keyExtractor={(i, idx) => `${i.userId}-${idx}`}
+              ItemSeparatorComponent={() => <View style={{ height: 8 }} />}
+              style={{ maxHeight: 280, width: "100%" }}
+              renderItem={({ item }) => (
+                <TouchableOpacity
+                  style={styles.tieOptionRow}
+                  activeOpacity={0.9}
+                  onPress={() => {
+                    setTiePickerVisible(false);
+                    setTimeout(() => openStudentProfile(item), 120);
+                  }}
+                >
+                  {item.avatar ? (
+                    <Image source={{ uri: item.avatar }} style={styles.tieOptionAvatar} />
+                  ) : (
+                    <View style={[styles.tieOptionAvatar, styles.avatarFallback]}>
+                      <Text style={styles.initial}>{(item.name || "U")[0]}</Text>
+                    </View>
+                  )}
+                  <View style={{ flex: 1, marginLeft: 10 }}>
+                    <Text numberOfLines={1} style={styles.tieOptionName}>{item.name}</Text>
+                    <Text style={styles.tieOptionPoints}>{item.totalPoints} points</Text>
+                  </View>
+                  <Ionicons name="chevron-forward" size={16} color={C.muted} />
+                </TouchableOpacity>
+              )}
+            />
+
+            <TouchableOpacity style={styles.closeBtn} onPress={() => setTiePickerVisible(false)}>
+              <Text style={styles.closeBtnText}>Close</Text>
+            </TouchableOpacity>
           </View>
         </View>
       </Modal>
@@ -907,6 +1009,43 @@ const styles = StyleSheet.create({
     textAlign: "center",
   },
   podiumPts: { marginTop: 2, color: C.muted, fontSize: 11, fontWeight: "700" },
+  tiePreviewWrap: {
+    marginTop: 6,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  tiePreviewAvatarWrap: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    borderWidth: 1.5,
+    backgroundColor: "#fff",
+    overflow: "hidden",
+  },
+  tiePreviewAvatar: {
+    width: "100%",
+    height: "100%",
+    borderRadius: 12,
+  },
+  tiePreviewFallback: {
+    width: "100%",
+    height: "100%",
+    borderRadius: 12,
+    backgroundColor: C.primary,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  tiePreviewInitial: {
+    color: "#fff",
+    fontSize: 10,
+    fontWeight: "900",
+  },
+  tiePreviewText: {
+    marginLeft: 6,
+    fontSize: 11,
+    fontWeight: "800",
+  },
 
   podiumBlock: {
     marginTop: 8,
@@ -998,6 +1137,56 @@ const styles = StyleSheet.create({
     padding: 18,
     borderWidth: 1,
     borderColor: "#E6EEFD",
+  },
+  tieModalCard: {
+    width: "100%",
+    maxWidth: 420,
+    backgroundColor: "#fff",
+    borderRadius: 22,
+    padding: 18,
+    borderWidth: 1,
+    borderColor: "#E6EEFD",
+    alignItems: "center",
+  },
+  tieModalTitle: {
+    color: C.text,
+    fontSize: 18,
+    fontWeight: "900",
+  },
+  tieModalSubtitle: {
+    marginTop: 6,
+    marginBottom: 14,
+    color: C.muted,
+    fontSize: 12,
+    fontWeight: "700",
+    textAlign: "center",
+  },
+  tieOptionRow: {
+    width: "100%",
+    borderWidth: 1,
+    borderColor: "#E4ECFA",
+    borderRadius: 12,
+    backgroundColor: "#fff",
+    paddingHorizontal: 10,
+    paddingVertical: 9,
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  tieOptionAvatar: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+  },
+  tieOptionName: {
+    color: C.text,
+    fontSize: 13,
+    fontWeight: "800",
+  },
+  tieOptionPoints: {
+    marginTop: 2,
+    color: C.muted,
+    fontSize: 11,
+    fontWeight: "700",
   },
   profileHero: {
     alignItems: "center",

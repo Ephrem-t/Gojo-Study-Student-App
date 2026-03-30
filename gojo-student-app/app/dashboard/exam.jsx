@@ -318,6 +318,9 @@ export default function ExamScreen() {
   const [profileModalVisible, setProfileModalVisible] = useState(false);
   const [profileLoading, setProfileLoading] = useState(false);
   const [selectedProfile, setSelectedProfile] = useState(null);
+  const [topTiePickerVisible, setTopTiePickerVisible] = useState(false);
+  const [topTieCandidates, setTopTieCandidates] = useState([]);
+  const [topTieRank, setTopTieRank] = useState(null);
   const [activeFilter, setActiveFilter] = useState("online");
   const [expandedOnlineSubjectId, setExpandedOnlineSubjectId] = useState(null);
 
@@ -681,20 +684,49 @@ export default function ExamScreen() {
     setProfileLoading(false);
   }, []);
 
+  const topRankGroups = useMemo(() => {
+    const grouped = [];
+    const seen = new Set();
+
+    leaders.forEach((item, index) => {
+      const rank = Number(item?.rank || index + 1);
+      if (seen.has(rank)) return;
+      const group = leaders.filter((x, idx) => Number(x?.rank || idx + 1) === rank);
+      seen.add(rank);
+      grouped.push({ rank, representative: group[0], tiedItems: group });
+    });
+
+    return grouped;
+  }, [leaders]);
+
+  const handleTopRankPress = useCallback((group) => {
+    const tiedItems = group?.tiedItems || [];
+    if (!tiedItems.length) return;
+    if (tiedItems.length === 1) {
+      openTopProfile(tiedItems[0]);
+      return;
+    }
+    setTopTieRank(group.rank);
+    setTopTieCandidates(tiedItems);
+    setTopTiePickerVisible(true);
+  }, [openTopProfile]);
+
   const topSection = useMemo(() => (
     <View>
       <View style={styles.storyListWrap}>
         <FlatList
-          data={leaders}
+          data={topRankGroups}
           horizontal
-          keyExtractor={(i) => i.userId}
+          keyExtractor={(i, idx) => `rank-${i.rank}-${idx}`}
           contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 8, paddingRight: 44 }}
           showsHorizontalScrollIndicator={false}
           ItemSeparatorComponent={() => <View style={{ width: 8 }} />}
           renderItem={({ item, index }) => {
             const rank = Number(item.rank || index + 1);
-            const name = item.profile?.name || item.profile?.username || item.userId;
-            const avatar = item.profile?.profileImage || null;
+            const main = item.representative || null;
+            const tiedItems = Array.isArray(item.tiedItems) ? item.tiedItems : [];
+            const name = main?.profile?.name || main?.profile?.username || main?.userId || "-";
+            const avatar = main?.profile?.profileImage || null;
             const trophyColor = rank === 1 ? GOLD : rank === 2 ? SILVER : rank === 3 ? BRONZE : null;
             const rankFrameStyle =
               rank === 1
@@ -727,7 +759,7 @@ export default function ExamScreen() {
               <TouchableOpacity
                 activeOpacity={0.9}
                 style={styles.storyWrap}
-                onPress={() => openTopProfile(item)}
+                onPress={() => handleTopRankPress(item)}
               >
                 <View style={[styles.rankFrame, rankFrameStyle]}>
                   <View style={[styles.avatarShadow, rankGlowStyle]}>
@@ -750,6 +782,32 @@ export default function ExamScreen() {
                   </View>
                 </View>
                 <Text numberOfLines={1} style={styles.storyName}>{name}</Text>
+                {tiedItems.length > 1 ? (
+                  <View style={styles.storyTieStackWrap}>
+                    {tiedItems.slice(0, 4).map((person, idx) => {
+                      const tieAvatar = person?.profile?.profileImage || null;
+                      const tieName = person?.profile?.name || person?.profile?.username || person?.userId || "U";
+                      return (
+                        <View
+                          key={`${person?.userId || idx}-${idx}`}
+                          style={[
+                            styles.storyTieAvatarWrap,
+                            idx > 0 ? { marginLeft: -9 } : null,
+                          ]}
+                        >
+                          {tieAvatar ? (
+                            <Image source={{ uri: tieAvatar }} style={styles.storyTieAvatar} />
+                          ) : (
+                            <View style={styles.storyTieFallback}>
+                              <Text style={styles.storyTieLetter}>{tieName[0]}</Text>
+                            </View>
+                          )}
+                        </View>
+                      );
+                    })}
+                    <Text style={styles.storyTieText}>+{tiedItems.length - 1}</Text>
+                  </View>
+                ) : null}
               </TouchableOpacity>
             );
           }}
@@ -1008,6 +1066,58 @@ export default function ExamScreen() {
       ) : null}
 
       <Modal
+        visible={topTiePickerVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setTopTiePickerVisible(false)}
+      >
+        <View style={styles.profileModalOverlay}>
+          <View style={styles.profileModalCard}>
+            <Text style={styles.tieModalTitle}>Rank #{topTieRank} is tied</Text>
+            <Text style={styles.tieModalSubtitle}>Choose a student to view profile details.</Text>
+
+            <FlatList
+              data={topTieCandidates}
+              keyExtractor={(i, idx) => `${i.userId}-${idx}`}
+              ItemSeparatorComponent={() => <View style={{ height: 8 }} />}
+              style={{ maxHeight: 280, width: "100%" }}
+              renderItem={({ item }) => {
+                const personName = item?.profile?.name || item?.profile?.username || item?.userId || "-";
+                const personAvatar = item?.profile?.profileImage || null;
+                return (
+                  <TouchableOpacity
+                    style={styles.tieOptionRow}
+                    activeOpacity={0.9}
+                    onPress={() => {
+                      setTopTiePickerVisible(false);
+                      setTimeout(() => openTopProfile(item), 120);
+                    }}
+                  >
+                    {personAvatar ? (
+                      <Image source={{ uri: personAvatar }} style={styles.tieOptionAvatar} />
+                    ) : (
+                      <View style={[styles.tieOptionAvatar, styles.avatarFallback]}>
+                        <Text style={styles.avatarLetter}>{(personName || "U")[0]}</Text>
+                      </View>
+                    )}
+                    <View style={{ flex: 1, marginLeft: 10 }}>
+                      <Text numberOfLines={1} style={styles.tieOptionName}>{personName}</Text>
+                      <Text style={styles.tieOptionPoints}>{Number(item?.totalPoints || 0)} points</Text>
+                    </View>
+                    <Ionicons name="chevron-forward" size={16} color={MUTED} />
+                  </TouchableOpacity>
+                );
+              }}
+            />
+
+            <TouchableOpacity style={styles.closeBtn} onPress={() => setTopTiePickerVisible(false)}>
+              <Text style={styles.closeBtnText}>Close</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal
         visible={profileModalVisible}
         transparent
         animationType="fade"
@@ -1065,6 +1175,11 @@ export default function ExamScreen() {
     selectedProfile,
     studentGrade,
     subjects,
+    topTieCandidates,
+    topTiePickerVisible,
+    topTieRank,
+    topRankGroups,
+    handleTopRankPress,
     openTopProfile,
   ]);
 
@@ -1292,6 +1407,45 @@ const styles = StyleSheet.create({
   rankBadgeBronze: { backgroundColor: "#D08A3A" },
   rankBottomBadgeText: { color: "#fff", fontWeight: "900", fontSize: 10 },
   storyName: { marginTop: 8, width: STORY_AVATAR_SIZE + 8, textAlign: "center", fontSize: 11, color: TEXT },
+  storyTieStackWrap: {
+    marginTop: 5,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  storyTieAvatarWrap: {
+    width: 18,
+    height: 18,
+    borderRadius: 9,
+    borderWidth: 1,
+    borderColor: "#fff",
+    backgroundColor: "#fff",
+    overflow: "hidden",
+  },
+  storyTieAvatar: {
+    width: "100%",
+    height: "100%",
+    borderRadius: 9,
+  },
+  storyTieFallback: {
+    width: "100%",
+    height: "100%",
+    borderRadius: 9,
+    backgroundColor: PRIMARY,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  storyTieLetter: {
+    color: "#fff",
+    fontWeight: "900",
+    fontSize: 9,
+  },
+  storyTieText: {
+    marginLeft: 5,
+    color: MUTED,
+    fontSize: 10,
+    fontWeight: "800",
+  },
 
   challengeCard: {
     width: CARD_W,
@@ -1864,6 +2018,47 @@ const styles = StyleSheet.create({
   },
   infoLabel: { color: MUTED, fontSize: 12, fontWeight: "700" },
   infoValue: { color: TEXT, fontSize: 12, fontWeight: "800", flexShrink: 1, textAlign: "right" },
+  tieModalTitle: {
+    color: TEXT,
+    fontSize: 18,
+    fontWeight: "900",
+    textAlign: "center",
+  },
+  tieModalSubtitle: {
+    marginTop: 6,
+    marginBottom: 12,
+    color: MUTED,
+    fontSize: 12,
+    fontWeight: "700",
+    textAlign: "center",
+  },
+  tieOptionRow: {
+    width: "100%",
+    borderWidth: 1,
+    borderColor: "#E4ECFA",
+    borderRadius: 12,
+    backgroundColor: "#fff",
+    paddingHorizontal: 10,
+    paddingVertical: 9,
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  tieOptionAvatar: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+  },
+  tieOptionName: {
+    color: TEXT,
+    fontSize: 13,
+    fontWeight: "800",
+  },
+  tieOptionPoints: {
+    marginTop: 2,
+    color: MUTED,
+    fontSize: 11,
+    fontWeight: "700",
+  },
   closeBtn: {
     marginTop: 12,
     height: 42,
