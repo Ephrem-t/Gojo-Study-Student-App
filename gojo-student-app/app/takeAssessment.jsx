@@ -10,6 +10,9 @@ import {
   ScrollView,
   Alert,
   Image,
+  Modal,
+  Animated,
+  Easing,
 } from "react-native";
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { useLocalSearchParams, useRouter } from "expo-router";
@@ -30,6 +33,18 @@ const BG = "#FFFFFF";
 const SUCCESS = "#12B76A";
 const WARNING = "#F59E0B";
 const DANGER = "#EF4444";
+const CELEBRATION_THRESHOLD = 80;
+const RESULT_SPARKLES = [
+  { left: "8%", top: 26, color: "#0B72FF", drop: -32, rotate: "-22deg" },
+  { left: "18%", top: 12, color: "#12B76A", drop: -40, rotate: "12deg" },
+  { left: "28%", top: 30, color: "#F59E0B", drop: -26, rotate: "-12deg" },
+  { left: "39%", top: 10, color: "#7C3AED", drop: -44, rotate: "18deg" },
+  { left: "52%", top: 24, color: "#EC4899", drop: -30, rotate: "-18deg" },
+  { left: "63%", top: 10, color: "#0EA5E9", drop: -40, rotate: "16deg" },
+  { left: "73%", top: 28, color: "#22C55E", drop: -28, rotate: "-16deg" },
+  { left: "83%", top: 12, color: "#F97316", drop: -42, rotate: "20deg" },
+  { left: "89%", top: 34, color: "#2563EB", drop: -24, rotate: "-14deg" },
+];
 
 export default function TakeAssessment() {
   const router = useRouter();
@@ -60,6 +75,13 @@ export default function TakeAssessment() {
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [alreadySubmitted, setAlreadySubmitted] = useState(false);
+  const [resultModalVisible, setResultModalVisible] = useState(false);
+  const [resultSummary, setResultSummary] = useState({
+    kind: "submitted",
+    isAuto: false,
+    finalScore: 0,
+    totalPoints: 0,
+  });
 
   const [schoolKey, setSchoolKey] = useState(null);
   const [studentId, setStudentId] = useState(null);
@@ -79,6 +101,40 @@ export default function TakeAssessment() {
 
   const scrollRef = useRef(null);
   const questionLayoutsRef = useRef({});
+  const resultOverlayOpacity = useRef(new Animated.Value(0)).current;
+  const resultCardTranslate = useRef(new Animated.Value(28)).current;
+  const resultCardScale = useRef(new Animated.Value(0.94)).current;
+  const sparkleAnims = useRef(RESULT_SPARKLES.map(() => new Animated.Value(0))).current;
+
+  useEffect(() => {
+    if (!resultModalVisible) {
+      resultOverlayOpacity.setValue(0);
+      resultCardTranslate.setValue(28);
+      resultCardScale.setValue(0.94);
+      return;
+    }
+
+    Animated.parallel([
+      Animated.timing(resultOverlayOpacity, {
+        toValue: 1,
+        duration: 220,
+        easing: Easing.out(Easing.quad),
+        useNativeDriver: true,
+      }),
+      Animated.timing(resultCardTranslate, {
+        toValue: 0,
+        duration: 260,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }),
+      Animated.spring(resultCardScale, {
+        toValue: 1,
+        speed: 14,
+        bounciness: 6,
+        useNativeDriver: true,
+      }),
+    ]).start();
+  }, [resultModalVisible, resultOverlayOpacity, resultCardScale, resultCardTranslate]);
 
   useEffect(() => {
     (async () => {
@@ -286,7 +342,13 @@ export default function TakeAssessment() {
       const submitted = await hasStudentSubmitted({ schoolKey, assessmentId, studentId });
       if (submitted) {
         setAlreadySubmitted(true);
-        Alert.alert("Already submitted", "You already submitted this assessment.");
+        setResultSummary({
+          kind: "already",
+          isAuto: false,
+          finalScore: 0,
+          totalPoints: Number(assessment?.totalPoints || totalPoints || 0),
+        });
+        setResultModalVisible(true);
         return;
       }
 
@@ -345,12 +407,13 @@ export default function TakeAssessment() {
 
       if (draftKey) await AsyncStorage.removeItem(draftKey);
       setAlreadySubmitted(true);
-
-      Alert.alert(
-        isAuto ? "Time up" : "Submitted",
-        isAuto ? "Assessment auto-submitted." : "Your assessment has been submitted."
-      );
-      handleBackNavigation();
+      setResultSummary({
+        kind: "submitted",
+        isAuto,
+        finalScore: Number(autoScore || 0),
+        totalPoints: Number(assessment?.totalPoints || totalPoints || 0),
+      });
+      setResultModalVisible(true);
     } catch {
       Alert.alert("Submit failed", "Please try again.");
     } finally {
@@ -376,6 +439,33 @@ export default function TakeAssessment() {
 
   const timerText = formatTimeLeft(timeLeftMs);
   const dueLabel = formatDueDate(assessment?.dueDate);
+  const resultPercent = resultSummary.totalPoints > 0
+    ? Math.round((resultSummary.finalScore / resultSummary.totalPoints) * 100)
+    : 0;
+  const shouldCelebrate = resultModalVisible && resultPercent >= CELEBRATION_THRESHOLD;
+  const isAlreadySubmission = resultSummary.kind === "already";
+
+  useEffect(() => {
+    sparkleAnims.forEach((v) => v.setValue(0));
+    if (!shouldCelebrate) return;
+
+    const anims = sparkleAnims.map((v, idx) =>
+      Animated.timing(v, {
+        toValue: 1,
+        duration: 760,
+        delay: idx * 50,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      })
+    );
+
+    Animated.stagger(30, anims).start();
+  }, [shouldCelebrate, sparkleAnims]);
+
+  const closeResultModal = () => {
+    setResultModalVisible(false);
+    handleBackNavigation();
+  };
 
   return (
     <SafeAreaView style={styles.container}>
@@ -613,6 +703,98 @@ export default function TakeAssessment() {
           </Text>
         </TouchableOpacity>
       </ScrollView>
+
+      <Modal
+        visible={resultModalVisible}
+        transparent
+        animationType="none"
+        onRequestClose={closeResultModal}
+      >
+        <Animated.View style={[styles.resultOverlay, { opacity: resultOverlayOpacity }]}>
+          <Animated.View
+            style={[
+              styles.resultCard,
+              {
+                transform: [
+                  { translateY: resultCardTranslate },
+                  { scale: resultCardScale },
+                ],
+              },
+            ]}
+          >
+            <View style={styles.resultGlowTop} />
+            <View style={styles.resultGlowBottom} />
+            {shouldCelebrate ? (
+              <View pointerEvents="none" style={styles.sparkleLayer}>
+                {RESULT_SPARKLES.map((item, idx) => {
+                  const progress = sparkleAnims[idx];
+                  const opacity = progress.interpolate({ inputRange: [0, 0.2, 1], outputRange: [0, 1, 0] });
+                  const translateY = progress.interpolate({ inputRange: [0, 1], outputRange: [0, item.drop] });
+                  const scale = progress.interpolate({ inputRange: [0, 0.35, 1], outputRange: [0.6, 1.08, 0.8] });
+
+                  return (
+                    <Animated.View
+                      key={`sparkle-${idx}`}
+                      style={[
+                        styles.sparkleDot,
+                        {
+                          left: item.left,
+                          top: item.top,
+                          backgroundColor: item.color,
+                          opacity,
+                          transform: [{ translateY }, { scale }, { rotate: item.rotate }],
+                        },
+                      ]}
+                    />
+                  );
+                })}
+              </View>
+            ) : null}
+
+            <View style={styles.resultIconWrap}>
+              <Ionicons name="checkmark-done" size={28} color="#fff" />
+            </View>
+
+            <Text style={styles.resultTitle}>
+              {isAlreadySubmission
+                ? "Already Submitted"
+                : resultSummary.isAuto
+                  ? "Time Is Up"
+                  : "Assessment Submitted"}
+            </Text>
+            <Text style={styles.resultSubtitle}>
+              {isAlreadySubmission
+                ? "This assessment was already submitted before."
+                : resultSummary.isAuto
+                  ? "Your exam was auto-submitted successfully."
+                  : "Great work. Your exam has been submitted successfully."}
+            </Text>
+
+            {!isAlreadySubmission ? (
+              <View style={styles.resultStatsRow}>
+                <View style={styles.resultStatBox}>
+                  <Text style={styles.resultStatLabel}>Score</Text>
+                  <Text style={styles.resultStatValue}>{resultSummary.finalScore}/{resultSummary.totalPoints || 0}</Text>
+                </View>
+                <View style={styles.resultStatDivider} />
+                <View style={styles.resultStatBox}>
+                  <Text style={styles.resultStatLabel}>Result</Text>
+                  <Text style={styles.resultStatValue}>{resultPercent}%</Text>
+                </View>
+              </View>
+            ) : (
+              <View style={styles.resultInfoPill}>
+                <Ionicons name="information-circle-outline" size={16} color={PRIMARY} />
+                <Text style={styles.resultInfoText}>No duplicate submission allowed.</Text>
+              </View>
+            )}
+
+            <TouchableOpacity style={styles.resultPrimaryBtn} onPress={closeResultModal} activeOpacity={0.9}>
+              <Text style={styles.resultPrimaryText}>Continue</Text>
+            </TouchableOpacity>
+          </Animated.View>
+        </Animated.View>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -1079,6 +1261,154 @@ function createStyles(colors) {
     color: "#fff",
     fontWeight: "900",
     fontSize: 14,
+  },
+
+  resultOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(6, 15, 39, 0.56)",
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 24,
+  },
+  resultCard: {
+    width: "100%",
+    maxWidth: 390,
+    borderRadius: 24,
+    backgroundColor: colors.card,
+    borderWidth: 1,
+    borderColor: colors.border,
+    paddingHorizontal: 20,
+    paddingTop: 22,
+    paddingBottom: 18,
+    alignItems: "center",
+    overflow: "hidden",
+    shadowColor: "#001946",
+    shadowOffset: { width: 0, height: 14 },
+    shadowOpacity: 0.24,
+    shadowRadius: 20,
+    elevation: 12,
+  },
+  resultGlowTop: {
+    position: "absolute",
+    top: -90,
+    right: -80,
+    width: 200,
+    height: 200,
+    borderRadius: 100,
+    backgroundColor: "rgba(11,114,255,0.12)",
+  },
+  resultGlowBottom: {
+    position: "absolute",
+    bottom: -80,
+    left: -70,
+    width: 180,
+    height: 180,
+    borderRadius: 90,
+    backgroundColor: "rgba(18,183,106,0.10)",
+  },
+  sparkleLayer: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    top: 0,
+    height: 90,
+  },
+  sparkleDot: {
+    position: "absolute",
+    width: 8,
+    height: 14,
+    borderRadius: 6,
+  },
+  resultIconWrap: {
+    width: 68,
+    height: 68,
+    borderRadius: 34,
+    backgroundColor: PRIMARY,
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: 14,
+    borderWidth: 4,
+    borderColor: "rgba(11,114,255,0.18)",
+  },
+  resultTitle: {
+    color: colors.text,
+    fontSize: 20,
+    fontWeight: "900",
+    textAlign: "center",
+  },
+  resultSubtitle: {
+    color: colors.muted,
+    marginTop: 8,
+    textAlign: "center",
+    fontSize: 13,
+    fontWeight: "600",
+    lineHeight: 20,
+    paddingHorizontal: 6,
+  },
+  resultStatsRow: {
+    width: "100%",
+    marginTop: 16,
+    marginBottom: 14,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.inputBackground,
+    flexDirection: "row",
+    alignItems: "stretch",
+  },
+  resultStatBox: {
+    flex: 1,
+    paddingVertical: 12,
+    alignItems: "center",
+  },
+  resultStatDivider: {
+    width: 1,
+    backgroundColor: colors.border,
+  },
+  resultStatLabel: {
+    color: colors.muted,
+    fontSize: 11,
+    fontWeight: "700",
+    textTransform: "uppercase",
+    letterSpacing: 0.6,
+  },
+  resultStatValue: {
+    marginTop: 6,
+    color: colors.text,
+    fontSize: 18,
+    fontWeight: "900",
+  },
+  resultInfoPill: {
+    width: "100%",
+    marginTop: 16,
+    marginBottom: 14,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.inputBackground,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+  },
+  resultInfoText: {
+    marginLeft: 6,
+    color: colors.muted,
+    fontWeight: "700",
+    fontSize: 12,
+  },
+  resultPrimaryBtn: {
+    width: "100%",
+    borderRadius: 14,
+    backgroundColor: PRIMARY,
+    paddingVertical: 12,
+    alignItems: "center",
+  },
+  resultPrimaryText: {
+    color: "#fff",
+    fontSize: 14,
+    fontWeight: "900",
   },
 });
 }

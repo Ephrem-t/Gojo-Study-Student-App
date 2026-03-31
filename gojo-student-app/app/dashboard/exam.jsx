@@ -396,7 +396,11 @@ export default function ExamScreen() {
       const raw = [];
       const val = snap?.val ? snap.val() : null;
       if (val) {
-        Object.keys(val).forEach((key) => raw.push({ userId: key, rank: val[key]?.rank || 999 }));
+        Object.keys(val).forEach((key) => raw.push({
+          userId: key,
+          rank: Number(val[key]?.rank || 999),
+          totalPoints: Number(val[key]?.totalPoints || 0),
+        }));
       }
 
       raw.sort((a, b) => (a.rank || 999) - (b.rank || 999));

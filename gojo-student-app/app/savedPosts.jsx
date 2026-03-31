@@ -20,6 +20,7 @@ import { useRouter } from "expo-router";
 import { get, ref, runTransaction } from "firebase/database";
 import { database } from "../constants/firebaseConfig";
 import { useAppTheme } from "../hooks/use-app-theme";
+import useUserProfileCard from "../hooks/use-user-profile-card";
 import { getInstagramFeedAspectRatio } from "./lib/instagramMedia";
 import { extractProfileImage, normalizeProfileImageUri } from "./lib/profileImage";
 import { getSavedPostsLocation, getSavedPostsMap, setSavedPostEntry } from "./lib/savedPosts";
@@ -87,6 +88,7 @@ export default function SavedPostsScreen() {
   const insets = useSafeAreaInsets();
   const { colors } = useAppTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
+  const { openUserProfile, profileCardModal } = useUserProfileCard();
   const adminCacheRef = useRef({});
 
   const [loading, setLoading] = useState(true);
@@ -380,18 +382,41 @@ export default function SavedPostsScreen() {
     return (
       <View style={styles.card}>
         <View style={styles.cardHeader}>
-          <Image
-            source={posterImage ? { uri: posterImage } : require("../assets/images/avatar_placeholder.png")}
-            style={styles.avatar}
-          />
-          <View style={styles.headerTextWrap}>
-            <Text style={styles.username}>{posterName}</Text>
-            <View style={styles.headerMetaRow}>
-              <Text style={styles.time}>{timeAgo(data.time)}</Text>
-              <Text style={styles.headerDot}>·</Text>
-              <Text style={styles.targetRoleText}>{formatTargetRoleLabel(data)}</Text>
+          <TouchableOpacity
+            style={styles.headerProfileTap}
+            activeOpacity={0.85}
+            onPress={() => openUserProfile({
+              candidates: [
+                admin?._nodeKey,
+                admin?.userId,
+                admin?.username,
+                data?.adminId,
+                data?.userId,
+                data?.createdBy,
+              ].filter(Boolean),
+              fallbackSchoolCode: admin?._schoolKey,
+              fallbackUser: admin,
+              fallbackName: posterName,
+              fallbackAvatar: posterImage,
+              fallbackRole: admin?.role || "School Account",
+              fallbackRoleTitle: admin?.designation || admin?.subject || admin?.role || "School Account",
+              fallbackContactKey: admin?._nodeKey || data?.adminId || data?.createdBy || "",
+              fallbackContactUserId: admin?.userId || data?.adminId || data?.userId || data?.createdBy || "",
+            })}
+          >
+            <Image
+              source={posterImage ? { uri: posterImage } : require("../assets/images/avatar_placeholder.png")}
+              style={styles.avatar}
+            />
+            <View style={styles.headerTextWrap}>
+              <Text style={styles.username}>{posterName}</Text>
+              <View style={styles.headerMetaRow}>
+                <Text style={styles.time}>{timeAgo(data.time)}</Text>
+                <Text style={styles.headerDot}>·</Text>
+                <Text style={styles.targetRoleText}>{formatTargetRoleLabel(data)}</Text>
+              </View>
             </View>
-          </View>
+          </TouchableOpacity>
         </View>
 
         {message ? (
@@ -489,6 +514,8 @@ export default function SavedPostsScreen() {
           </Pressable>
         </View>
       </Modal>
+
+      {profileCardModal}
     </SafeAreaView>
   );
 }
@@ -556,6 +583,11 @@ function createStyles(colors) {
       paddingHorizontal: 12,
       paddingTop: 10,
       paddingBottom: 6,
+    },
+    headerProfileTap: {
+      flex: 1,
+      flexDirection: "row",
+      alignItems: "center",
     },
     avatar: {
       width: 40,

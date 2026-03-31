@@ -13,6 +13,7 @@ import {
   Modal,
   Pressable,
 } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as FileSystem from "expo-file-system/legacy";
@@ -33,6 +34,7 @@ import {
 import { database } from "../../constants/firebaseConfig";
 import { queryUserByUsernameInSchool, queryUserByChildInSchool } from "../lib/userHelpers";
 import { useAppTheme } from "../../hooks/use-app-theme";
+import useUserProfileCard from "../../hooks/use-user-profile-card";
 import { extractProfileImage, normalizeProfileImageUri } from "../lib/profileImage";
 import { getInstagramFeedAspectRatio } from "../lib/instagramMedia";
 import { getSavedPostsLocation, toggleSavedPostEntry } from "../lib/savedPosts";
@@ -122,6 +124,8 @@ function getPosterImage(admin, postData) {
 export default function HomeScreen() {
   const { colors } = useAppTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
+  const insets = useSafeAreaInsets();
+  const { openUserProfile, profileCardModal } = useUserProfileCard();
   const [postsLatest, setPostsLatest] = useState([]);
   const [postsOlder, setPostsOlder] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -305,7 +309,7 @@ export default function HomeScreen() {
 
           await Promise.all(filteredTmp.map((p) => resolvePosterForPost(p.data, schoolKey)));
 
-          const enriched = filteredTmp.map((p) => {
+          const enriched = await Promise.all(filteredTmp.map(async (p) => {
             const likesNode = p.data.likes || {};
             const seenNode = p.data.seenBy || {};
 
@@ -326,8 +330,10 @@ export default function HomeScreen() {
               adminCacheRef.current[p.data.adminId] ||
               adminCacheRef.current[p.data.userId] ||
               null;
-            return { postId: p.postId, data: p.data, admin, likesMap: likesNode, seenMap: seenNode };
-          });
+            const imageUri = normalizeProfileImageUri(p.data.postUrl);
+            const aspectRatio = imageUri ? await getInstagramFeedAspectRatio(imageUri) : 1;
+            return { postId: p.postId, data: p.data, admin, likesMap: likesNode, seenMap: seenNode, aspectRatio };
+          }));
 
           enriched.forEach((e) => {
             const safePostImage = normalizeProfileImageUri(e.data.postUrl);
@@ -453,15 +459,17 @@ export default function HomeScreen() {
 
       await Promise.all(filteredByTarget.map((p) => resolvePosterForPost(p.data, schoolKey)));
 
-      const enrichedOlder = filteredByTarget.map((p) => {
+      const enrichedOlder = await Promise.all(filteredByTarget.map(async (p) => {
         const likesNode = p.data.likes || {};
         const seenNode = p.data.seenBy || {};
         const admin =
           adminCacheRef.current[p.data.adminId] ||
           adminCacheRef.current[p.data.userId] ||
           null;
-        return { postId: p.postId, data: p.data, admin, likesMap: likesNode, seenMap: seenNode };
-      });
+        const imageUri = normalizeProfileImageUri(p.data.postUrl);
+        const aspectRatio = imageUri ? await getInstagramFeedAspectRatio(imageUri) : 1;
+        return { postId: p.postId, data: p.data, admin, likesMap: likesNode, seenMap: seenNode, aspectRatio };
+      }));
 
       enrichedOlder.forEach((e) => {
         const safePostImage = normalizeProfileImageUri(e.data.postUrl);
@@ -530,7 +538,13 @@ export default function HomeScreen() {
         const snap = await get(pRef);
         if (snap.exists()) {
           const val = snap.val();
-          const updated = { postId: val.postId || postId, data: val, likesMap: val.likes || {}, seenMap: val.seenBy || {} };
+          const updated = {
+            postId: val.postId || postId,
+            data: val,
+            likesMap: val.likes || {},
+            seenMap: val.seenBy || {},
+            aspectRatio: found?.aspectRatio || 1,
+          };
           setPostsLatest((prev) => prev.map((p) => (p.postId === postId ? updated : p)));
           setPostsOlder((prev) => prev.map((p) => (p.postId === postId ? updated : p)));
         }
@@ -675,7 +689,7 @@ export default function HomeScreen() {
     const isLiked = userId ? !!likesMap[userId] : false;
     const isSaved = !!savedPostsMap[postId];
     const imageUri = normalizeProfileImageUri(data.postUrl);
-    const [mediaAspectRatio, setMediaAspectRatio] = useState(1);
+    const mediaAspectRatio = item.aspectRatio || 1;
     const message = String(data.message || "").trim();
     const targetRoleLabel = formatTargetRoleLabel(data);
     const posterName = getPosterName(admin, data);
@@ -685,25 +699,6 @@ export default function HomeScreen() {
     const previewMessage = shouldTruncate && !isExpanded
       ? `${message.slice(0, DESCRIPTION_PREVIEW_LENGTH).trimEnd()}...`
       : message;
-
-    useEffect(() => {
-      let active = true;
-
-      if (!imageUri) {
-        setMediaAspectRatio(1);
-        return () => {
-          active = false;
-        };
-      }
-
-      getInstagramFeedAspectRatio(imageUri).then((nextAspectRatio) => {
-        if (active) setMediaAspectRatio(nextAspectRatio);
-      });
-
-      return () => {
-        active = false;
-      };
-    }, [imageUri]);
 
     const scale = useRef(new Animated.Value(1)).current;
     const animateHeart = () => {
@@ -720,18 +715,41 @@ export default function HomeScreen() {
     return (
       <View style={styles.card}>
         <View style={styles.cardHeader}>
-          <Image
-            source={posterImage ? { uri: posterImage } : require("../../assets/images/avatar_placeholder.png")}
-            style={styles.avatar}
-          />
-          <View style={styles.headerTextWrap}>
-            <Text style={styles.username}>{posterName}</Text>
-            <View style={styles.headerMetaRow}>
-              <Text style={styles.time}>{timeAgo(data.time)}</Text>
-              <Text style={styles.headerDot}>·</Text>
-              <Text style={styles.targetRoleText}>{targetRoleLabel}</Text>
+          <TouchableOpacity
+            style={styles.headerProfileTap}
+            activeOpacity={0.85}
+            onPress={() => openUserProfile({
+              candidates: [
+                item.admin?._nodeKey,
+                item.admin?.userId,
+                item.admin?.username,
+                item.data?.adminId,
+                item.data?.userId,
+                item.data?.createdBy,
+              ].filter(Boolean),
+              fallbackSchoolCode: item.admin?._schoolKey,
+              fallbackUser: item.admin,
+              fallbackName: posterName,
+              fallbackAvatar: posterImage,
+              fallbackRole: item.admin?.role || "School Account",
+              fallbackRoleTitle: item.admin?.designation || item.admin?.subject || item.admin?.role || "School Account",
+              fallbackContactKey: item.admin?._nodeKey || item.data?.adminId || item.data?.createdBy || "",
+              fallbackContactUserId: item.admin?.userId || item.data?.adminId || item.data?.userId || item.data?.createdBy || "",
+            })}
+          >
+            <Image
+              source={posterImage ? { uri: posterImage } : require("../../assets/images/avatar_placeholder.png")}
+              style={styles.avatar}
+            />
+            <View style={styles.headerTextWrap}>
+              <Text style={styles.username}>{posterName}</Text>
+              <View style={styles.headerMetaRow}>
+                <Text style={styles.time}>{timeAgo(data.time)}</Text>
+                <Text style={styles.headerDot}>·</Text>
+                <Text style={styles.targetRoleText}>{targetRoleLabel}</Text>
+              </View>
             </View>
-          </View>
+          </TouchableOpacity>
           <TouchableOpacity style={styles.moreBtn} activeOpacity={0.8} onPress={() => openPostMenu(postId)}>
             <Ionicons name="ellipsis-horizontal" size={20} color={colors.muted} />
           </TouchableOpacity>
@@ -749,15 +767,14 @@ export default function HomeScreen() {
         ) : null}
 
         {imageUri ? (
-          <TouchableOpacity
-            activeOpacity={0.95}
+          <Pressable
             onPress={() => {
               setViewerImage(imageUri);
               setViewerVisible(true);
             }}
           >
             <Image source={{ uri: imageUri }} style={[styles.postImage, { aspectRatio: mediaAspectRatio }]} resizeMode="cover" />
-          </TouchableOpacity>
+          </Pressable>
         ) : null}
 
         <View style={styles.reactionsSummary}>
@@ -823,7 +840,7 @@ export default function HomeScreen() {
         data={combinedPosts}
         keyExtractor={(i) => i.postId}
         renderItem={({ item }) => <PostCard item={item} />}
-        contentContainerStyle={styles.list}
+        contentContainerStyle={[styles.list, { paddingBottom: 74 + Math.max(insets.bottom, 6) }]}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={[colors.primary]} tintColor={colors.primary} />}
         onEndReachedThreshold={0.6}
         onEndReached={() => {
@@ -872,6 +889,7 @@ export default function HomeScreen() {
           </Pressable>
         </View>
       </Modal>
+      {profileCardModal}
     </>
   );
 }
@@ -896,6 +914,11 @@ function createStyles(colors) {
     paddingHorizontal: 12,
     paddingTop: 10,
     paddingBottom: 6,
+  },
+  headerProfileTap: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
   },
   avatar: {
     width: 40,
@@ -1040,6 +1063,146 @@ function createStyles(colors) {
   viewerImage: {
     width: "100%",
     height: "100%",
+  },
+  profileModalOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(7,17,34,0.44)",
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 18,
+  },
+  profileModalCard: {
+    width: "100%",
+    maxWidth: 344,
+    backgroundColor: colors.card,
+    borderRadius: 24,
+    paddingHorizontal: 16,
+    paddingTop: 18,
+    paddingBottom: 14,
+    overflow: "hidden",
+    borderWidth: 1,
+    borderColor: "rgba(0,122,251,0.12)",
+    shadowColor: "#001845",
+    shadowOffset: { width: 0, height: 14 },
+    shadowOpacity: 0.16,
+    shadowRadius: 28,
+    elevation: 18,
+  },
+  profileModalAccent: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    height: 68,
+    backgroundColor: colors.soft,
+  },
+  profileHero: {
+    alignItems: "center",
+    marginBottom: 12,
+  },
+  profileModalAvatar: {
+    width: 68,
+    height: 68,
+    borderRadius: 34,
+    marginBottom: 10,
+    backgroundColor: colors.soft,
+    borderWidth: 2,
+    borderColor: colors.white,
+  },
+  profileAvatarFallback: {
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  profileAvatarLetter: {
+    fontSize: 24,
+    fontWeight: "800",
+    color: colors.primary,
+  },
+  profileModalName: {
+    fontSize: 20,
+    fontWeight: "800",
+    color: colors.text,
+    textAlign: "center",
+  },
+  roleLine: {
+    marginTop: 8,
+    fontSize: 13,
+    textAlign: "center",
+  },
+  roleLineLabel: {
+    color: colors.muted,
+    fontWeight: "700",
+  },
+  roleLineDot: {
+    color: colors.muted,
+  },
+  roleLineValue: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: colors.primary,
+  },
+  infoGrid: {
+    gap: 8,
+  },
+  infoRow: {
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 14,
+    backgroundColor: "#F8FBFF",
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  infoLabel: {
+    fontSize: 10,
+    fontWeight: "800",
+    color: colors.muted,
+    textTransform: "uppercase",
+    marginBottom: 3,
+  },
+  infoValue: {
+    fontSize: 14,
+    fontWeight: "700",
+    color: colors.text,
+  },
+  profileModalActions: {
+    flexDirection: "row",
+    gap: 10,
+    marginTop: 12,
+  },
+  messageProfileBtn: {
+    flex: 1,
+    minHeight: 40,
+    borderRadius: 12,
+    backgroundColor: colors.primary,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    shadowColor: colors.primary,
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.2,
+    shadowRadius: 16,
+    elevation: 8,
+  },
+  messageProfileBtnText: {
+    color: colors.white,
+    fontSize: 14,
+    fontWeight: "800",
+  },
+  closeProfileBtn: {
+    flex: 1,
+    minHeight: 40,
+    borderRadius: 12,
+    backgroundColor: "#F4F7FB",
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  closeProfileBtnText: {
+    color: colors.text,
+    fontSize: 14,
+    fontWeight: "800",
   },
 });
 }

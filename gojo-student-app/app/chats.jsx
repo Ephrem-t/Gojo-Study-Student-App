@@ -22,6 +22,7 @@ import { setOpenedChat } from "./lib/chatStore";
 import { useFocusEffect } from "@react-navigation/native";
 import { getUserVal } from "./lib/userHelpers";
 import { useAppTheme } from "../hooks/use-app-theme";
+import useUserProfileCard from "../hooks/use-user-profile-card";
 import { extractProfileImage, normalizeProfileImageUri } from "./lib/profileImage";
 
 const AVATAR_PLACEHOLDER = require("../assets/images/avatar_placeholder.png");
@@ -53,6 +54,7 @@ export default function ChatsScreen() {
   const router = useRouter();
   const { colors, statusBarStyle } = useAppTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
+  const { openUserProfile, profileCardModal } = useUserProfileCard();
 
   const [loadingInitial, setLoadingInitial] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -616,13 +618,39 @@ export default function ChatsScreen() {
               return (
                 <TouchableOpacity style={styles.itemWrapper} onPress={() => onOpenChat(item)} activeOpacity={0.9}>
                   <View style={styles.row}>
-                    <Image source={normalizeProfileImageUri(item.profileImage) ? { uri: normalizeProfileImageUri(item.profileImage) } : AVATAR_PLACEHOLDER} style={styles.avatar} />
+                    <TouchableOpacity
+                      style={styles.profileTapArea}
+                      activeOpacity={0.85}
+                      onPress={() => openUserProfile({
+                        candidates: [item.key, item.userId].filter(Boolean),
+                        fallbackName: item.name,
+                        fallbackAvatar: item.profileImage,
+                        fallbackRole: item.role || item.type || "School Account",
+                        fallbackRoleTitle: item.role || item.type || "School Account",
+                        fallbackContactKey: item.key || "",
+                        fallbackContactUserId: item.userId || item.key || "",
+                      })}
+                    >
+                      <Image source={normalizeProfileImageUri(item.profileImage) ? { uri: normalizeProfileImageUri(item.profileImage) } : AVATAR_PLACEHOLDER} style={styles.avatar} />
+                    </TouchableOpacity>
                     <View style={{ flex: 1, marginLeft: 12 }}>
                       <View style={styles.rowTop}>
-                        <View style={{ flex: 1, flexDirection: "row", alignItems: "center" }}>
+                        <TouchableOpacity
+                          style={styles.nameTapArea}
+                          activeOpacity={0.85}
+                          onPress={() => openUserProfile({
+                            candidates: [item.key, item.userId].filter(Boolean),
+                            fallbackName: item.name,
+                            fallbackAvatar: item.profileImage,
+                            fallbackRole: item.role || item.type || "School Account",
+                            fallbackRoleTitle: item.role || item.type || "School Account",
+                            fallbackContactKey: item.key || "",
+                            fallbackContactUserId: item.userId || item.key || "",
+                          })}
+                        >
                           <Text style={styles.name} numberOfLines={1}>{item.name}</Text>
                           {item.role ? <View style={styles.badge}><Text style={styles.badgeText}>{item.role}</Text></View> : null}
-                        </View>
+                        </TouchableOpacity>
 
                         <View style={{ alignItems: "flex-end", flexDirection: "row" }}>
                           <Text style={styles.time}>{fmtTime12(item.lastTime)}</Text>
@@ -649,6 +677,7 @@ export default function ChatsScreen() {
           />
         )}
       </View>
+      {profileCardModal}
     </SafeAreaView>
   );
 }
@@ -720,8 +749,10 @@ function createStyles(colors) {
 
   itemWrapper: { paddingHorizontal: 0 },
   row: { flexDirection: "row", alignItems: "center", paddingVertical: 12, backgroundColor: colors.background },
+  profileTapArea: { alignItems: "center", justifyContent: "center" },
   avatar: { width: 56, height: 56, borderRadius: 28, backgroundColor: colors.surfaceMuted },
   rowTop: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  nameTapArea: { flex: 1, flexDirection: "row", alignItems: "center" },
   name: { fontWeight: "700", fontSize: 16, color: colors.text, marginRight: 8 },
   badge: { marginLeft: -4, paddingHorizontal: 7, paddingVertical: 3, borderRadius: 8, backgroundColor: colors.badgeBackground },
   badgeText: { color: colors.primary, fontWeight: "700", fontSize: 11 },

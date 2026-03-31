@@ -864,8 +864,6 @@ export default function ProfileScreen() {
                 <Ionicons name="chevron-back" size={20} color={colors.white} />
               </TouchableOpacity>
 
-              <Text style={styles.heroTopTitle}>Profile</Text>
-
               <View style={styles.heroTopActions}>
                 <View style={styles.heroQuickStats}>
                   {schoolRank?.rank ? (
@@ -1473,7 +1471,7 @@ function createStyles(colors) {
   },
   heroBanner: {
     height: 110,
-    backgroundColor: "#7F1D1D",
+    backgroundColor: colors.white,
     position: "relative",
     overflow: "hidden",
     borderTopLeftRadius: 0,
@@ -1488,7 +1486,7 @@ function createStyles(colors) {
   },
   heroBannerFallback: {
     flex: 1,
-    backgroundColor: "#991B1B",
+    backgroundColor: colors.white,
     overflow: "hidden",
   },
   heroBannerOrbPrimary: {
@@ -1496,7 +1494,7 @@ function createStyles(colors) {
     width: 180,
     height: 180,
     borderRadius: 90,
-    backgroundColor: "rgba(248,113,113,0.30)",
+    backgroundColor: "rgba(0,0,0,0.04)",
     top: -40,
     right: -20,
   },
@@ -1505,17 +1503,17 @@ function createStyles(colors) {
     width: 160,
     height: 160,
     borderRadius: 80,
-    backgroundColor: "rgba(255,255,255,0.10)",
+    backgroundColor: "rgba(0,0,0,0.02)",
     bottom: -60,
     left: -20,
   },
   heroBannerOverlay: {
     ...StyleSheet.absoluteFillObject,
-    backgroundColor: "rgba(69,10,10,0.22)",
+    backgroundColor: "transparent",
   },
   heroTopBar: {
     position: "absolute",
-    top: 10,
+    top: 6,
     left: 12,
     right: 12,
     zIndex: 30,
@@ -1528,9 +1526,9 @@ function createStyles(colors) {
     alignItems: "center",
   },
   heroTopIconBtn: {
-    width: 34,
-    height: 34,
-    borderRadius: 17,
+    width: 32,
+    height: 32,
+    borderRadius: 16,
     alignItems: "center",
     justifyContent: "center",
     backgroundColor: "rgba(15,23,42,0.38)",
@@ -1538,7 +1536,7 @@ function createStyles(colors) {
     borderColor: "rgba(255,255,255,0.16)",
   },
   heroTopTitle: {
-    color: "#F8FAFC",
+    color: colors.text,
     fontSize: 14,
     fontWeight: "800",
     letterSpacing: 0.2,

@@ -1263,31 +1263,42 @@ useEffect(() => {
           },
         ]}
       >
+        <View style={styles.resultGlowTop} />
+        <View style={styles.resultGlowBottom} />
+
         <Animated.View style={{ transform: [{ scale: resultPulse }] }}>
-          <View style={[styles.resultBadgeBubble, { backgroundColor: isPass ? "#ECFDF3" : "#FEF2F2" }]}>
+          <View style={styles.resultBadgeBubble}>
             <Ionicons
               name={isPass ? "checkmark-circle" : "refresh-circle"}
               size={42}
-              color={isPass ? C.success : C.danger}
+              color="#fff"
             />
           </View>
         </Animated.View>
 
-        <Text style={styles.resultTitle}>{gradeLabel}</Text>
+        <Text style={styles.resultTitle}>Exam Completed</Text>
         <Text style={styles.resultPct}>{Math.round(Number(result?.percent || 0))}%</Text>
-        <Text style={styles.resultSub}>{result?.correct ?? 0} / {result?.total ?? 0} correct</Text>
+        <Text style={styles.resultSub}>
+          {isPass ? "Great work. Your exam has been submitted successfully." : "Your exam has been submitted. Keep practicing to improve your score."}
+        </Text>
+
+        <View style={styles.resultMoodPill}>
+          <Text style={styles.resultMoodText}>{gradeLabel}</Text>
+        </View>
 
         <View style={styles.resultStatsRow}>
           <View style={styles.resultStatBox}>
             <Text style={styles.resultStatLabel}>Correct</Text>
             <Text style={[styles.resultStatValue, { color: C.success }]}>{result?.correct ?? 0}</Text>
           </View>
+          <View style={styles.resultStatDivider} />
           <View style={styles.resultStatBox}>
             <Text style={styles.resultStatLabel}>Wrong</Text>
             <Text style={[styles.resultStatValue, { color: C.danger }]}>
               {Math.max(0, Number(result?.total || 0) - Number(result?.correct || 0))}
             </Text>
           </View>
+          <View style={styles.resultStatDivider} />
           <View style={styles.resultStatBox}>
             <Text style={styles.resultStatLabel}>Score</Text>
             <Text style={[styles.resultStatValue, { color: C.primary }]}>
@@ -1312,12 +1323,12 @@ useEffect(() => {
                 setReviewIndex(Math.max(0, (order.length || questions.length) - 1));
               }}
             >
-              <Text style={styles.ghostTxt}>Review</Text>
+              <Text style={styles.ghostTxt}>Review Answers</Text>
             </TouchableOpacity>
           ) : null}
 
           <TouchableOpacity style={[styles.primaryBtnSmall, { flex: 1 }]} onPress={handleBackNavigation}>
-            <Text style={styles.primaryBtnText}>Back to Rounds</Text>
+            <Text style={styles.primaryBtnText}>Continue</Text>
           </TouchableOpacity>
         </View>
       </Animated.View>
@@ -1474,18 +1485,62 @@ function createStyles(colors) {
   resultCard: {
     width: "100%",
     backgroundColor: colors.card,
-    borderRadius: 16,
+    borderRadius: 24,
     borderWidth: 1,
     borderColor: colors.border,
     alignItems: "center",
-    padding: 24,
-    shadowColor: "#000",
-    shadowOpacity: 0.05,
-    shadowRadius: 10,
-    elevation: 3,
+    paddingHorizontal: 20,
+    paddingTop: 22,
+    paddingBottom: 18,
+    overflow: "hidden",
+    shadowColor: "#001946",
+    shadowOffset: { width: 0, height: 14 },
+    shadowOpacity: 0.24,
+    shadowRadius: 20,
+    elevation: 12,
+  },
+  resultGlowTop: {
+    position: "absolute",
+    top: -90,
+    right: -80,
+    width: 200,
+    height: 200,
+    borderRadius: 100,
+    backgroundColor: "rgba(11,114,255,0.12)",
+  },
+  resultGlowBottom: {
+    position: "absolute",
+    bottom: -80,
+    left: -70,
+    width: 180,
+    height: 180,
+    borderRadius: 90,
+    backgroundColor: "rgba(18,183,106,0.10)",
   },
   resultPct: { fontSize: 56, color: C.primary, fontWeight: "900", marginTop: 4 },
-  resultSub: { marginTop: 8, color: colors.muted, textAlign: "center", fontWeight: "700" },
+  resultSub: {
+    marginTop: 8,
+    color: colors.muted,
+    textAlign: "center",
+    fontWeight: "600",
+    fontSize: 13,
+    lineHeight: 20,
+    paddingHorizontal: 6,
+  },
+  resultMoodPill: {
+    marginTop: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 999,
+    backgroundColor: colors.soft,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  resultMoodText: {
+    color: C.primary,
+    fontSize: 12,
+    fontWeight: "800",
+  },
 
   resultBgOrnament: {
     position: "absolute",
@@ -1497,12 +1552,16 @@ function createStyles(colors) {
     backgroundColor: C.primary,
   },
   resultBadgeBubble: {
-    width: 78,
-    height: 78,
-    borderRadius: 39,
+    width: 68,
+    height: 68,
+    borderRadius: 34,
     alignItems: "center",
     justifyContent: "center",
     marginTop: 2,
+    marginBottom: 14,
+    backgroundColor: C.primary,
+    borderWidth: 4,
+    borderColor: "rgba(11,114,255,0.18)",
   },
   resultTitle: {
     marginTop: 12,
@@ -1514,16 +1573,20 @@ function createStyles(colors) {
     marginTop: 14,
     flexDirection: "row",
     width: "100%",
-    gap: 8,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.inputBackground,
+    alignItems: "stretch",
   },
   resultStatBox: {
     flex: 1,
-    borderWidth: 1,
-    borderColor: colors.border,
-    backgroundColor: colors.panel,
-    borderRadius: 10,
-    paddingVertical: 10,
+    paddingVertical: 12,
     alignItems: "center",
+  },
+  resultStatDivider: {
+    width: 1,
+    backgroundColor: colors.border,
   },
   resultStatLabel: {
     color: colors.muted,

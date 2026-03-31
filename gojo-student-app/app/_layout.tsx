@@ -1,10 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ThemeProvider } from "@react-navigation/native";
-import { SafeAreaView, StyleSheet, View, Text, TouchableOpacity, Animated, Easing } from "react-native";
+import { SafeAreaView, StyleSheet, View, Text, TouchableOpacity, Animated, Easing, Platform } from "react-native";
 import { Stack, usePathname, useRouter } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { Ionicons } from "@expo/vector-icons";
+import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { getValue } from "./lib/dbHelpers";
 import { AppThemeProvider, useAppTheme } from "../hooks/use-app-theme";
@@ -43,6 +43,44 @@ function ThemedRootLayout() {
   const pathname = usePathname();
   const { colors, navigationTheme, statusBarStyle } = useAppTheme();
   const bootRedirectDoneRef = useRef(false);
+
+  useEffect(() => {
+    if (Platform.OS !== "web") return;
+    if (typeof window === "undefined") return;
+    if (typeof window.addEventListener !== "function") return;
+
+    const preloadFonts = async () => {
+      try {
+        await Promise.all([
+          Ionicons.loadFont(),
+          MaterialCommunityIcons.loadFont(),
+        ]);
+      } catch (error) {
+        console.warn("Icon font preload failed on web:", error);
+      }
+    };
+
+    preloadFonts();
+
+    const onUnhandledRejection = (event: any) => {
+      const reasonText = String(event?.reason?.message || event?.reason || "").toLowerCase();
+      const isFontTimeout =
+        reasonText.includes("fontfaceobserver") ||
+        reasonText.includes("6000ms timeout exceeded");
+
+      if (isFontTimeout) {
+        event?.preventDefault?.();
+        console.warn("Ignored web font timeout for icon font.");
+      }
+    };
+
+    window.addEventListener("unhandledrejection", onUnhandledRejection as any);
+    return () => {
+      if (typeof window.removeEventListener === "function") {
+        window.removeEventListener("unhandledrejection", onUnhandledRejection as any);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (bootRedirectDoneRef.current) return;

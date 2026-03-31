@@ -16,13 +16,17 @@ import {
   PanResponder,
   Dimensions,
   TouchableWithoutFeedback,
+  TextInput,
+  Keyboard,
 } from "react-native";
 import { useRouter } from "expo-router";
+import { useBottomTabBarHeight } from "@react-navigation/bottom-tabs";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { ref, get, query, orderByChild, equalTo } from "firebase/database";
 import { database } from "../../constants/firebaseConfig";
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
-import { Svg, Circle } from "react-native-svg";
+import { Svg, Circle, Rect, Line, Text as SvgText, G } from "react-native-svg";
 import { setOpenedChat } from "../lib/chatStore";
 import { useAppTheme } from "../../hooks/use-app-theme";
 
@@ -41,6 +45,12 @@ const SUCCESS = "#27AE60";
 const WARNING = "#F2C94C";
 const DANGER = "#EB5757";
 const CARD_BORDER = "#F1F3F8";
+const MARK_FILTER_OPTIONS = [
+  { key: "all", label: "All" },
+  { key: "submitted", label: "Submitted" },
+  { key: "unsubmitted", label: "Unsubmitted" },
+  { key: "analytics", label: "Analytics" },
+];
 
 if (Platform.OS === "android" && UIManager.setLayoutAnimationEnabledExperimental) {
   UIManager.setLayoutAnimationEnabledExperimental(true);
@@ -94,6 +104,103 @@ function CircularProgress({ size = 112, strokeWidth = 9, percent = 0, color, tex
         />
       </Svg>
       <Text style={{ position: "absolute", fontWeight: "800", fontSize: textSize, color: color || percentColor(pct) }}>{pct !== null ? `${pct}%` : "-"}</Text>
+    </View>
+  );
+}
+
+function shortSubjectLabel(value = "") {
+  const parts = String(value || "").trim().split(/\s+/).filter(Boolean);
+  if (!parts.length) return "SUB";
+  if (parts.length === 1) return parts[0].slice(0, 4).toUpperCase();
+  return parts.slice(0, 2).map((part) => part.charAt(0)).join("").toUpperCase();
+}
+
+function AnalyticsBarChart({ data = [], colors }) {
+  if (!data.length) {
+    return <Text style={{ color: MUTED }}>No submitted marks yet for chart view.</Text>;
+  }
+
+  const chartWidth = Math.max(210, SCREEN_H * 0.36);
+  const chartHeight = 164;
+  const baselineY = 124;
+  const maxValue = Math.max(100, ...data.map((item) => Number(item.value || 0)));
+  const slotWidth = chartWidth / data.length;
+  const barWidth = Math.min(22, Math.max(12, slotWidth * 0.4));
+  const gridValues = [0, 25, 50, 75, 100];
+
+  return (
+    <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+      <Svg width={chartWidth} height={chartHeight}>
+        {gridValues.map((tick) => {
+          const y = baselineY - ((baselineY - 18) * tick) / maxValue;
+          return (
+            <G key={`grid-${tick}`}>
+              <Line x1="0" y1={y} x2={chartWidth} y2={y} stroke="#E8EEF9" strokeWidth="1" />
+              <SvgText x="0" y={Math.max(12, y - 4)} fontSize="10" fontWeight="700" fill={colors.muted}>
+                {String(tick)}
+              </SvgText>
+            </G>
+          );
+        })}
+
+        {data.map((item, index) => {
+          const value = Math.max(0, Number(item.value || 0));
+          const barHeight = ((baselineY - 22) * value) / maxValue;
+          const x = slotWidth * index + (slotWidth - barWidth) / 2;
+          const y = baselineY - barHeight;
+          return (
+            <G key={item.key || item.label || index}>
+              <Rect
+                x={x}
+                y={y}
+                width={barWidth}
+                height={barHeight}
+                rx={barWidth / 2.4}
+                fill={value >= 70 ? colors.primary : value >= 50 ? WARNING : DANGER}
+              />
+              <SvgText
+                x={x + barWidth / 2}
+                y={Math.max(14, y - 6)}
+                fontSize="9"
+                fontWeight="800"
+                fill={colors.text}
+                textAnchor="middle"
+              >
+                {`${Math.round(value)}%`}
+              </SvgText>
+              <SvgText
+                x={x + barWidth / 2}
+                y={144}
+                fontSize="9"
+                fontWeight="800"
+                fill={colors.muted}
+                textAnchor="middle"
+              >
+                {String(shortSubjectLabel(item.label))}
+              </SvgText>
+            </G>
+          );
+        })}
+      </Svg>
+    </ScrollView>
+  );
+}
+
+function AnalyticsCompletionGraph({ completed = 0, total = 0, colors }) {
+  const chartWidth = Math.max(220, SCREEN_H * 0.36);
+  const progress = total > 0 ? Math.max(0, Math.min(1, completed / total)) : 0;
+  const completedWidth = chartWidth * progress;
+
+  return (
+    <View>
+      <Svg width={chartWidth} height={18}>
+        <Rect x="0" y="0" width={chartWidth} height="10" rx="5" fill="#E7EEF9" />
+        <Rect x="0" y="0" width={completedWidth} height="10" rx="5" fill={colors.primary} />
+      </Svg>
+      <View style={{ flexDirection: "row", justifyContent: "space-between", marginTop: 4 }}>
+        <Text style={{ color: colors.text, fontWeight: "700", fontSize: 10 }}>{completed} completed</Text>
+        <Text style={{ color: colors.muted, fontWeight: "700", fontSize: 10 }}>{Math.max(0, total - completed)} pending</Text>
+      </View>
     </View>
   );
 }
@@ -336,6 +443,114 @@ function mergeMarksWithTemplate(actualMarks, templateSubjectNode) {
   return output;
 }
 
+function hasSubmittedScoreValue(value) {
+  if (value == null) return false;
+  if (typeof value === "string") return value.trim() !== "";
+  return true;
+}
+
+function hasSubmittedMarksInClassNode(actualMarks = {}) {
+  if (!actualMarks || typeof actualMarks !== "object") return false;
+
+  for (const semKey of Object.keys(actualMarks)) {
+    const semNode = actualMarks[semKey] || {};
+    const qKeys = Object.keys(semNode).filter((k) => /^q\d+/i.test(k));
+
+    if (qKeys.length > 0) {
+      for (const qKey of qKeys) {
+        const qNode = semNode[qKey] || {};
+        const assessments = qNode.assessments || qNode.assessment || {};
+        for (const assessKey of Object.keys(assessments)) {
+          const item = assessments[assessKey] || {};
+          if (
+            hasSubmittedScoreValue(item.score) ||
+            hasSubmittedScoreValue(item.obtained) ||
+            hasSubmittedScoreValue(item.mark) ||
+            hasSubmittedScoreValue(item.points) ||
+            hasSubmittedScoreValue(item.point)
+          ) {
+            return true;
+          }
+        }
+      }
+    } else {
+      const assessments = semNode.assessments || semNode.assessment || {};
+      for (const assessKey of Object.keys(assessments)) {
+        const item = assessments[assessKey] || {};
+        if (
+          hasSubmittedScoreValue(item.score) ||
+          hasSubmittedScoreValue(item.obtained) ||
+          hasSubmittedScoreValue(item.mark) ||
+          hasSubmittedScoreValue(item.points) ||
+          hasSubmittedScoreValue(item.point)
+        ) {
+          return true;
+        }
+      }
+    }
+  }
+
+  return false;
+}
+
+function getCourseAnalytics(marks = {}) {
+  if (!marks || typeof marks !== "object") {
+    return {
+      score: 0,
+      max: 0,
+      percent: null,
+      assessmentCount: 0,
+      completedCount: 0,
+    };
+  }
+
+  let score = 0;
+  let max = 0;
+  let assessmentCount = 0;
+  let completedCount = 0;
+
+  Object.keys(marks).forEach((semKey) => {
+    const semNode = marks[semKey] || {};
+    const qKeys = Object.keys(semNode || {}).filter((k) => /^q\d+/i.test(k));
+
+    if (qKeys.length > 0) {
+      qKeys.forEach((qKey) => {
+        const qNode = semNode[qKey] || {};
+        const assessments = qNode.assessments || qNode.assessment || {};
+        Object.keys(assessments).forEach((assessmentKey) => {
+          const item = normalizeAssessmentEntry(assessments[assessmentKey] || {}, assessmentKey);
+          assessmentCount += 1;
+          if (item.max != null) max += Number(item.max || 0);
+          if (item.score != null) {
+            score += Number(item.score || 0);
+            completedCount += 1;
+          }
+        });
+      });
+      return;
+    }
+
+    const assessments = semNode.assessments || semNode.assessment || {};
+    Object.keys(assessments).forEach((assessmentKey) => {
+      const item = normalizeAssessmentEntry(assessments[assessmentKey] || {}, assessmentKey);
+      assessmentCount += 1;
+      if (item.max != null) max += Number(item.max || 0);
+      if (item.score != null) {
+        score += Number(item.score || 0);
+        completedCount += 1;
+      }
+    });
+  });
+
+  return {
+    score,
+    max,
+    percent: max > 0 ? (score / max) * 100 : null,
+    assessmentCount,
+    completedCount,
+  };
+}
+
 /* Bottom sheet omitted for brevity — unchanged from previous (keeps same implementation) */
 // ... (keep DraggableBottomSheet from prior file unchanged)
 function DraggableBottomSheet({ visible, onClose, contentHeight = SCREEN_H * 0.85, innerScrollAtTopRef, onSnapChange, children, styles }) {
@@ -440,15 +655,21 @@ function DraggableBottomSheet({ visible, onClose, contentHeight = SCREEN_H * 0.8
 export default function ClassMarkScreen() {
   const router = useRouter();
   const { colors } = useAppTheme();
+  const insets = useSafeAreaInsets();
+  const tabBarHeight = useBottomTabBarHeight();
   const styles = useMemo(() => createStyles(colors), [colors]);
   const [loading, setLoading] = useState(true);
   const [courses, setCourses] = useState([]);
   const [expanded, setExpanded] = useState({});
   const [marksMap, setMarksMap] = useState({});
   const [modeMap, setModeMap] = useState({});
+  const [submittedMap, setSubmittedMap] = useState({});
   const [studentId, setStudentId] = useState(null);
   const [studentGrade, setStudentGrade] = useState(null);
   const [studentSection, setStudentSection] = useState(null);
+  const [search, setSearch] = useState("");
+  const [markFilter, setMarkFilter] = useState("all");
+  const [isSearchFocused, setIsSearchFocused] = useState(false);
 
   const [sheetVisible, setSheetVisible] = useState(false);
   const [sheetCourseKey, setSheetCourseKey] = useState(null);
@@ -457,6 +678,7 @@ export default function ClassMarkScreen() {
   const [teacherProfile, setTeacherProfile] = useState({ name: null, profileImage: null });
 
   const innerScrollAtTopRef = useRef(true);
+  const scrollBottomPadding = Math.max(68, Math.round((tabBarHeight + insets.bottom + 20) * 0.6));
 
   // load student info; reads Students path under school bucket if schoolKey present
   const loadStudent = useCallback(async () => {
@@ -575,6 +797,7 @@ export default function ClassMarkScreen() {
         // ClassMarks: try school-scoped path then fallback to root path
         const marks = {};
         const modes = {};
+        const submitted = {};
         await Promise.all(list.map(async (c) => {
           try {
             let cm = null;
@@ -606,14 +829,16 @@ export default function ClassMarkScreen() {
             const actualMarks = cm && cm.exists() ? (cm.val() || {}) : {};
             marks[c.key] = mergeMarksWithTemplate(actualMarks, templateSubject || {});
             modes[c.key] = detectTemplateMode(templateSubject || {}) || "semester";
+            submitted[c.key] = !!(cm && cm.exists() && hasSubmittedMarksInClassNode(actualMarks));
           } catch (err) { console.warn("classmark fetch", err); marks[c.key] = null; }
         }));
         if (!mounted) return;
         setMarksMap(marks);
         setModeMap(modes);
+        setSubmittedMap(submitted);
       } catch (err) {
         console.warn(err);
-        if (mounted) { setCourses([]); setMarksMap({}); setModeMap({}); }
+        if (mounted) { setCourses([]); setMarksMap({}); setModeMap({}); setSubmittedMap({}); }
       } finally {
         if (mounted) setLoading(false);
       }
@@ -622,6 +847,71 @@ export default function ClassMarkScreen() {
   }, [loadStudent]);
 
   const toggle = (k) => { LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut); setExpanded((p) => ({ ...p, [k]: !p[k] })); };
+
+  const isSearchMode = isSearchFocused || search.trim().length > 0;
+
+  const filteredCourses = useMemo(() => {
+    const q = search.trim().toLowerCase();
+
+    if (isSearchMode) {
+      return courses.filter((c) => {
+        const name = String(c?.data?.name || "").toLowerCase();
+        const subject = String(c?.data?.subject || "").toLowerCase();
+        return !q || name.includes(q) || subject.includes(q);
+      });
+    }
+
+    if (markFilter === "analytics") return courses;
+
+    return courses.filter((c) => {
+      const name = String(c?.data?.name || "").toLowerCase();
+      const subject = String(c?.data?.subject || "").toLowerCase();
+      const matchesSearch = !q || name.includes(q) || subject.includes(q);
+      if (!matchesSearch) return false;
+
+      const isSubmitted = !!submittedMap[c.key];
+      if (markFilter === "submitted") return isSubmitted;
+      if (markFilter === "unsubmitted") return !isSubmitted;
+      return true;
+    });
+  }, [courses, search, markFilter, submittedMap, isSearchMode]);
+
+  const analyticsSummary = useMemo(() => {
+    const subjectAnalytics = courses.map((course) => {
+      const metrics = getCourseAnalytics(marksMap[course.key] || {});
+      return {
+        key: course.key,
+        subjectName: course.data?.name || course.data?.subject || course.key,
+        submitted: !!submittedMap[course.key],
+        ...metrics,
+      };
+    });
+
+    const submittedSubjects = subjectAnalytics.filter((item) => item.submitted);
+    const rankedSubjects = subjectAnalytics
+      .filter((item) => item.percent != null)
+      .sort((a, b) => Number(b.percent || 0) - Number(a.percent || 0));
+
+    const totalScore = subjectAnalytics.reduce((sum, item) => sum + Number(item.score || 0), 0);
+    const totalMax = subjectAnalytics.reduce((sum, item) => sum + Number(item.max || 0), 0);
+    const totalAssessments = subjectAnalytics.reduce((sum, item) => sum + Number(item.assessmentCount || 0), 0);
+    const completedAssessments = subjectAnalytics.reduce((sum, item) => sum + Number(item.completedCount || 0), 0);
+
+    return {
+      overallPercent: totalMax > 0 ? Math.round((totalScore / totalMax) * 100) : null,
+      totalScore,
+      totalMax,
+      subjectCount: subjectAnalytics.length,
+      submittedCount: submittedSubjects.length,
+      pendingCount: Math.max(0, subjectAnalytics.length - submittedSubjects.length),
+      totalAssessments,
+      completedAssessments,
+      completionPercent: totalAssessments > 0 ? Math.round((completedAssessments / totalAssessments) * 100) : 0,
+      bestSubject: rankedSubjects[0] || null,
+      focusSubject: rankedSubjects.length > 1 ? rankedSubjects[rankedSubjects.length - 1] : rankedSubjects[0] || null,
+      subjectAnalytics: subjectAnalytics.sort((a, b) => (a.subjectName || "").localeCompare(b.subjectName || "")),
+    };
+  }, [courses, marksMap, submittedMap]);
 
   const parseAssessments = (node) => {
     if (!node) return [];
@@ -990,13 +1280,6 @@ export default function ClassMarkScreen() {
               </View>
             </View>
 
-            <View style={[styles.cardHeaderToggle, expanded[courseKey] && styles.cardHeaderToggleActive]}>
-              <Ionicons
-                name={expanded[courseKey] ? "chevron-up" : "chevron-down"}
-                size={18}
-                color={expanded[courseKey] ? PRIMARY : MUTED}
-              />
-            </View>
           </TouchableOpacity>
 
           {expanded[courseKey] && (
@@ -1040,6 +1323,88 @@ export default function ClassMarkScreen() {
     );
   };
 
+  const AnalyticsView = () => {
+    const summary = analyticsSummary;
+    const chartData = summary.subjectAnalytics
+      .filter((item) => item.percent != null)
+      .sort((a, b) => Number(b.percent || 0) - Number(a.percent || 0))
+      .slice(0, 6)
+      .map((item) => ({
+        key: item.key,
+        label: item.subjectName,
+        value: Math.round(Number(item.percent || 0)),
+      }));
+
+    return (
+      <View style={styles.analyticsWrap}>
+        <View style={styles.analyticsHero}>
+          <View style={styles.analyticsHeroGlowPrimary} />
+          <View style={styles.analyticsHeroGlowSecondary} />
+          <Text style={styles.analyticsEyebrow}>Student Performance Analytics</Text>
+          <Text style={styles.analyticsHeroTitle}>Your marks overview</Text>
+          <View style={styles.analyticsHeroScoreRow}>
+            <View style={styles.analyticsHeroRingWrap}>
+              <CircularProgress
+                percent={summary.overallPercent ?? 0}
+                size={82}
+                strokeWidth={8}
+                textSize={14}
+                color={summary.overallPercent != null ? percentColor(summary.overallPercent) : MUTED}
+              />
+            </View>
+            <View style={styles.analyticsHeroMetaWrap}>
+              <Text style={styles.analyticsHeroScore}>{summary.overallPercent != null ? `${summary.overallPercent}%` : "-"}</Text>
+              <Text style={styles.analyticsHeroScoreLabel}>Overall performance</Text>
+              <View style={styles.analyticsHeroBadge}>
+                <Text style={styles.analyticsHeroBadgeLabel}>Submitted</Text>
+                <Text style={styles.analyticsHeroBadgeValue}>{summary.submittedCount}/{summary.subjectCount}</Text>
+              </View>
+            </View>
+          </View>
+        </View>
+
+        <View style={styles.analyticsGraphCard}>
+          <Text style={styles.analyticsGraphTitle}>Performance Graph</Text>
+          <Text style={styles.analyticsGraphSubtitle}>Top subjects by submitted average</Text>
+          <View style={styles.analyticsGraphInner}>
+            <AnalyticsBarChart data={chartData} colors={colors} />
+          </View>
+        </View>
+
+        <View style={styles.analyticsInsightRow}>
+          <View style={styles.analyticsInsightCardLarge}>
+            <Text style={styles.analyticsInsightLabel}>Assessment Completion</Text>
+            <Text style={styles.analyticsInsightTitle}>{summary.completionPercent}% complete</Text>
+            <Text style={styles.analyticsInsightMeta}>Submitted assessments.</Text>
+            <View style={{ marginTop: 8 }}>
+              <AnalyticsCompletionGraph completed={summary.completedAssessments} total={summary.totalAssessments} colors={colors} />
+            </View>
+          </View>
+        </View>
+
+        <View style={styles.analyticsPanel}>
+          <Text style={styles.analyticsPanelTitle}>Performance Insights</Text>
+          <View style={styles.analyticsInsightListRow}>
+            <View style={styles.analyticsMiniInsight}>
+              <Text style={styles.analyticsInsightLabel}>Best Subject</Text>
+              <Text style={styles.analyticsMiniInsightTitle}>{summary.bestSubject?.subjectName || "No marks yet"}</Text>
+              <Text style={styles.analyticsMiniInsightMeta}>
+                {summary.bestSubject?.percent != null ? `${Math.round(summary.bestSubject.percent)}% average` : "Waiting for submitted marks"}
+              </Text>
+            </View>
+            <View style={styles.analyticsMiniInsight}>
+              <Text style={styles.analyticsInsightLabel}>Needs Focus</Text>
+              <Text style={styles.analyticsMiniInsightTitle}>{summary.focusSubject?.subjectName || "No marks yet"}</Text>
+              <Text style={styles.analyticsMiniInsightMeta}>
+                {summary.focusSubject?.percent != null ? `${Math.round(summary.focusSubject.percent)}% average` : "Not enough data yet"}
+              </Text>
+            </View>
+          </View>
+        </View>
+      </View>
+    );
+  };
+
   if (loading) return (<View style={styles.center}><ActivityIndicator size="large" color={PRIMARY} /></View>);
 
   // Empty state when no courses found (friendly message)
@@ -1060,22 +1425,84 @@ export default function ClassMarkScreen() {
   return (
     <View style={styles.container}>
       <ScrollView
-        contentContainerStyle={{ paddingHorizontal: 12, paddingTop: 0, paddingBottom: 80 }}
+        contentContainerStyle={{ paddingHorizontal: 12, paddingTop: 0, paddingBottom: scrollBottomPadding }}
         showsVerticalScrollIndicator={false}
         showsHorizontalScrollIndicator={false}
       >
-        <Text style={styles.subtitle}>Tap a card to expand quick details. Open details for a complete breakdown.</Text>
+        <View style={styles.searchCard}>
+          <View style={styles.searchIconWrap}>
+            <Ionicons name="search-outline" size={16} color={PRIMARY} />
+          </View>
+          <TextInput
+            value={search}
+            onChangeText={setSearch}
+            onFocus={() => setIsSearchFocused(true)}
+            onBlur={() => setIsSearchFocused(false)}
+            placeholder="Search subject"
+            placeholderTextColor={MUTED}
+            style={styles.searchInput}
+          />
+          {isSearchMode ? (
+            <TouchableOpacity
+              activeOpacity={0.85}
+              onPress={() => {
+                setSearch("");
+                setIsSearchFocused(false);
+                Keyboard.dismiss();
+              }}
+            >
+              <Text style={styles.searchCancelText}>Cancel</Text>
+            </TouchableOpacity>
+          ) : null}
+        </View>
 
-        <FlatList
-          data={courses}
-          keyExtractor={(i) => i.key}
-          renderItem={CourseTile}
-          ItemSeparatorComponent={() => <View style={{ height: 12 }} />}
-          contentContainerStyle={{ paddingTop: 6 }}
-          scrollEnabled={false}
-          showsVerticalScrollIndicator={false}
-          showsHorizontalScrollIndicator={false}
-        />
+        {!isSearchMode ? (
+          <View style={styles.filterRow}>
+            {MARK_FILTER_OPTIONS.map((opt) => {
+              const active = markFilter === opt.key;
+              return (
+                <TouchableOpacity
+                  key={opt.key}
+                  activeOpacity={0.9}
+                  onPress={() => setMarkFilter(opt.key)}
+                  style={[styles.filterChip, active && styles.filterChipActive]}
+                >
+                  <Text style={[styles.filterChipText, active && styles.filterChipTextActive]}>{opt.label}</Text>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+        ) : null}
+
+        {!isSearchMode ? (
+          <Text style={styles.subtitle} numberOfLines={1} ellipsizeMode="tail">
+            {markFilter === "analytics"
+              ? "Review your marks analytics."
+              : "Tap a card to expand quick details."}
+          </Text>
+        ) : null}
+
+        {(isSearchMode || markFilter !== "analytics") && filteredCourses.length === 0 ? (
+          <View style={styles.searchEmptyWrap}>
+            <Text style={styles.searchEmptyTitle}>No subject found</Text>
+            <Text style={styles.searchEmptyText}>Try another subject name or change the filter.</Text>
+          </View>
+        ) : null}
+
+        {!isSearchMode && markFilter === "analytics" ? (
+          <AnalyticsView />
+        ) : (
+          <FlatList
+            data={filteredCourses}
+            keyExtractor={(i) => i.key}
+            renderItem={CourseTile}
+            ItemSeparatorComponent={() => <View style={{ height: 12 }} />}
+            contentContainerStyle={{ paddingTop: 6 }}
+            scrollEnabled={false}
+            showsVerticalScrollIndicator={false}
+            showsHorizontalScrollIndicator={false}
+          />
+        )}
       </ScrollView>
 
       <DraggableBottomSheet visible={sheetVisible} onClose={() => setSheetVisible(false)} contentHeight={SCREEN_H * 0.94} innerScrollAtTopRef={innerScrollAtTopRef} styles={styles}>
@@ -1289,9 +1716,385 @@ function CourseSheetInner({ courseKey, courseName, marks = {}, mode = "semester"
 function createStyles(colors) {
   return StyleSheet.create({
   container: { flex: 1, backgroundColor: colors.background },
-  subtitle: { color: MUTED, paddingHorizontal: 12 },
+  subtitle: { color: MUTED, paddingHorizontal: 12, marginTop: 8 },
   center: { flex: 1, alignItems: "center", justifyContent: "center" },
   emptyTitle: { fontWeight: "700", fontSize: 18, color: colors.text, textAlign: "center" },
+
+  searchCard: {
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 16,
+    backgroundColor: colors.card,
+    paddingHorizontal: 10,
+    flexDirection: "row",
+    alignItems: "center",
+    height: 42,
+    marginHorizontal: 12,
+    marginTop: 8,
+    shadowColor: "#2563EB",
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.025,
+    shadowRadius: 8,
+    elevation: 1,
+  },
+  searchIconWrap: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    backgroundColor: colors.soft,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  searchInput: {
+    flex: 1,
+    color: colors.text,
+    marginLeft: 10,
+    fontSize: 14,
+    fontWeight: "500",
+  },
+  searchCancelText: {
+    color: PRIMARY,
+    fontSize: 13,
+    fontWeight: "700",
+    paddingHorizontal: 4,
+  },
+  filterRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginTop: 10,
+    marginHorizontal: 12,
+    gap: 8,
+  },
+  filterChip: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.card,
+  },
+  filterChipActive: {
+    borderColor: colors.primary,
+    backgroundColor: colors.soft,
+  },
+  filterChipText: {
+    color: MUTED,
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  filterChipTextActive: {
+    color: colors.primary,
+  },
+  searchEmptyWrap: {
+    marginTop: 16,
+    marginBottom: 6,
+    marginHorizontal: 12,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 14,
+    backgroundColor: colors.card,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+  },
+  searchEmptyTitle: {
+    fontWeight: "700",
+    color: colors.text,
+  },
+  searchEmptyText: {
+    color: MUTED,
+    marginTop: 4,
+  },
+
+  analyticsWrap: {
+    marginTop: 14,
+    marginHorizontal: 14,
+    gap: 10,
+  },
+  analyticsHero: {
+    borderRadius: 24,
+    overflow: "hidden",
+    paddingHorizontal: 12,
+    paddingTop: 12,
+    paddingBottom: 12,
+    backgroundColor: colors.card,
+    borderWidth: 1,
+    borderColor: colors.border,
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 12 },
+    shadowOpacity: 0.08,
+    shadowRadius: 22,
+    elevation: 6,
+  },
+  analyticsHeroGlowPrimary: {
+    position: "absolute",
+    top: -54,
+    right: -46,
+    width: 170,
+    height: 170,
+    borderRadius: 85,
+    backgroundColor: "rgba(0,122,251,0.12)",
+  },
+  analyticsHeroGlowSecondary: {
+    position: "absolute",
+    bottom: -54,
+    left: -46,
+    width: 150,
+    height: 150,
+    borderRadius: 75,
+    backgroundColor: "rgba(39,174,96,0.10)",
+  },
+  analyticsEyebrow: {
+    color: colors.primary,
+    fontSize: 10,
+    fontWeight: "800",
+    textTransform: "uppercase",
+    letterSpacing: 0.6,
+  },
+  analyticsHeroTitle: {
+    marginTop: 4,
+    color: colors.text,
+    fontSize: 18,
+    fontWeight: "900",
+  },
+  analyticsHeroText: {
+    marginTop: 8,
+    color: colors.muted,
+    fontSize: 13,
+    lineHeight: 20,
+    maxWidth: "92%",
+  },
+  analyticsHeroScoreRow: {
+    marginTop: 8,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+  },
+  analyticsHeroRingWrap: {
+    marginRight: 4,
+  },
+  analyticsHeroMetaWrap: {
+    flex: 1,
+  },
+  analyticsHeroScore: {
+    color: colors.text,
+    fontSize: 28,
+    fontWeight: "900",
+    lineHeight: 32,
+  },
+  analyticsHeroScoreLabel: {
+    marginTop: 2,
+    color: colors.muted,
+    fontSize: 10,
+    fontWeight: "700",
+  },
+  analyticsHeroBadge: {
+    minWidth: 74,
+    marginTop: 4,
+    paddingHorizontal: 9,
+    paddingVertical: 6,
+    borderRadius: 12,
+    backgroundColor: colors.soft,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  analyticsHeroBadgeLabel: {
+    color: colors.muted,
+    fontSize: 9,
+    fontWeight: "700",
+  },
+  analyticsHeroBadgeValue: {
+    marginTop: 2,
+    color: colors.primary,
+    fontSize: 13,
+    fontWeight: "900",
+  },
+  analyticsGraphCard: {
+    backgroundColor: colors.card,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 20,
+    paddingHorizontal: 11,
+    paddingTop: 10,
+    paddingBottom: 8,
+  },
+  analyticsGraphTitle: {
+    color: colors.text,
+    fontSize: 13,
+    fontWeight: "900",
+  },
+  analyticsGraphSubtitle: {
+    marginTop: 2,
+    color: colors.muted,
+    fontSize: 10,
+  },
+  analyticsGraphInner: {
+    marginTop: 8,
+  },
+  analyticsGrid: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    justifyContent: "space-between",
+    rowGap: 10,
+  },
+  analyticsStatCard: {
+    width: "48.5%",
+    backgroundColor: colors.card,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 18,
+    paddingHorizontal: 14,
+    paddingVertical: 14,
+  },
+  analyticsStatLabel: {
+    color: colors.muted,
+    fontSize: 11,
+    fontWeight: "700",
+    textTransform: "uppercase",
+  },
+  analyticsStatValue: {
+    marginTop: 10,
+    color: colors.text,
+    fontSize: 26,
+    fontWeight: "900",
+  },
+  analyticsInsightRow: {
+    flexDirection: "row",
+  },
+  analyticsInsightCard: {
+    flex: 1,
+    backgroundColor: colors.card,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 18,
+    paddingHorizontal: 14,
+    paddingVertical: 14,
+  },
+  analyticsInsightCardLarge: {
+    flex: 1,
+    backgroundColor: colors.card,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 18,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  analyticsInsightLabel: {
+    color: colors.muted,
+    fontSize: 10,
+    fontWeight: "700",
+    textTransform: "uppercase",
+  },
+  analyticsInsightTitle: {
+    marginTop: 6,
+    color: colors.text,
+    fontSize: 14,
+    fontWeight: "900",
+  },
+  analyticsInsightMeta: {
+    marginTop: 4,
+    color: colors.muted,
+    fontSize: 11,
+    lineHeight: 16,
+  },
+  analyticsPanel: {
+    backgroundColor: colors.card,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 20,
+    paddingHorizontal: 14,
+    paddingVertical: 14,
+    marginBottom: 10,
+  },
+  analyticsPanelTitle: {
+    color: colors.text,
+    fontSize: 16,
+    fontWeight: "900",
+    marginBottom: 12,
+  },
+  analyticsInsightListRow: {
+    flexDirection: "row",
+    gap: 10,
+  },
+  analyticsMiniInsight: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 16,
+    backgroundColor: colors.inputBackground,
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+  },
+  analyticsMiniInsightTitle: {
+    marginTop: 8,
+    color: colors.text,
+    fontSize: 15,
+    fontWeight: "900",
+  },
+  analyticsMiniInsightMeta: {
+    marginTop: 6,
+    color: colors.muted,
+    fontSize: 12,
+    lineHeight: 18,
+  },
+  analyticsSubjectRow: {
+    paddingVertical: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.border,
+  },
+  analyticsSubjectTopRow: {
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  analyticsSubjectName: {
+    color: colors.text,
+    fontSize: 15,
+    fontWeight: "800",
+  },
+  analyticsSubjectMeta: {
+    marginTop: 4,
+    color: colors.muted,
+    fontSize: 12,
+  },
+  analyticsStatusPill: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+    borderWidth: 1,
+  },
+  analyticsStatusPillOn: {
+    backgroundColor: "#ECFDF3",
+    borderColor: "#BBF7D0",
+  },
+  analyticsStatusPillOff: {
+    backgroundColor: "#FFF7ED",
+    borderColor: "#FED7AA",
+  },
+  analyticsStatusText: {
+    fontSize: 11,
+    fontWeight: "800",
+  },
+  analyticsStatusTextOn: {
+    color: SUCCESS,
+  },
+  analyticsStatusTextOff: {
+    color: "#C2410C",
+  },
+  analyticsSubjectScoreRow: {
+    marginTop: 10,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  analyticsSubjectScore: {
+    color: colors.text,
+    fontSize: 13,
+    fontWeight: "700",
+  },
+  analyticsSubjectPercent: {
+    color: colors.primary,
+    fontSize: 13,
+    fontWeight: "900",
+  },
 
   cardWrapper: { marginBottom: 12 },
   cardView: {
