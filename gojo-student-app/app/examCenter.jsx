@@ -20,6 +20,7 @@ import { useRouter, useLocalSearchParams } from "expo-router";
 import { ref, get } from "firebase/database";
 import { database } from "../constants/firebaseConfig";
 import { Ionicons } from "@expo/vector-icons";
+import { useAppTheme } from "../hooks/use-app-theme";
 import { getValue, pushAndSet, runTransactionSafe, safeUpdate } from "./lib/dbHelpers";
 
 const C = {
@@ -132,6 +133,9 @@ function computeRefillState({ currentLives, maxLives, lastConsumedAt, refillMs, 
 export default function ExamCenter() {
   const router = useRouter();
   const params = useLocalSearchParams();
+  const { colors, statusBarStyle } = useAppTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
+  const modalStyles = useMemo(() => createModalStyles(colors), [colors]);
 
   const roundId = params.roundId;
   const examId = params.examId;
@@ -899,7 +903,7 @@ useEffect(() => {
   if (loading) {
     return (
       <SafeAreaView style={[styles.loadingWrap, { paddingTop: safeAreaPaddingTop }]}>
-        <StatusBar barStyle="dark-content" backgroundColor={C.bg} />
+        <StatusBar barStyle={statusBarStyle} backgroundColor={colors.background} />
         <ActivityIndicator size="large" color={C.primary} />
       </SafeAreaView>
     );
@@ -907,7 +911,7 @@ useEffect(() => {
 
   return (
     <SafeAreaView style={[styles.safeRoot, { paddingTop: safeAreaPaddingTop }]}>
-      <StatusBar barStyle="dark-content" backgroundColor={C.bg} />
+      <StatusBar barStyle={statusBarStyle} backgroundColor={colors.background} />
 
       <Modal visible={outOfLivesModalVisible} transparent animationType="none" onRequestClose={() => {}}>
         <View style={modalStyles.overlay}>
@@ -941,7 +945,7 @@ useEffect(() => {
         {stage === "rules" && (
           <View style={styles.panel}>
             <View style={styles.headerBar}>
-              <TouchableOpacity onPress={handleBackNavigation} style={styles.backBtn}><Ionicons name="chevron-back" size={22} color={C.text} /></TouchableOpacity>
+              <TouchableOpacity onPress={handleBackNavigation} style={styles.backBtn}><Ionicons name="chevron-back" size={22} color={colors.text} /></TouchableOpacity>
               <View style={{ flex: 1 }}>
                 <Text style={styles.title}>{examMeta?.name || "Practice Test"}</Text>
                 <Text style={styles.subtitle}>{roundMeta?.name || ""}</Text>
@@ -1345,12 +1349,13 @@ useEffect(() => {
   );
 }
 
-const styles = StyleSheet.create({
-  safeRoot: { flex: 1, backgroundColor: C.bg },
-  loadingWrap: { flex: 1, backgroundColor: C.bg, justifyContent: "center", alignItems: "center" },
+function createStyles(colors) {
+  return StyleSheet.create({
+  safeRoot: { flex: 1, backgroundColor: colors.background },
+  loadingWrap: { flex: 1, backgroundColor: colors.background, justifyContent: "center", alignItems: "center" },
 
-  root: { flex: 1, backgroundColor: C.bg },
-  panel: { flex: 1, backgroundColor: C.bg },
+  root: { flex: 1, backgroundColor: colors.background },
+  panel: { flex: 1, backgroundColor: colors.background },
 
   headerBar: {
     minHeight: 62,
@@ -1359,35 +1364,35 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    backgroundColor: C.bg,
+    backgroundColor: colors.background,
   },
-  backBtn: { width: 40, height: 40, borderRadius: 10, alignItems: "center", justifyContent: "center", backgroundColor: "#F7F9FF" },
-  title: { fontSize: 18, fontWeight: "900", color: C.text },
-  subtitle: { marginTop: 2, color: C.muted, fontSize: 12 },
+  backBtn: { width: 40, height: 40, borderRadius: 10, alignItems: "center", justifyContent: "center", backgroundColor: colors.inputBackground },
+  title: { fontSize: 18, fontWeight: "900", color: colors.text },
+  subtitle: { marginTop: 2, color: colors.muted, fontSize: 12 },
 
   body: { paddingHorizontal: 16, paddingBottom: 24 },
-  mainTitle: { fontSize: 24, fontWeight: "900", color: C.text, marginTop: 8, marginBottom: 10 },
+  mainTitle: { fontSize: 24, fontWeight: "900", color: colors.text, marginTop: 8, marginBottom: 10 },
 
   rulesInfoColumn: { width: "100%", marginBottom: 12 },
   rulesRow: { flexDirection: "row", alignItems: "center", paddingVertical: 8, borderRadius: 10 },
   rulesIconWrap: {
-    width: 48, height: 48, borderRadius: 10, borderWidth: 1, borderColor: "#EAF0FF",
-    alignItems: "center", justifyContent: "center", marginRight: 12, backgroundColor: "#fff",
+    width: 48, height: 48, borderRadius: 10, borderWidth: 1, borderColor: colors.border,
+    alignItems: "center", justifyContent: "center", marginRight: 12, backgroundColor: colors.card,
   },
   rulesTextWrap: { flex: 1 },
-  rulesNumber: { fontWeight: "900", color: C.text, fontSize: 16 },
-  rulesLabel: { color: C.muted, marginTop: 2 },
+  rulesNumber: { fontWeight: "900", color: colors.text, fontSize: 16 },
+  rulesLabel: { color: colors.muted, marginTop: 2 },
 
   infoCard: {
     marginTop: 8,
     borderWidth: 1,
-    borderColor: "#EAF0FF",
-    backgroundColor: "#F8FAFF",
+    borderColor: colors.border,
+    backgroundColor: colors.panel,
     borderRadius: 12,
     padding: 12,
   },
-  infoTitle: { fontWeight: "900", color: C.text, marginBottom: 6 },
-  infoText: { color: C.muted, lineHeight: 20 },
+  infoTitle: { fontWeight: "900", color: colors.text, marginBottom: 6 },
+  infoText: { color: colors.muted, lineHeight: 20 },
 
   noAttemptsCard: {
     marginTop: 12,
@@ -1409,7 +1414,7 @@ const styles = StyleSheet.create({
   primaryBtnText: { color: "#fff", fontWeight: "900" },
 
   examBody: { flexGrow: 1, paddingHorizontal: 16, paddingBottom: 12 },
-  timerPill: { flexDirection: "row", alignItems: "center", backgroundColor: "#EEF4FF", borderRadius: 12, paddingHorizontal: 10, paddingVertical: 6 },
+  timerPill: { flexDirection: "row", alignItems: "center", backgroundColor: colors.soft, borderRadius: 12, paddingHorizontal: 10, paddingVertical: 6 },
   timer: { marginLeft: 6, color: C.primary, fontWeight: "800" },
 
   progressTrack: {
@@ -1417,7 +1422,7 @@ const styles = StyleSheet.create({
     marginTop: 8,
     height: 8,
     borderRadius: 999,
-    backgroundColor: "#EAF0FF",
+    backgroundColor: colors.border,
     overflow: "hidden",
   },
   progressFill: {
@@ -1425,53 +1430,53 @@ const styles = StyleSheet.create({
     backgroundColor: C.primary,
   },
 
-  qCard: { marginTop: 12, backgroundColor: "#fff", borderRadius: 14, borderWidth: 1, borderColor: C.border, padding: 12 },
-  qText: { fontSize: 18, fontWeight: "900", color: C.text },
+  qCard: { marginTop: 12, backgroundColor: colors.card, borderRadius: 14, borderWidth: 1, borderColor: colors.border, padding: 12 },
+  qText: { fontSize: 18, fontWeight: "900", color: colors.text },
 
   option: { marginTop: 10, borderRadius: 12, padding: 12, flexDirection: "row", alignItems: "center" },
-  optionDefault: { backgroundColor: "#FAFBFF", borderWidth: 1, borderColor: "#EAF0FF" },
+  optionDefault: { backgroundColor: colors.inputBackground, borderWidth: 1, borderColor: colors.border },
   optionSelected: { backgroundColor: C.primary },
   correctFlash: { backgroundColor: "#ECFDF3", borderColor: "#ABEFC6" },
   wrongFlash: { backgroundColor: "#FEF3F2", borderColor: "#FECACA" },
 
   optBadge: { width: 34, height: 34, borderRadius: 17, marginRight: 10, alignItems: "center", justifyContent: "center" },
   optBadgeDef: { borderWidth: 1, borderColor: C.muted },
-  optBadgeSel: { backgroundColor: "#fff" },
+  optBadgeSel: { backgroundColor: colors.card },
   optLetter: { color: C.muted, fontWeight: "800" },
 
-  optText: { flex: 1, color: "#111827", fontSize: 14 },
+  optText: { flex: 1, color: colors.text, fontSize: 14 },
   optTextSel: { color: "#fff", fontWeight: "800" },
 
   explanationCard: {
     marginTop: 12,
     borderWidth: 1,
-    borderColor: "#EAF0FF",
-    backgroundColor: "#F8FAFF",
+    borderColor: colors.border,
+    backgroundColor: colors.panel,
     borderRadius: 12,
     padding: 12,
   },
   explanationTitle: {
     fontWeight: "900",
-    color: C.text,
+    color: colors.text,
     marginBottom: 6,
   },
   explanationText: {
-    color: C.muted,
+    color: colors.muted,
     lineHeight: 20,
   },
 
   footer: { marginTop: 8, marginHorizontal: 16, marginBottom: 12, flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
-  ghostBtn: { borderWidth: 1, borderColor: "#EAF0FF", borderRadius: 10, paddingVertical: 12, paddingHorizontal: 18 },
-  ghostTxt: { color: C.muted, fontWeight: "800" },
+  ghostBtn: { borderWidth: 1, borderColor: colors.border, borderRadius: 10, paddingVertical: 12, paddingHorizontal: 18 },
+  ghostTxt: { color: colors.muted, fontWeight: "800" },
 
-   resultScreen: { flex: 1, backgroundColor: C.bg },
+  resultScreen: { flex: 1, backgroundColor: colors.background },
   resultCenter: { flex: 1, alignItems: "center", justifyContent: "center", paddingHorizontal: 16 },
   resultCard: {
     width: "100%",
-    backgroundColor: "#fff",
+    backgroundColor: colors.card,
     borderRadius: 16,
     borderWidth: 1,
-    borderColor: C.border,
+    borderColor: colors.border,
     alignItems: "center",
     padding: 24,
     shadowColor: "#000",
@@ -1480,7 +1485,7 @@ const styles = StyleSheet.create({
     elevation: 3,
   },
   resultPct: { fontSize: 56, color: C.primary, fontWeight: "900", marginTop: 4 },
-  resultSub: { marginTop: 8, color: C.muted, textAlign: "center", fontWeight: "700" },
+  resultSub: { marginTop: 8, color: colors.muted, textAlign: "center", fontWeight: "700" },
 
   resultBgOrnament: {
     position: "absolute",
@@ -1503,7 +1508,7 @@ const styles = StyleSheet.create({
     marginTop: 12,
     fontSize: 22,
     fontWeight: "900",
-    color: C.text,
+    color: colors.text,
   },
   resultStatsRow: {
     marginTop: 14,
@@ -1514,14 +1519,14 @@ const styles = StyleSheet.create({
   resultStatBox: {
     flex: 1,
     borderWidth: 1,
-    borderColor: "#EAF0FF",
-    backgroundColor: "#F8FAFF",
+    borderColor: colors.border,
+    backgroundColor: colors.panel,
     borderRadius: 10,
     paddingVertical: 10,
     alignItems: "center",
   },
   resultStatLabel: {
-    color: C.muted,
+    color: colors.muted,
     fontSize: 11,
     fontWeight: "700",
   },
@@ -1534,7 +1539,7 @@ const styles = StyleSheet.create({
     marginTop: 12,
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "#EEF4FF",
+    backgroundColor: colors.soft,
     borderRadius: 999,
     paddingHorizontal: 10,
     paddingVertical: 6,
@@ -1546,28 +1551,31 @@ const styles = StyleSheet.create({
     fontSize: 12,
   },
 
-  toggleBtn: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 10, marginRight: 8, borderWidth: 1, borderColor: "#EAF0FF" },
+  toggleBtn: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 10, marginRight: 8, borderWidth: 1, borderColor: colors.border },
   toggleOn: { backgroundColor: C.primary, borderColor: C.primary },
-  toggleOff: { backgroundColor: "#fff", borderColor: "#EAF0FF" },
+  toggleOff: { backgroundColor: colors.card, borderColor: colors.border },
   toggleTextOn: { color: "#fff", fontWeight: "800" },
-  toggleTextOff: { color: C.text, fontWeight: "800" },
+  toggleTextOff: { color: colors.text, fontWeight: "800" },
 });
+}
 
 
-const modalStyles = StyleSheet.create({
+function createModalStyles(colors) {
+  return StyleSheet.create({
   overlay: {
-    flex: 1, backgroundColor: "rgba(0,0,0,0.45)", justifyContent: "center", alignItems: "center", padding: 20,
+    flex: 1, backgroundColor: colors.overlay, justifyContent: "center", alignItems: "center", padding: 20,
   },
   card: {
-    width: "100%", maxWidth: 420, backgroundColor: "#fff", borderRadius: 14, padding: 18, alignItems: "center",
+    width: "100%", maxWidth: 420, backgroundColor: colors.card, borderRadius: 14, padding: 18, alignItems: "center",
   },
-  title: { fontSize: 20, fontWeight: "900", marginBottom: 8, color: C.text },
-  text: { color: C.muted, textAlign: "center" },
+  title: { fontSize: 20, fontWeight: "900", marginBottom: 8, color: colors.text },
+  text: { color: colors.muted, textAlign: "center" },
   countdown: { marginTop: 6, fontWeight: "900", color: C.primary },
-  closeBtn: { marginTop: 18, backgroundColor: "#E5E7EB", paddingVertical: 10, borderRadius: 10, alignItems: "center", width: "100%" },
-  closeBtnText: { color: "#6B7280", fontWeight: "800" },
-  modeTitle: { marginTop: 10, fontWeight: "800", color: C.text },
-  modeText: { marginTop: 6, color: C.muted, lineHeight: 20 },
+  closeBtn: { marginTop: 18, backgroundColor: colors.inputBackground, paddingVertical: 10, borderRadius: 10, alignItems: "center", width: "100%" },
+  closeBtnText: { color: colors.muted, fontWeight: "800" },
+  modeTitle: { marginTop: 10, fontWeight: "800", color: colors.text },
+  modeText: { marginTop: 6, color: colors.muted, lineHeight: 20 },
   closeBtnPrimary: { marginTop: 18, backgroundColor: C.primary, paddingVertical: 10, borderRadius: 10, alignItems: "center", width: "100%" },
   closeBtnTextPrimary: { color: "#fff", fontWeight: "900" },
 });
+}

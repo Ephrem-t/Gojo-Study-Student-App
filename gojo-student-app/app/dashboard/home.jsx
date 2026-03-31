@@ -33,6 +33,8 @@ import {
 } from "firebase/database";
 import { database } from "../../constants/firebaseConfig";
 import { queryUserByUsernameInSchool, queryUserByChildInSchool } from "../lib/userHelpers";
+import { useAppTheme } from "../../hooks/use-app-theme";
+import { extractProfileImage, normalizeProfileImageUri } from "../lib/profileImage";
 
 /**
  * Home feed with pagination ("load more") for older posts.
@@ -91,11 +93,36 @@ function formatTargetRoleLabel(data) {
   const raw = data?.targetRole ?? data?.target ?? "all";
   const normalized = String(raw).trim().toLowerCase();
 
-  if (!normalized || normalized === "all") return "All";
-  return normalized.charAt(0).toUpperCase() + normalized.slice(1);
+  if (!normalized || normalized === "all") return "Visible to everyone";
+  if (normalized === "student") return "Visible to student";
+  return `Visible to ${normalized}`;
+}
+
+function getPosterName(admin, postData) {
+  const fullFromAdmin = [admin?.personal?.firstName, admin?.personal?.middleName, admin?.personal?.lastName]
+    .filter(Boolean)
+    .join(" ")
+    .trim();
+
+  return admin?.name || admin?.username || fullFromAdmin || postData?.adminName || "School Admin";
+}
+
+function getPosterImage(admin, postData) {
+  const candidates = [
+    extractProfileImage(admin),
+    postData?.adminProfile,
+  ];
+
+  for (const candidate of candidates) {
+    const normalized = normalizeProfileImageUri(candidate);
+    if (normalized) return normalized;
+  }
+  return null;
 }
 
 export default function HomeScreen() {
+  const { colors } = useAppTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
   const [postsLatest, setPostsLatest] = useState([]);
   const [postsOlder, setPostsOlder] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -129,9 +156,12 @@ export default function HomeScreen() {
       }
       if (userSnap && userSnap.exists()) {
         const u = userSnap.val();
-        if (u.profileImage) {
-          await AsyncStorage.setItem("profileImage", u.profileImage);
-          Image.prefetch(u.profileImage).catch(() => {});
+        const safeProfileImage = normalizeProfileImageUri(extractProfileImage(u));
+        if (safeProfileImage) {
+          await AsyncStorage.setItem("profileImage", safeProfileImage);
+          Image.prefetch(safeProfileImage).catch(() => {});
+        } else {
+          await AsyncStorage.removeItem("profileImage").catch(() => {});
         }
       }
     } catch {}
@@ -146,6 +176,76 @@ export default function HomeScreen() {
     if (sk) return ref(database, `Platform1/Schools/${sk}/Posts`);
     return ref(database, "Posts");
   };
+
+  const cacheResolvedPoster = useCallback((keys, userVal, nodeKey, schoolKey) => {
+    if (!userVal) return;
+    const payload = { ...userVal, _nodeKey: nodeKey || null, _schoolKey: schoolKey || null };
+    const allKeys = Array.from(
+      new Set([
+        ...(Array.isArray(keys) ? keys : []),
+        nodeKey,
+        userVal.userId,
+        userVal.username,
+      ].filter(Boolean))
+    );
+    allKeys.forEach((k) => {
+      adminCacheRef.current[k] = payload;
+    });
+  }, []);
+
+  const resolvePosterForPost = useCallback(async (postData, schoolKey) => {
+    const keys = [postData?.adminId, postData?.userId, postData?.createdBy].filter(Boolean);
+    if (!keys.length) return;
+
+    const cached = keys.find((k) => adminCacheRef.current[k]);
+    if (cached) return;
+
+    for (const key of keys) {
+      try {
+        const byUserId = await queryUserByChildInSchool("userId", key, schoolKey);
+        if (byUserId && byUserId.exists()) {
+          let found = false;
+          byUserId.forEach((c) => {
+            cacheResolvedPoster(keys, c.val(), c.key, schoolKey);
+            found = true;
+            return true;
+          });
+          if (found) return;
+        }
+      } catch {}
+
+      try {
+        const byUsername = await queryUserByUsernameInSchool(key, schoolKey);
+        if (byUsername && byUsername.exists()) {
+          let found = false;
+          byUsername.forEach((c) => {
+            cacheResolvedPoster(keys, c.val(), c.key, schoolKey);
+            found = true;
+            return true;
+          });
+          if (found) return;
+        }
+      } catch {}
+
+      try {
+        const directSchoolSnap = schoolKey
+          ? await get(ref(database, `Platform1/Schools/${schoolKey}/Users/${key}`))
+          : null;
+        if (directSchoolSnap && directSchoolSnap.exists()) {
+          cacheResolvedPoster(keys, directSchoolSnap.val(), key, schoolKey);
+          return;
+        }
+      } catch {}
+
+      try {
+        const directGlobalSnap = await get(ref(database, `Users/${key}`));
+        if (directGlobalSnap && directGlobalSnap.exists()) {
+          cacheResolvedPoster(keys, directGlobalSnap.val(), key, null);
+          return;
+        }
+      } catch {}
+    }
+  }, [cacheResolvedPoster]);
 
   // helper: targetRole filtering
   const isStudentVisiblePost = (data) => {
@@ -194,62 +294,9 @@ export default function HomeScreen() {
           // FEATURE #1: targetRole filter for student
           const filteredTmp = tmp.filter((p) => isStudentVisiblePost(p.data));
 
-          const adminIds = Array.from(new Set(filteredTmp.map((p) => p.data.adminId).filter(Boolean)));
           const schoolKey = await AsyncStorage.getItem("schoolKey");
 
-          await Promise.all(
-            adminIds.map(async (aid) => {
-              if (adminCacheRef.current[aid]) return;
-              try {
-                let snapUser = null;
-                try {
-                  snapUser = await queryUserByUsernameInSchool(aid, schoolKey);
-                } catch {
-                  snapUser = null;
-                }
-
-                if (snapUser && snapUser.exists()) {
-                  snapUser.forEach((c) => {
-                    adminCacheRef.current[aid] = { ...c.val(), _nodeKey: c.key, _schoolKey: schoolKey || null };
-                    return true;
-                  });
-                  return;
-                }
-
-                try {
-                  const snapByUserId = await queryUserByChildInSchool("userId", aid, schoolKey);
-                  if (snapByUserId && snapByUserId.exists()) {
-                    snapByUserId.forEach((c) => {
-                      adminCacheRef.current[aid] = { ...c.val(), _nodeKey: c.key, _schoolKey: schoolKey || null };
-                      return true;
-                    });
-                    return;
-                  }
-                } catch {}
-
-                try {
-                  const qGlobal = query(ref(database, "Users"), orderByChild("username"), equalTo(aid));
-                  const sGlobal = await get(qGlobal);
-                  if (sGlobal.exists()) {
-                    sGlobal.forEach((c) => {
-                      adminCacheRef.current[aid] = { ...c.val(), _nodeKey: c.key, _schoolKey: null };
-                      return true;
-                    });
-                    return;
-                  }
-                  const qGlobal2 = query(ref(database, "Users"), orderByChild("userId"), equalTo(aid));
-                  const sGlobal2 = await get(qGlobal2);
-                  if (sGlobal2.exists()) {
-                    sGlobal2.forEach((c) => {
-                      adminCacheRef.current[aid] = { ...c.val(), _nodeKey: c.key, _schoolKey: null };
-                      return true;
-                    });
-                    return;
-                  }
-                } catch {}
-              } catch {}
-            })
-          );
+          await Promise.all(filteredTmp.map((p) => resolvePosterForPost(p.data, schoolKey)));
 
           const enriched = filteredTmp.map((p) => {
             const likesNode = p.data.likes || {};
@@ -268,13 +315,18 @@ export default function HomeScreen() {
               seenNode[currentUserId] = true;
             }
 
-            const admin = adminCacheRef.current[p.data.adminId] || null;
+            const admin =
+              adminCacheRef.current[p.data.adminId] ||
+              adminCacheRef.current[p.data.userId] ||
+              null;
             return { postId: p.postId, data: p.data, admin, likesMap: likesNode, seenMap: seenNode };
           });
 
           enriched.forEach((e) => {
-            if (e.data.postUrl) Image.prefetch(e.data.postUrl).catch(() => {});
-            if (e.admin && e.admin.profileImage) Image.prefetch(e.admin.profileImage).catch(() => {});
+            const safePostImage = normalizeProfileImageUri(e.data.postUrl);
+            const safeAdminImage = normalizeProfileImageUri(extractProfileImage(e.admin));
+            if (safePostImage) Image.prefetch(safePostImage).catch(() => {});
+            if (safeAdminImage) Image.prefetch(safeAdminImage).catch(() => {});
           });
 
           if (mounted) {
@@ -300,7 +352,7 @@ export default function HomeScreen() {
       if (unsubscribe) unsubscribe();
       if (postsQueryRef.current) off(postsQueryRef.current);
     };
-  }, [loadUserContext]);
+  }, [loadUserContext, resolvePosterForPost]);
 
   const onRefresh = async () => {
     setRefreshing(true);
@@ -357,72 +409,25 @@ export default function HomeScreen() {
         return;
       }
 
-      const adminIds = Array.from(new Set(filteredByTarget.map((p) => p.data.adminId).filter(Boolean)));
       const schoolKey = await AsyncStorage.getItem("schoolKey");
 
-      await Promise.all(
-        adminIds.map(async (aid) => {
-          if (adminCacheRef.current[aid]) return;
-          try {
-            let snapUser = null;
-            try {
-              snapUser = await queryUserByUsernameInSchool(aid, schoolKey);
-            } catch {
-              snapUser = null;
-            }
-            if (snapUser && snapUser.exists()) {
-              snapUser.forEach((c) => {
-                adminCacheRef.current[aid] = { ...c.val(), _nodeKey: c.key, _schoolKey: schoolKey || null };
-                return true;
-              });
-              return;
-            }
-
-            try {
-              const snapByUserId = await queryUserByChildInSchool("userId", aid, schoolKey);
-              if (snapByUserId && snapByUserId.exists()) {
-                snapByUserId.forEach((c) => {
-                  adminCacheRef.current[aid] = { ...c.val(), _nodeKey: c.key, _schoolKey: schoolKey || null };
-                  return true;
-                });
-                return;
-              }
-            } catch {}
-
-            try {
-              const qGlobal = query(ref(database, "Users"), orderByChild("username"), equalTo(aid));
-              const sGlobal = await get(qGlobal);
-              if (sGlobal.exists()) {
-                sGlobal.forEach((c) => {
-                  adminCacheRef.current[aid] = { ...c.val(), _nodeKey: c.key, _schoolKey: null };
-                  return true;
-                });
-                return;
-              }
-              const qGlobal2 = query(ref(database, "Users"), orderByChild("userId"), equalTo(aid));
-              const sGlobal2 = await get(qGlobal2);
-              if (sGlobal2.exists()) {
-                sGlobal2.forEach((c) => {
-                  adminCacheRef.current[aid] = { ...c.val(), _nodeKey: c.key, _schoolKey: null };
-                  return true;
-                });
-                return;
-              }
-            } catch {}
-          } catch {}
-        })
-      );
+      await Promise.all(filteredByTarget.map((p) => resolvePosterForPost(p.data, schoolKey)));
 
       const enrichedOlder = filteredByTarget.map((p) => {
         const likesNode = p.data.likes || {};
         const seenNode = p.data.seenBy || {};
-        const admin = adminCacheRef.current[p.data.adminId] || null;
+        const admin =
+          adminCacheRef.current[p.data.adminId] ||
+          adminCacheRef.current[p.data.userId] ||
+          null;
         return { postId: p.postId, data: p.data, admin, likesMap: likesNode, seenMap: seenNode };
       });
 
       enrichedOlder.forEach((e) => {
-        if (e.data.postUrl) Image.prefetch(e.data.postUrl).catch(() => {});
-        if (e.admin && e.admin.profileImage) Image.prefetch(e.admin.profileImage).catch(() => {});
+        const safePostImage = normalizeProfileImageUri(e.data.postUrl);
+        const safeAdminImage = normalizeProfileImageUri(extractProfileImage(e.admin));
+        if (safePostImage) Image.prefetch(safePostImage).catch(() => {});
+        if (safeAdminImage) Image.prefetch(safeAdminImage).catch(() => {});
       });
 
       setPostsOlder((prev) => {
@@ -555,7 +560,7 @@ export default function HomeScreen() {
 
     if (!selectedPost) return;
 
-    const accountName = selectedPost.admin?.name || selectedPost.admin?.username || "School Admin";
+    const accountName = getPosterName(selectedPost.admin, selectedPost.data);
     const targetRole = formatTargetRoleLabel(selectedPost.data);
 
     Alert.alert("About this account", `Posted by ${accountName}\nAudience: ${targetRole}`);
@@ -565,7 +570,8 @@ export default function HomeScreen() {
     const selectedPost = combinedPosts.find((post) => post.postId === postMenuPostId);
     closePostMenu();
 
-    if (!selectedPost?.data?.postUrl) {
+    const downloadableUrl = normalizeProfileImageUri(selectedPost?.data?.postUrl);
+    if (!downloadableUrl) {
       Alert.alert("Download", "This post does not have an image to download.");
       return;
     }
@@ -577,11 +583,11 @@ export default function HomeScreen() {
         return;
       }
 
-      const ext = getFileExtensionFromUrl(selectedPost.data.postUrl);
+      const ext = getFileExtensionFromUrl(downloadableUrl);
       const fileName = `gojo-post-${selectedPost.postId || Date.now()}.${ext}`;
       const downloadPath = `${FileSystem.cacheDirectory}${fileName}`;
 
-      await FileSystem.downloadAsync(selectedPost.data.postUrl, downloadPath);
+      await FileSystem.downloadAsync(downloadableUrl, downloadPath);
       await MediaLibrary.saveToLibraryAsync(downloadPath);
       await FileSystem.deleteAsync(downloadPath, { idempotent: true });
 
@@ -596,9 +602,11 @@ export default function HomeScreen() {
     const { postId, data, admin, likesMap = {}, seenMap = {} } = item;
     const likesCount = data.likeCount || Object.keys(likesMap || {}).length;
     const isLiked = userId ? !!likesMap[userId] : false;
-    const imageUri = data.postUrl || null;
+    const imageUri = normalizeProfileImageUri(data.postUrl);
     const message = String(data.message || "").trim();
     const targetRoleLabel = formatTargetRoleLabel(data);
+    const posterName = getPosterName(admin, data);
+    const posterImage = getPosterImage(admin, data);
     const isExpanded = !!expandedDescriptions[postId];
     const shouldTruncate = message.length > DESCRIPTION_PREVIEW_LENGTH;
     const previewMessage = shouldTruncate && !isExpanded
@@ -621,11 +629,11 @@ export default function HomeScreen() {
       <View style={styles.card}>
         <View style={styles.cardHeader}>
           <Image
-            source={(admin && admin.profileImage) ? { uri: admin.profileImage } : require("../../assets/images/avatar_placeholder.png")}
+            source={posterImage ? { uri: posterImage } : require("../../assets/images/avatar_placeholder.png")}
             style={styles.avatar}
           />
           <View style={styles.headerTextWrap}>
-            <Text style={styles.username}>{admin?.name || admin?.username || "School Admin"}</Text>
+            <Text style={styles.username}>{posterName}</Text>
             <View style={styles.headerMetaRow}>
               <Text style={styles.time}>{timeAgo(data.time)}</Text>
               <Text style={styles.headerDot}>·</Text>
@@ -633,7 +641,7 @@ export default function HomeScreen() {
             </View>
           </View>
           <TouchableOpacity style={styles.moreBtn} activeOpacity={0.8} onPress={() => openPostMenu(postId)}>
-            <Ionicons name="ellipsis-horizontal" size={20} color="#65676B" />
+            <Ionicons name="ellipsis-horizontal" size={20} color={colors.muted} />
           </TouchableOpacity>
         </View>
 
@@ -666,7 +674,7 @@ export default function HomeScreen() {
           </View>
           <TouchableOpacity style={styles.likeIconOnlyBtn} activeOpacity={0.85} onPress={onHeartPress}>
             <Animated.View style={{ transform: [{ scale }] }}>
-              <Ionicons name={isLiked ? "heart" : "heart-outline"} size={24} color={isLiked ? "#ED4956" : "#262626"} />
+              <Ionicons name={isLiked ? "heart" : "heart-outline"} size={24} color={isLiked ? "#ED4956" : colors.text} />
             </Animated.View>
           </TouchableOpacity>
         </View>
@@ -695,22 +703,22 @@ export default function HomeScreen() {
   if (loading) {
     return (
       <View style={styles.center}>
-        <ActivityIndicator size="large" color="#007AFB" />
+        <ActivityIndicator size="large" color={colors.primary} />
       </View>
     );
   }
 
   if (!combinedPosts || combinedPosts.length === 0) {
     return (
-      <View style={{ flex: 1, backgroundColor: "#fff" }}>
+      <View style={{ flex: 1, backgroundColor: colors.background }}>
         <EmptyState />
       </View>
     );
   }
 
   const ListFooter = () => {
-    if (loadingMore) return <ActivityIndicator style={{ margin: 16 }} color="#007AFB" />;
-    if (!hasMore) return <Text style={{ textAlign: "center", color: "#888", padding: 12 }}>No more posts</Text>;
+    if (loadingMore) return <ActivityIndicator style={{ margin: 16 }} color={colors.primary} />;
+    if (!hasMore) return <Text style={{ textAlign: "center", color: colors.muted, padding: 12 }}>No more posts</Text>;
     return null;
   };
 
@@ -721,7 +729,7 @@ export default function HomeScreen() {
         keyExtractor={(i) => i.postId}
         renderItem={({ item }) => <PostCard item={item} />}
         contentContainerStyle={styles.list}
-        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={["#007AFB"]} />}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={[colors.primary]} tintColor={colors.primary} />}
         onEndReachedThreshold={0.6}
         onEndReached={() => {
           if (!loadingMore && hasMore) loadMore();
@@ -736,12 +744,12 @@ export default function HomeScreen() {
             <View style={styles.menuSheetHandle} />
             <View style={styles.menuSheet}>
               <TouchableOpacity style={styles.menuItem} activeOpacity={0.85} onPress={handleAboutAccount}>
-                <Ionicons name="information-circle-outline" size={20} color="#262626" />
+                <Ionicons name="information-circle-outline" size={20} color={colors.text} />
                 <Text style={styles.menuItemText}>About this account</Text>
               </TouchableOpacity>
               <View style={styles.menuDivider} />
               <TouchableOpacity style={styles.menuItem} activeOpacity={0.85} onPress={handleDownloadPost}>
-                <Ionicons name="download-outline" size={20} color="#262626" />
+                <Ionicons name="download-outline" size={20} color={colors.text} />
                 <Text style={styles.menuItemText}>Download</Text>
               </TouchableOpacity>
               <View style={styles.menuDivider} />
@@ -759,7 +767,7 @@ export default function HomeScreen() {
         <View style={styles.viewerBg}>
           <View style={styles.viewerTop}>
             <TouchableOpacity style={styles.viewerClose} onPress={() => setViewerVisible(false)}>
-              <Ionicons name="close" size={26} color="#fff" />
+              <Ionicons name="close" size={26} color={colors.white} />
             </TouchableOpacity>
           </View>
           <Pressable style={{ flex: 1, width: "100%" }} onPress={() => setViewerVisible(false)}>
@@ -773,11 +781,12 @@ export default function HomeScreen() {
   );
 }
 
-const styles = StyleSheet.create({
-  list: { paddingVertical: 10, backgroundColor: "#F0F2F5" },
-  center: { flex: 1, alignItems: "center", justifyContent: "center", padding: 20, backgroundColor: "#F0F2F5" },
+function createStyles(colors) {
+  return StyleSheet.create({
+  list: { paddingVertical: 10, backgroundColor: colors.feedBackground },
+  center: { flex: 1, alignItems: "center", justifyContent: "center", padding: 20, backgroundColor: colors.feedBackground },
   card: {
-    backgroundColor: "#fff",
+    backgroundColor: colors.card,
     marginBottom: 10,
     overflow: "hidden",
     borderRadius: 0,
@@ -794,15 +803,15 @@ const styles = StyleSheet.create({
     height: 40,
     borderRadius: 20,
     marginRight: 10,
-    backgroundColor: "#E4E6EB",
+    backgroundColor: colors.surfaceMuted,
   },
 
   headerTextWrap: { flex: 1 },
-  username: { fontWeight: "700", color: "#050505", fontSize: 15 },
+  username: { fontWeight: "700", color: colors.text, fontSize: 15 },
   headerMetaRow: { flexDirection: "row", alignItems: "center", marginTop: 2 },
-  time: { color: "#65676B", fontSize: 12 },
-  headerDot: { color: "#65676B", fontSize: 12, marginHorizontal: 4 },
-  targetRoleText: { color: "#65676B", fontSize: 12, fontWeight: "600" },
+  time: { color: colors.muted, fontSize: 12 },
+  headerDot: { color: colors.muted, fontSize: 12, marginHorizontal: 4 },
+  targetRoleText: { color: colors.muted, fontSize: 12 },
   moreBtn: {
     width: 32,
     height: 32,
@@ -812,11 +821,10 @@ const styles = StyleSheet.create({
   },
 
   messageWrap: { paddingHorizontal: 12, paddingBottom: 10 },
-  messageText: { color: "#050505", lineHeight: 20, fontSize: 15 },
+  messageText: { color: colors.text, lineHeight: 20, fontSize: 15 },
   seeMoreText: {
-    color: "#65676B",
+    color: colors.muted,
     fontSize: 14,
-    fontWeight: "600",
     marginTop: 4,
   },
 
@@ -837,7 +845,7 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   reactionCountText: {
-    color: "#262626",
+    color: colors.text,
     fontSize: 13,
     fontWeight: "700",
   },
@@ -867,7 +875,7 @@ const styles = StyleSheet.create({
     marginBottom: 10,
   },
   menuSheet: {
-    backgroundColor: "#FFFFFF",
+    backgroundColor: colors.card,
     borderRadius: 22,
     paddingVertical: 6,
     shadowColor: "#000",
@@ -884,7 +892,7 @@ const styles = StyleSheet.create({
     paddingVertical: 16,
   },
   menuItemText: {
-    color: "#262626",
+    color: colors.text,
     fontSize: 16,
     fontWeight: "600",
   },
@@ -893,19 +901,19 @@ const styles = StyleSheet.create({
   },
   menuDivider: {
     height: 1,
-    backgroundColor: "#F3F3F3",
+    backgroundColor: colors.border,
     marginHorizontal: 18,
   },
 
-  emptyContainer: { flex: 1, backgroundColor: "#fff", alignItems: "center", justifyContent: "center", padding: 28 },
+  emptyContainer: { flex: 1, backgroundColor: colors.background, alignItems: "center", justifyContent: "center", padding: 28 },
   emptyImage: { width: 220, height: 160, marginBottom: 18 },
-  emptyFallbackIcon: { width: 120, height: 120, borderRadius: 60, backgroundColor: "#F6F8FF", alignItems: "center", justifyContent: "center", marginBottom: 12 },
+  emptyFallbackIcon: { width: 120, height: 120, borderRadius: 60, backgroundColor: colors.soft, alignItems: "center", justifyContent: "center", marginBottom: 12 },
   emptyTitle: { fontSize: 20, fontWeight: "700", color: "#222", marginBottom: 6 },
-  emptySubtitle: { fontSize: 14, color: "#8B93B3", textAlign: "center" },
+  emptySubtitle: { fontSize: 14, color: colors.muted, textAlign: "center" },
 
   viewerBg: {
     flex: 1,
-    backgroundColor: "rgba(0,0,0,0.96)",
+    backgroundColor: colors.imageOverlay,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -928,3 +936,4 @@ const styles = StyleSheet.create({
     height: "100%",
   },
 });
+}

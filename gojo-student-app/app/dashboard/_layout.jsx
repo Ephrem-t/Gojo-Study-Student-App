@@ -1,24 +1,20 @@
-import React, { useEffect, useState, useRef } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Tabs, useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
-import { Text, TouchableOpacity, View, Image, StyleSheet } from "react-native";
+import { Text, TouchableOpacity, View, Image, StyleSheet, Platform } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { ref, get, onValue, off, query, orderByChild, equalTo } from "firebase/database";
 import { database } from "../../constants/firebaseConfig";
 import { StatusBar } from "expo-status-bar";
-
-const PRIMARY = "#007AFB";
-const WHITE = "#FFFFFF";
-
-function isValidProfileUri(value) {
-  if (!value || typeof value !== "string") return false;
-  const v = value.trim();
-  if (!v) return false;
-  return /^(https?:\/\/|file:\/\/|data:image\/)/i.test(v);
-}
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { useAppTheme } from "../../hooks/use-app-theme";
+import { extractProfileImage, normalizeProfileImageUri } from "../lib/profileImage";
 
 export default function DashboardLayout() {
   const router = useRouter();
+  const insets = useSafeAreaInsets();
+  const { colors, statusBarStyle } = useAppTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
   const [profileImage, setProfileImage] = useState(null);
   const [totalUnread, setTotalUnread] = useState(0);
   const chatsCleanupRef = useRef(null);
@@ -33,7 +29,34 @@ export default function DashboardLayout() {
         const userId = await AsyncStorage.getItem("userId");
         const username = await AsyncStorage.getItem("username");
         const studentId = await AsyncStorage.getItem("studentId");
-        const schoolKey = await AsyncStorage.getItem("schoolKey");
+        const storedSchoolKey = await AsyncStorage.getItem("schoolKey");
+
+        const resolveSchoolKey = async () => {
+          if (storedSchoolKey) return storedSchoolKey;
+
+          const candidates = [username, studentId, userId, userNodeKey, studentNodeKey]
+            .filter(Boolean)
+            .map((v) => String(v).trim().toUpperCase())
+            .filter((v) => v.length >= 3);
+
+          for (const candidate of candidates) {
+            const prefix = candidate.slice(0, 3);
+            try {
+              const codeSnap = await get(ref(database, `Platform1/schoolCodeIndex/${prefix}`));
+              const code = codeSnap?.exists() ? codeSnap.val() : null;
+              if (code) {
+                try {
+                  await AsyncStorage.setItem("schoolKey", String(code));
+                } catch {}
+                return String(code);
+              }
+            } catch {}
+          }
+
+          return null;
+        };
+
+        const schoolKey = await resolveSchoolKey();
 
         const uniqueVals = Array.from(
           new Set([userNodeKey, studentNodeKey, userId, username, studentId].filter(Boolean))
@@ -46,7 +69,7 @@ export default function DashboardLayout() {
             : `Users/${key}`;
           const snap = await get(ref(database, path));
           if (!snap.exists()) return null;
-          return snap.val()?.profileImage || null;
+          return extractProfileImage(snap.val());
         };
 
         const tryCollectionByField = async (collectionPath, field, value) => {
@@ -56,7 +79,7 @@ export default function DashboardLayout() {
           if (!snap.exists()) return null;
           let found = null;
           snap.forEach((child) => {
-            found = child.val()?.profileImage || null;
+            found = extractProfileImage(child.val());
             return true;
           });
           return found;
@@ -69,7 +92,7 @@ export default function DashboardLayout() {
             : `Students/${key}`;
           const snap = await get(ref(database, path));
           if (!snap.exists()) return null;
-          return snap.val()?.profileImage || null;
+          return extractProfileImage(snap.val());
         };
 
         const tryStudentCollectionByField = async (collectionPath, field, value) => {
@@ -79,7 +102,7 @@ export default function DashboardLayout() {
           if (!snap.exists()) return null;
           let found = null;
           snap.forEach((child) => {
-            found = child.val()?.profileImage || null;
+            found = extractProfileImage(child.val());
             return true;
           });
           return found;
@@ -125,7 +148,13 @@ export default function DashboardLayout() {
           const studentCollections = schoolKey
             ? [`Platform1/Schools/${schoolKey}/Students`, "Students"]
             : ["Students"];
-          const studentFields = ["studentId", "userId", "name"];
+          const studentFields = [
+            "studentId",
+            "userId",
+            "username",
+            "systemAccountInformation/username",
+            "name",
+          ];
 
           for (const col of studentCollections) {
             for (const val of uniqueVals) {
@@ -200,7 +229,7 @@ export default function DashboardLayout() {
   const HomeHeaderLeft = () => (
     <TouchableOpacity style={styles.iconButton} onPress={() => router.push("/chats")}>
       <View style={styles.chatIconWrap}>
-        <Ionicons name="paper-plane-outline" size={21} color="#222" />
+        <Ionicons name="paper-plane-outline" size={21} color={colors.text} />
         {totalUnread > 0 && (
           <View style={styles.unreadBadge}>
             <Text style={styles.unreadText}>
@@ -217,8 +246,8 @@ export default function DashboardLayout() {
       <TouchableOpacity onPress={() => router.push("../profiles")}> 
         <Image
           source={
-            isValidProfileUri(profileImage)
-              ? { uri: profileImage }
+            normalizeProfileImageUri(profileImage, { allowBlob: Platform.OS === "web" })
+              ? { uri: normalizeProfileImageUri(profileImage, { allowBlob: Platform.OS === "web" }) }
               : require("../../assets/images/avatar_placeholder.png")
           }
           style={styles.profileImage}
@@ -227,18 +256,52 @@ export default function DashboardLayout() {
     </View>
   );
 
+  const ExamTabIcon = ({ color, size }) => (
+    <View style={styles.examTabIconWrap}>
+      <Ionicons name="document-text-outline" size={size} color={color} />
+      <Text style={[styles.examTabBadge, { color }]}>A+</Text>
+    </View>
+  );
+
+  const BooksTabIcon = ({ color, size }) => (
+    <View style={styles.booksTabIconWrap}>
+      <Ionicons name="library-outline" size={size} color={color} />
+      <Text style={[styles.booksTabBadge, { color }]}>BK</Text>
+    </View>
+  );
+
+  const ClassMarkTabIcon = ({ color, size }) => (
+    <View style={styles.classMarkTabIconWrap}>
+      <Ionicons name="podium-outline" size={size} color={color} />
+      <Text style={[styles.classMarkTabBadge, { color }]}>MK</Text>
+    </View>
+  );
+
   return (
     <>
-      <StatusBar style="dark" backgroundColor={WHITE} translucent={false} />
+      <StatusBar style={statusBarStyle} backgroundColor={colors.tabBar} translucent={false} />
       <Tabs
+        initialRouteName="home"
         screenOptions={{
-          headerStyle: { backgroundColor: WHITE },
+          headerStyle: { backgroundColor: colors.tabBar },
           headerShadowVisible: false,
           headerTitleAlign: "left",
-          tabBarActiveTintColor: PRIMARY,
-          tabBarInactiveTintColor: "#BFD9FF",
-          tabBarStyle: { height: 62, backgroundColor: WHITE },
-          tabBarLabelStyle: { fontSize: 12 },
+          tabBarShowLabel: true,
+          tabBarLabelPosition: "below-icon",
+          tabBarActiveTintColor: colors.primary,
+          tabBarInactiveTintColor: colors.tabInactive,
+          headerTintColor: colors.text,
+          tabBarStyle: {
+            height: 52 + Math.max(insets.bottom, 0),
+            backgroundColor: colors.tabBar,
+            borderTopColor: colors.border,
+            paddingTop: 2,
+            paddingBottom: Math.max(insets.bottom, 0),
+          },
+          sceneStyle: { backgroundColor: colors.background },
+          tabBarItemStyle: { paddingVertical: 1 },
+          tabBarIconStyle: { marginBottom: 1 },
+          tabBarLabelStyle: { fontSize: 12, fontWeight: "600", lineHeight: 14 },
         }}
       >
         <Tabs.Screen
@@ -258,11 +321,10 @@ export default function DashboardLayout() {
           name="book"
           options={{
             title: "Books",
+            tabBarLabel: "Book",
             headerTitle: "Book Library",
             headerRight: () => null,
-            tabBarIcon: ({ color, size }) => (
-              <Ionicons name="book-outline" size={size} color={color} />
-            ),
+            tabBarIcon: ({ color, size }) => <BooksTabIcon color={color} size={size} />,
           }}
         />
 
@@ -270,11 +332,10 @@ export default function DashboardLayout() {
           name="exam"
           options={{
             title: "Exams",
+            tabBarLabel: "Exam",
             headerTitle: "Exams",
             headerRight: () => null,
-            tabBarIcon: ({ color, size }) => (
-              <Ionicons name="clipboard-outline" size={size} color={color} />
-            ),
+            tabBarIcon: ({ color, size }) => <ExamTabIcon color={color} size={size} />,
           }}
         />
 
@@ -282,11 +343,10 @@ export default function DashboardLayout() {
           name="classMark"
           options={{
             title: "Class Mark",
+            tabBarLabel: "Class Mark",
             headerTitle: "Class Mark",
             headerRight: () => null,
-            tabBarIcon: ({ color, size }) => (
-              <Ionicons name="reader-outline" size={size} color={color} />
-            ),
+            tabBarIcon: ({ color, size }) => <ClassMarkTabIcon color={color} size={size} />,
           }}
         />
       </Tabs>
@@ -294,10 +354,11 @@ export default function DashboardLayout() {
   );
 }
 
-const styles = StyleSheet.create({
+function createStyles(colors) {
+  return StyleSheet.create({
   titleText: {
     fontSize: 20,
-    color: "#222",
+    color: colors.text,
     fontWeight: "700",
     marginLeft: 8,
   },
@@ -313,8 +374,8 @@ const styles = StyleSheet.create({
     height: 38,
     borderRadius: 19,
     borderWidth: 0.5,
-    borderColor: "#EFEFF4",
-    backgroundColor: "#F6F8FF",
+    borderColor: colors.border,
+    backgroundColor: colors.soft,
   },
 
   iconButton: {
@@ -333,6 +394,66 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
 
+  examTabIconWrap: {
+    width: 28,
+    height: 28,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  booksTabIconWrap: {
+    width: 28,
+    height: 28,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  booksTabBadge: {
+    position: "absolute",
+    right: -7,
+    bottom: 1,
+    fontSize: 7,
+    fontWeight: "800",
+    lineHeight: 8,
+    backgroundColor: colors.tabBar,
+    paddingHorizontal: 2,
+    borderRadius: 4,
+    overflow: "hidden",
+  },
+
+  examTabBadge: {
+    position: "absolute",
+    right: -6,
+    bottom: 1,
+    fontSize: 9,
+    fontWeight: "800",
+    lineHeight: 10,
+    backgroundColor: colors.tabBar,
+    paddingHorizontal: 2,
+    borderRadius: 4,
+    overflow: "hidden",
+  },
+
+  classMarkTabIconWrap: {
+    width: 28,
+    height: 28,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  classMarkTabBadge: {
+    position: "absolute",
+    right: -7,
+    bottom: 1,
+    fontSize: 7,
+    fontWeight: "800",
+    lineHeight: 8,
+    backgroundColor: colors.tabBar,
+    paddingHorizontal: 2,
+    borderRadius: 4,
+    overflow: "hidden",
+  },
+
   unreadBadge: {
     position: "absolute",
     right: -10,
@@ -345,14 +466,15 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     paddingHorizontal: 4,
     borderWidth: 1.5,
-    borderColor: "#fff",
+    borderColor: colors.tabBar,
     zIndex: 20,
     elevation: 20,
   },
 
   unreadText: {
-    color: "#fff",
+    color: colors.white,
     fontSize: 10,
     fontWeight: "700",
   },
 });
+}

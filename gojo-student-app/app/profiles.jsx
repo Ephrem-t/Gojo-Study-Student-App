@@ -10,17 +10,21 @@ import {
   TextInput,
   Modal,
   ActivityIndicator,
-  Linking,
   Animated,
   Dimensions,
+  PanResponder,
+  Platform,
 } from "react-native";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useRouter } from "expo-router";
+import { StatusBar } from "expo-status-bar";
 import * as ImagePicker from "expo-image-picker";
-import { database } from "../constants/firebaseConfig";
-import { ref, get, update } from "firebase/database";
+import { database, storage } from "../constants/firebaseConfig";
+import { ref, get, update, remove } from "firebase/database";
+import { ref as stRef, uploadBytes, getDownloadURL } from "firebase/storage";
+import { useAppTheme } from "../hooks/use-app-theme";
 
 const { width: SCREEN_WIDTH } = Dimensions.get("window");
 
@@ -35,10 +39,37 @@ const SUCCESS = "#12B76A";
 const DANGER = "#EF4444";
 
 const AVATAR_PLACEHOLDER = require("../assets/images/avatar_placeholder.png");
-const TERMS_URL = "https://example.com/terms";
-const PRIVACY_URL = "https://example.com/privacy";
 
 const DAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+
+function normalizeProfileImageUri(value) {
+  if (!value || typeof value !== "string") return null;
+  const uri = value.trim();
+  if (!uri) return null;
+
+  if (/^https?:\/\//i.test(uri)) return uri;
+  if (/^data:image\//i.test(uri)) return uri;
+  if (/^blob:/i.test(uri) && Platform.OS === "web") return uri;
+  if (/^file:\/\//i.test(uri)) return null;
+
+  return null;
+}
+
+async function uploadProfileImageAsync({ uri, userNodeKey, studentNodeKey }) {
+  const response = await fetch(uri);
+  const blob = await response.blob();
+  const ownerKey = userNodeKey || studentNodeKey || "student";
+  const extMatch = String(uri).match(/\.(jpg|jpeg|png|webp)(?:\?|$)/i);
+  const ext = extMatch?.[1]?.toLowerCase() || "jpg";
+  const path = `profile-images/${ownerKey}/${Date.now()}.${ext}`;
+  const storageRef = stRef(storage, path);
+
+  await uploadBytes(storageRef, blob, {
+    contentType: blob.type || `image/${ext === "jpg" ? "jpeg" : ext}`,
+  });
+
+  return getDownloadURL(storageRef);
+}
 
 function formatDate(dateStr) {
   if (!dateStr) return "";
@@ -51,6 +82,19 @@ function formatDate(dateStr) {
     });
   } catch {
     return dateStr;
+  }
+}
+
+function formatNoteDate(value) {
+  if (!value) return "Recently updated";
+  try {
+    return new Date(value).toLocaleDateString(undefined, {
+      month: "short",
+      day: "numeric",
+      year: "numeric",
+    });
+  } catch {
+    return "Recently updated";
   }
 }
 
@@ -117,9 +161,237 @@ function sortPeriods(entries) {
   });
 }
 
+function normalizeGradeKey(v) {
+  if (!v) return "";
+  const s = String(v).toLowerCase().replace("grade", "").trim();
+  return s ? `grade${s}` : "";
+}
+
+function titleize(value) {
+  return String(value || "")
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function getSubjectIcon(subjectName) {
+  const name = (subjectName || "").toLowerCase();
+  if (name.includes("math") || name.includes("mathematics")) return "calculator-outline";
+  if (name.includes("science")) return "flask-outline";
+  if (name.includes("english") || name.includes("language")) return "book-outline";
+  if (name.includes("history") || name.includes("social")) return "globe-outline";
+  if (name.includes("biology")) return "leaf-outline";
+  if (name.includes("chemistry")) return "color-wand-outline";
+  if (name.includes("physics")) return "flash-outline";
+  if (name.includes("geography")) return "map-outline";
+  if (name.includes("computer") || name.includes("ict")) return "laptop-outline";
+  if (name.includes("art")) return "palette-outline";
+  if (name.includes("music")) return "musical-notes-outline";
+  if (name.includes("physical") || name.includes("pe") || name.includes("sport")) return "fitness-outline";
+  return "library-outline";
+}
+
+function getSubjectColor(subjectName) {
+  const name = (subjectName || "").toLowerCase();
+  if (name.includes("math") || name.includes("mathematics")) return "#FF6B6B";
+  if (name.includes("science")) return "#4ECDC4";
+  if (name.includes("english") || name.includes("language")) return "#45B7D1";
+  if (name.includes("history") || name.includes("social")) return "#96CEB4";
+  if (name.includes("biology")) return "#88D8B0";
+  if (name.includes("chemistry")) return "#FFB74D";
+  if (name.includes("physics")) return "#64B5F6";
+  if (name.includes("geography")) return "#81C784";
+  if (name.includes("computer") || name.includes("ict")) return "#9575CD";
+  if (name.includes("art")) return "#F06292";
+  if (name.includes("music")) return "#BA68C8";
+  if (name.includes("physical") || name.includes("pe") || name.includes("sport")) return "#4DB6AC";
+  return "#90A4AE";
+}
+
+function normalizeChapterNotes(value) {
+  if (!value || typeof value !== "object") return [];
+
+  const nestedNotes = value.notes && typeof value.notes === "object"
+    ? Object.entries(value.notes)
+        .map(([noteId, note]) => ({ ...(note || {}), noteId }))
+        .filter((note) => typeof note === "object")
+    : [];
+
+  if (typeof value.text === "string" || typeof value.title === "string") {
+    return [{ ...value, noteId: value.noteId || "legacy" }, ...nestedNotes];
+  }
+
+  return nestedNotes.length
+    ? nestedNotes
+    : Object.entries(value)
+        .map(([noteId, note]) => ({ ...(note || {}), noteId }))
+        .filter((note) => typeof note === "object" && (typeof note.text === "string" || typeof note.title === "string"));
+}
+
+async function getGroupedStudentNotes(schoolCode, grade, candidateStudentIds) {
+  const gradeKey = normalizeGradeKey(grade);
+  const ids = Array.from(new Set((candidateStudentIds || []).filter(Boolean).map((value) => String(value).trim())));
+
+  if (!schoolCode || !gradeKey || !ids.length) return [];
+
+  try {
+    let notesRoot = null;
+    let ownerId = null;
+
+    for (const id of ids) {
+      const snap = await get(ref(database, `Platform1/Schools/${schoolCode}/StudentBookNotes/${id}/${gradeKey}`)).catch(() => null);
+      if (snap?.exists()) {
+        notesRoot = snap.val() || {};
+        ownerId = id;
+        break;
+      }
+    }
+
+    if (!notesRoot || !ownerId) return [];
+
+    const booksSnap = await get(ref(database, `Platform1/TextBooks/${gradeKey}`)).catch(() => null);
+    const booksMap = booksSnap?.exists() ? booksSnap.val() || {} : {};
+
+    return Object.keys(notesRoot)
+      .map((subjectKey) => {
+        const subjectNode = notesRoot[subjectKey] || {};
+        const subjectMeta = booksMap[subjectKey] || {};
+        const subjectTitle = subjectMeta.title || titleize(subjectKey);
+        const subjectNotes = [];
+
+        Object.keys(subjectNode).forEach((unitKey) => {
+          const unitValue = subjectNode[unitKey] || {};
+          const unitMeta = subjectMeta.units?.[unitKey] || {};
+          const unitTitle = unitMeta.title || titleize(unitKey);
+
+          normalizeChapterNotes(unitValue)
+            .sort((a, b) => {
+              const ap = a?.pinned ? 1 : 0;
+              const bp = b?.pinned ? 1 : 0;
+              if (ap !== bp) return bp - ap;
+              return (b?.updatedAt || b?.createdAt || 0) - (a?.updatedAt || a?.createdAt || 0);
+            })
+            .forEach((note) => {
+              const title = String(note?.title || "").trim() || `${unitTitle} Note`;
+              const preview = String(note?.text || "").trim();
+
+              if (!title && !preview) return;
+
+              subjectNotes.push({
+                ownerId,
+                subjectKey,
+                subjectTitle,
+                unitKey,
+                unitTitle,
+                noteId: note?.noteId || "",
+                title,
+                text: preview,
+                preview,
+                pinned: !!note?.pinned,
+                colorTag: note?.colorTag || "#F8FBFF",
+                updatedAt: note?.updatedAt || note?.createdAt || 0,
+              });
+            });
+        });
+
+        return {
+          subjectKey,
+          subjectTitle,
+          notes: subjectNotes,
+        };
+      })
+      .filter((section) => section.notes.length > 0);
+  } catch (error) {
+    console.warn("Grouped notes lookup error:", error);
+    return [];
+  }
+}
+
+async function getCountryRankForStudent(grade, candidateIds) {
+  const normalizedGrade = extractGradeNumber(grade);
+  const ids = Array.from(new Set((candidateIds || []).filter(Boolean).map((value) => String(value).trim())));
+
+  if (!normalizedGrade || !ids.length) return null;
+
+  try {
+    let country = "Ethiopia";
+
+    try {
+      const countrySnap = await get(ref(database, "Platform1/country"));
+      if (countrySnap.exists()) country = countrySnap.val() || country;
+    } catch {}
+
+    if (!country || typeof country !== "string") country = "Ethiopia";
+
+    const gradeKey = `grade${normalizedGrade}`;
+    const paths = [
+      `Platform1/rankings/country/${country}/${gradeKey}/leaderboard`,
+      `rankings/country/${country}/${gradeKey}/leaderboard`,
+    ];
+
+    for (const path of paths) {
+      const snap = await get(ref(database, path)).catch(() => null);
+      if (!snap?.exists()) continue;
+
+      const leaderboard = snap.val() || {};
+      for (const id of ids) {
+        const row = leaderboard[id];
+        const rank = Number(row?.rank || 0);
+        if (rank > 0 && rank <= 10) {
+          return { rank, country };
+        }
+      }
+    }
+  } catch (error) {
+    console.warn("Country rank lookup error:", error);
+  }
+
+  return null;
+}
+
+async function getSchoolRankForStudent(grade, schoolKey, candidateIds) {
+  const normalizedGrade = extractGradeNumber(grade);
+  const ids = Array.from(new Set((candidateIds || []).filter(Boolean).map((value) => String(value).trim())));
+
+  if (!normalizedGrade || !schoolKey || !ids.length) return null;
+
+  try {
+    const gradeKey = `grade${normalizedGrade}`;
+    const paths = [
+      `Platform1/rankings/schools/${schoolKey}/${gradeKey}/leaderboard`,
+      `rankings/schools/${schoolKey}/${gradeKey}/leaderboard`,
+      `Platform1/rankings/schools/${schoolKey}/${gradeKey}`,
+      `rankings/schools/${schoolKey}/${gradeKey}`,
+    ];
+
+    for (const path of paths) {
+      const snap = await get(ref(database, path)).catch(() => null);
+      if (!snap?.exists()) continue;
+
+      const raw = snap.val() || {};
+      const leaderboard = raw?.leaderboard || raw;
+
+      for (const id of ids) {
+        const row = leaderboard[id];
+        const rank = Number(row?.rank || 0);
+        if (rank > 0 && rank <= 10) {
+          return { rank, schoolKey };
+        }
+      }
+    }
+  } catch (error) {
+    console.warn("School rank lookup error:", error);
+  }
+
+  return null;
+}
+
 export default function ProfileScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
+  const { colors, statusBarStyle } = useAppTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
   const scrollY = useRef(new Animated.Value(0)).current;
   const sheetAnim = useRef(new Animated.Value(0)).current;
 
@@ -143,8 +415,16 @@ export default function ProfileScreen() {
   const [calendarEvents, setCalendarEvents] = useState([]);
   const [scheduleMap, setScheduleMap] = useState({});
   const [scheduleVisible, setScheduleVisible] = useState(false);
+  const [countryRank, setCountryRank] = useState(null);
+  const [schoolRank, setSchoolRank] = useState(null);
 
   const [pwdModal, setPwdModal] = useState(false);
+  const [editModal, setEditModal] = useState(false);
+  const [profileSectionTab, setProfileSectionTab] = useState("main");
+  const [noteSections, setNoteSections] = useState([]);
+  const [expandedNoteSubjects, setExpandedNoteSubjects] = useState({});
+  const [notesLoading, setNotesLoading] = useState(false);
+  const [noteReader, setNoteReader] = useState({ visible: false, note: null });
   const [newPwd, setNewPwd] = useState("");
   const [confirmPwd, setConfirmPwd] = useState("");
   const [savingPwd, setSavingPwd] = useState(false);
@@ -162,6 +442,9 @@ export default function ProfileScreen() {
       setSchoolKey(sk);
       setUserNodeKey(uKey);
       setStudentNodeKey(sKey);
+      setCountryRank(null);
+      setSchoolRank(null);
+      setNoteSections([]);
 
       let grade = "";
       let section = "";
@@ -185,11 +468,46 @@ export default function ProfileScreen() {
           name: userVal?.name || studentVal?.name || "Student",
           username: userVal?.username || studentVal?.studentId || "",
           role: userVal?.role || "student",
-          profileImage: userVal?.profileImage || studentVal?.profileImage || null,
+          profileImage: normalizeProfileImageUri(userVal?.profileImage || studentVal?.profileImage || null),
           grade,
           section,
           studentId,
         });
+
+        const rankInfo = await getCountryRankForStudent(grade, [
+          studentId,
+          sKey,
+          userVal?.username,
+          studentVal?.studentId,
+          uKey,
+        ]);
+        setCountryRank(rankInfo);
+
+        const schoolRankInfo = await getSchoolRankForStudent(grade, sk, [
+          studentId,
+          sKey,
+          userVal?.username,
+          studentVal?.studentId,
+          uKey,
+        ]);
+        setSchoolRank(schoolRankInfo);
+
+        setNotesLoading(true);
+        const groupedNotes = await getGroupedStudentNotes(sk, grade, [
+          sKey,
+          studentId,
+          userVal?.username,
+          studentVal?.studentId,
+          uKey,
+        ]);
+        setNoteSections(groupedNotes);
+        setExpandedNoteSubjects(
+          groupedNotes.reduce((acc, section, index) => {
+            acc[section.subjectKey] = index === 0;
+            return acc;
+          }, {})
+        );
+        setNotesLoading(false);
       }
 
       if (sk) {
@@ -229,8 +547,111 @@ export default function ProfileScreen() {
       console.warn("Profile fetch error:", e);
       Alert.alert("Error", "Unable to load profile.");
     } finally {
+      setNotesLoading(false);
       setLoading(false);
     }
+  }, []);
+
+  const openProfileNoteEditor = useCallback((note) => {
+    if (!note?.ownerId || !note?.subjectKey || !note?.unitKey) return;
+
+    router.push({
+      pathname: "/chapterNote",
+      params: {
+        schoolCode: schoolKey,
+        studentId: note.ownerId,
+        grade: profile.grade,
+        subjectKey: note.subjectKey,
+        subjectTitle: note.subjectTitle,
+        unitKey: note.unitKey,
+        unitTitle: note.unitTitle,
+        noteId: note.noteId || "",
+      },
+    });
+  }, [profile.grade, router, schoolKey]);
+
+  const openProfileNoteReader = useCallback((note) => {
+    if (!note) return;
+    setNoteReader({ visible: true, note });
+  }, []);
+
+  const closeProfileNoteReader = useCallback(() => {
+    setNoteReader({ visible: false, note: null });
+  }, []);
+
+  const openProfileNoteEditorFromReader = useCallback(() => {
+    if (!noteReader.note) return;
+    const note = noteReader.note;
+    closeProfileNoteReader();
+    requestAnimationFrame(() => openProfileNoteEditor(note));
+  }, [closeProfileNoteReader, noteReader.note, openProfileNoteEditor]);
+
+  const refreshGroupedNotes = useCallback(async () => {
+    if (!schoolKey || !profile.grade) return;
+
+    setNotesLoading(true);
+    try {
+      const groupedNotes = await getGroupedStudentNotes(schoolKey, profile.grade, [
+        studentNodeKey,
+        profile.studentId,
+        profile.username,
+        userNodeKey,
+      ]);
+
+      setNoteSections(groupedNotes);
+      setExpandedNoteSubjects((prev) => {
+        const next = {};
+        groupedNotes.forEach((section, index) => {
+          next[section.subjectKey] = prev[section.subjectKey] ?? index === 0;
+        });
+        return next;
+      });
+    } finally {
+      setNotesLoading(false);
+    }
+  }, [profile.grade, profile.studentId, profile.username, schoolKey, studentNodeKey, userNodeKey]);
+
+  const deleteProfileNote = useCallback(async (note) => {
+    if (!schoolKey || !profile.grade || !note?.ownerId || !note?.subjectKey || !note?.unitKey) return;
+
+    const gradeKey = normalizeGradeKey(profile.grade);
+    const unitPath = `Platform1/Schools/${schoolKey}/StudentBookNotes/${note.ownerId}/${gradeKey}/${note.subjectKey}/${note.unitKey}`;
+    const noteId = note.noteId || "";
+
+    try {
+      if (noteId === "legacy") {
+        await update(ref(database, unitPath), {
+          noteId: null,
+          studentId: null,
+          gradeKey: null,
+          subjectKey: null,
+          unitKey: null,
+          title: null,
+          text: null,
+          pinned: null,
+          colorTag: null,
+          createdAt: null,
+          updatedAt: null,
+        });
+      } else {
+        await remove(ref(database, `${unitPath}/notes/${noteId}`));
+      }
+
+      if (noteReader.note?.noteId === note.noteId && noteReader.note?.unitKey === note.unitKey) {
+        closeProfileNoteReader();
+      }
+
+      await refreshGroupedNotes();
+    } catch {
+      Alert.alert("Delete failed", "Could not remove this note.");
+    }
+  }, [closeProfileNoteReader, noteReader.note, profile.grade, refreshGroupedNotes, schoolKey]);
+
+  const toggleNoteSubject = useCallback((subjectKey) => {
+    setExpandedNoteSubjects((prev) => ({
+      ...prev,
+      [subjectKey]: !prev[subjectKey],
+    }));
   }, []);
 
   useEffect(() => {
@@ -240,6 +661,29 @@ export default function ProfileScreen() {
   const upcoming = useMemo(() => upcomingWithinDays(calendarEvents, 30), [calendarEvents]);
   const todayDay = getTodayDayName();
   const todaySchedule = scheduleMap[todayDay] || [];
+  const usernameHandle = useMemo(() => {
+    const raw = String(profile.username || "").trim();
+    if (!raw) return "@student";
+    return raw.startsWith("@") ? raw : `@${raw}`;
+  }, [profile.username]);
+
+  const gradeSection = useMemo(() => {
+    const g = extractGradeNumber(profile.grade);
+    const s = normalizeSection(profile.section);
+    if (!g && !s) return "--";
+    return `${g}${s}`;
+  }, [profile.grade, profile.section]);
+
+  const avatarUri = useMemo(() => normalizeProfileImageUri(profile.profileImage), [profile.profileImage]);
+
+  const handleProfileBack = useCallback(() => {
+    if (router.canGoBack()) {
+      router.back();
+      return;
+    }
+
+    router.replace("/dashboard/home");
+  }, [router]);
 
   const openScheduleSheet = useCallback(() => {
     setScheduleVisible(true);
@@ -284,20 +728,25 @@ export default function ProfileScreen() {
       if (!uri) return;
 
       setSavingPhoto(true);
+      const uploadedUrl = await uploadProfileImageAsync({
+        uri,
+        userNodeKey,
+        studentNodeKey,
+      });
 
       if (schoolKey && userNodeKey) {
         await update(ref(database, `Platform1/Schools/${schoolKey}/Users/${userNodeKey}`), {
-          profileImage: uri,
+          profileImage: uploadedUrl,
         });
       }
 
       if (schoolKey && studentNodeKey) {
         await update(ref(database, `Platform1/Schools/${schoolKey}/Students/${studentNodeKey}`), {
-          profileImage: uri,
+          profileImage: uploadedUrl,
         });
       }
 
-      setProfile((p) => ({ ...p, profileImage: uri }));
+      setProfile((p) => ({ ...p, profileImage: uploadedUrl }));
       Alert.alert("Updated", "Profile photo updated.");
     } catch (e) {
       console.warn("pickAndSavePhoto error:", e);
@@ -305,7 +754,7 @@ export default function ProfileScreen() {
     } finally {
       setSavingPhoto(false);
     }
-  }, [schoolKey, userNodeKey, studentNodeKey]);
+  }, [schoolKey, studentNodeKey, userNodeKey]);
 
   const savePassword = useCallback(async () => {
     if (!newPwd || newPwd.length < 4) {
@@ -342,31 +791,8 @@ export default function ProfileScreen() {
     }
   }, [newPwd, confirmPwd, schoolKey, userNodeKey, studentNodeKey]);
 
-  const logout = useCallback(async () => {
-    Alert.alert("Logout", "Are you sure you want to logout?", [
-      { text: "Cancel", style: "cancel" },
-      {
-        text: "Logout",
-        style: "destructive",
-        onPress: async () => {
-          try {
-            const keys = await AsyncStorage.getAllKeys();
-            if (keys?.length) await AsyncStorage.multiRemove(keys);
-          } catch {}
-          router.replace("/");
-        },
-      },
-    ]);
-  }, [router]);
-
-  const openExternal = useCallback(async (url, label) => {
-    try {
-      const can = await Linking.canOpenURL(url);
-      if (!can) return Alert.alert("Unavailable", `${label} link is not configured yet.`);
-      await Linking.openURL(url);
-    } catch {
-      Alert.alert("Error", `Unable to open ${label}.`);
-    }
+  const openEditProfileMenu = useCallback(() => {
+    setEditModal(true);
   }, []);
 
   const pullY = scrollY.interpolate({
@@ -402,12 +828,7 @@ export default function ProfileScreen() {
 
   return (
     <SafeAreaView style={styles.safe}>
-      <View style={[styles.backWrap, { top: insets.top + 8 }]}>
-        <TouchableOpacity style={styles.backBtn} onPress={() => router.back()}>
-          <Ionicons name="chevron-back" size={22} color="#fff" />
-        </TouchableOpacity>
-      </View>
-
+      <StatusBar style={statusBarStyle} backgroundColor={colors.background} />
       <Animated.View
         pointerEvents="none"
         style={[
@@ -418,10 +839,7 @@ export default function ProfileScreen() {
           },
         ]}
       >
-        <Image
-          source={profile.profileImage ? { uri: profile.profileImage } : AVATAR_PLACEHOLDER}
-          style={styles.stretchImage}
-        />
+        <View style={styles.stretchFill} />
       </Animated.View>
 
       <Animated.ScrollView
@@ -434,31 +852,113 @@ export default function ProfileScreen() {
         showsVerticalScrollIndicator={false}
       >
         <View style={styles.heroCard}>
-          <View style={styles.avatarWrap}>
-            <Image
-              source={profile.profileImage ? { uri: profile.profileImage } : AVATAR_PLACEHOLDER}
-              style={styles.avatar}
-            />
-            <TouchableOpacity style={styles.editAvatarBtn} onPress={pickAndSavePhoto} disabled={savingPhoto}>
-              {savingPhoto ? (
-                <ActivityIndicator color="#fff" size="small" />
-              ) : (
-                <Ionicons name="camera" size={16} color="#fff" />
-              )}
-            </TouchableOpacity>
+          <View style={styles.heroBanner}>
+            <View style={styles.heroBannerFallback}>
+              <View style={styles.heroBannerOrbPrimary} />
+              <View style={styles.heroBannerOrbSecondary} />
+            </View>
+            <View style={styles.heroBannerOverlay} />
+
+            <View style={styles.heroTopBar}>
+              <TouchableOpacity style={styles.heroTopIconBtn} onPress={handleProfileBack}>
+                <Ionicons name="chevron-back" size={20} color={colors.white} />
+              </TouchableOpacity>
+
+              <Text style={styles.heroTopTitle}>Profile</Text>
+
+              <View style={styles.heroTopActions}>
+                <View style={styles.heroQuickStats}>
+                  {schoolRank?.rank ? (
+                    <MiniPill
+                      icon="podium-gold"
+                      text={`S#${schoolRank.rank}`}
+                      styles={styles}
+                      onPress={() => router.push({ pathname: "/leaderboard", params: { scope: "school" } })}
+                    />
+                  ) : null}
+                  {countryRank?.rank ? (
+                    <MiniPill
+                      icon="trophy-outline"
+                      text={`#${countryRank.rank}`}
+                      styles={styles}
+                      onPress={() => router.push({ pathname: "/leaderboard", params: { scope: "country" } })}
+                    />
+                  ) : null}
+                </View>
+
+                <TouchableOpacity style={styles.heroTopIconBtn} onPress={() => router.push("/setting")}>
+                  <MaterialCommunityIcons name="cog-outline" size={18} color={colors.white} />
+                </TouchableOpacity>
+              </View>
+            </View>
           </View>
 
-          <Text style={styles.name}>{profile.name}</Text>
-          <Text style={styles.subText}>
-            {profile.username} {profile.grade ? `• Grade ${profile.grade}` : ""} {profile.section ? `• ${profile.section}` : ""}
-          </Text>
+          <View style={styles.heroAvatarSlot}>
+            <View style={styles.avatarWrap}>
+              <Image
+                source={avatarUri ? { uri: avatarUri } : AVATAR_PLACEHOLDER}
+                style={styles.avatar}
+              />
+              <TouchableOpacity style={styles.editAvatarBtn} onPress={pickAndSavePhoto} disabled={savingPhoto}>
+                {savingPhoto ? (
+                  <ActivityIndicator color={colors.white} size="small" />
+                ) : (
+                  <Ionicons name="camera" size={16} color={colors.white} />
+                )}
+              </TouchableOpacity>
+            </View>
+          </View>
 
-          <View style={styles.heroQuickStats}>
-            <MiniPill icon="school-outline" text={`Grade ${profile.grade || "--"}`} />
-            <MiniPill icon="layers-outline" text={`Section ${profile.section || "--"}`} />
+          <View style={styles.heroIdentityBlock}>
+            <View style={styles.identityTopRow}>
+              <Text style={styles.name}>{profile.name}</Text>
+            </View>
+            <View style={styles.subRow}>
+              <Text style={styles.subText}>{usernameHandle}</Text>
+              {gradeSection && gradeSection !== "--" ? (
+                <MiniPill icon="school-outline" text={gradeSection} compact styles={styles} />
+              ) : null}
+            </View>
+            <TouchableOpacity style={styles.editProfileBtn} onPress={openEditProfileMenu} activeOpacity={0.88}>
+              <Text style={styles.editProfileText}>Edit Profile</Text>
+            </TouchableOpacity>
+
+            <View style={styles.profileFilterRow}>
+              <TouchableOpacity
+                style={[styles.profileFilterBtn, profileSectionTab === "main" && styles.profileFilterBtnActive]}
+                onPress={() => setProfileSectionTab("main")}
+                activeOpacity={0.85}
+              >
+                <Text
+                  style={[
+                    styles.profileFilterText,
+                    profileSectionTab === "main" && styles.profileFilterTextActive,
+                  ]}
+                >
+                  Main
+                </Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[styles.profileFilterBtn, profileSectionTab === "note" && styles.profileFilterBtnActive]}
+                onPress={() => setProfileSectionTab("note")}
+                activeOpacity={0.85}
+              >
+                <Text
+                  style={[
+                    styles.profileFilterText,
+                    profileSectionTab === "note" && styles.profileFilterTextActive,
+                  ]}
+                >
+                  My Note
+                </Text>
+              </TouchableOpacity>
+            </View>
           </View>
         </View>
 
+        {profileSectionTab === "main" ? (
+          <>
         <View style={styles.card}>
           <Text style={styles.sectionTitle}>Today at school</Text>
 
@@ -497,77 +997,123 @@ export default function ProfileScreen() {
             title="School calendar"
             subtitle="See upcoming events in a cleaner view"
             onPress={() => router.push("./calendar")}
+            styles={styles}
+            colors={colors}
           />
         </View>
 
-        <View style={styles.card}>
-          <Text style={styles.sectionTitle}>Upcoming events</Text>
-
-          {upcoming.length === 0 ? (
-            <Text style={styles.emptyText}>No upcoming events in the next 30 days.</Text>
-          ) : (
-            upcoming.slice(0, 4).map((e) => {
-              const color = getCategoryColor(e.category || e.type);
-              return (
-                <View key={e.id} style={styles.eventRow}>
-                  <View style={[styles.eventDot, { backgroundColor: color }]} />
-                  <View style={{ flex: 1 }}>
-                    <View style={styles.eventTopLine}>
-                      <Text style={styles.eventTitle}>{e.title || "Event"}</Text>
-                      <View style={[styles.eventBadge, { backgroundColor: `${color}16` }]}>
-                        <Text style={[styles.eventBadgeText, { color }]}>
-                          {getCategoryLabel(e.category || e.type)}
+          </>
+        ) : (
+          <View style={styles.card}>
+            {notesLoading ? (
+              <View style={styles.noteStateCard}>
+                <ActivityIndicator color={PRIMARY} />
+                <Text style={styles.noteStateText}>Loading notes...</Text>
+              </View>
+            ) : noteSections.length ? (
+              noteSections.map((section) => (
+                <View key={section.subjectKey} style={[styles.noteSubjectCard, expandedNoteSubjects[section.subjectKey] && styles.noteSubjectCardSelected]}>
+                  <TouchableOpacity
+                    style={[styles.noteSubjectHeader, expandedNoteSubjects[section.subjectKey] && styles.noteSubjectHeaderExpanded]}
+                    activeOpacity={0.92}
+                    onPress={() => toggleNoteSubject(section.subjectKey)}
+                  >
+                    <View style={styles.noteSubjectHeaderLeft}>
+                      <View style={[styles.noteSubjectCover, styles.noteSubjectIconContainer]}>
+                        <Ionicons
+                          name={getSubjectIcon(section.subjectTitle)}
+                          size={26}
+                          color={getSubjectColor(section.subjectTitle)}
+                        />
+                      </View>
+                      <View style={styles.noteSubjectInfoWrap}>
+                        <Text style={styles.noteSubjectName}>{section.subjectTitle}</Text>
+                        <Text style={styles.noteSubjectSub}>
+                          {section.notes.length} note{section.notes.length === 1 ? "" : "s"}
                         </Text>
                       </View>
                     </View>
-                    <Text style={styles.eventMeta}>{formatDate(e.gregorianDate)}</Text>
-                    {!!e.notes && <Text numberOfLines={2} style={styles.eventNotes}>{e.notes}</Text>}
-                  </View>
+
+                    <View style={[styles.noteSubjectToggle, expandedNoteSubjects[section.subjectKey] && styles.noteSubjectToggleActive]}>
+                      <Ionicons
+                        name={expandedNoteSubjects[section.subjectKey] ? "chevron-up" : "chevron-down"}
+                        size={16}
+                        color={expandedNoteSubjects[section.subjectKey] ? PRIMARY : MUTED}
+                      />
+                    </View>
+                  </TouchableOpacity>
+
+                  {expandedNoteSubjects[section.subjectKey] ? (
+                    <View style={styles.noteUnitsContainer}>
+                      {section.notes.map((note) => (
+                        <SwipeableProfileNoteCard
+                          key={`${section.subjectKey}-${note.unitKey}-${note.noteId || note.title}`}
+                          note={note}
+                          onOpen={() => openProfileNoteReader(note)}
+                          onEdit={() => openProfileNoteEditor(note)}
+                          onDelete={() =>
+                            Alert.alert("Delete note", "Remove this note from your list?", [
+                              { text: "Cancel", style: "cancel" },
+                              {
+                                text: "Delete",
+                                style: "destructive",
+                                onPress: () => deleteProfileNote(note),
+                              },
+                            ])
+                          }
+                          styles={styles}
+                          colors={colors}
+                        />
+                      ))}
+                    </View>
+                  ) : null}
                 </View>
-              );
-            })
-          )}
-        </View>
+              ))
+            ) : (
+              <View style={styles.noteStateCard}>
+                <Ionicons name="document-text-outline" size={18} color={MUTED} />
+                <Text style={styles.noteStateText}>No saved notes yet.</Text>
+              </View>
+            )}
+          </View>
+        )}
 
-        <View style={styles.card}>
-          <Text style={styles.sectionTitle}>Account</Text>
-          <ActionRow icon="key-outline" title="Change Password" subtitle="Update your account password" onPress={() => setPwdModal(true)} />
-          <Divider />
-          <ActionRow icon="chatbox-ellipses-outline" title="Contact School" subtitle="Message school management" onPress={() => router.push("/chats")} />
-          <Divider />
-          <ActionRow
-            icon="code-slash-outline"
-            title="Contact Developer"
-            subtitle="Reach support team"
-            onPress={() =>
-              Linking.openURL("mailto:support@gojostudy.com").catch(() =>
-                Alert.alert("Error", "Cannot open email app")
-              )
-            }
-          />
-          <Divider />
-          <ActionRow
-            icon="document-text-outline"
-            title="Terms of Service"
-            subtitle="Read usage terms"
-            onPress={() => openExternal(TERMS_URL, "Terms of Service")}
-          />
-          <Divider />
-          <ActionRow
-            icon="shield-checkmark-outline"
-            title="Privacy Policy"
-            subtitle="How your data is handled"
-            onPress={() => openExternal(PRIVACY_URL, "Privacy Policy")}
-          />
-        </View>
-
-        <TouchableOpacity style={styles.logoutBtn} onPress={logout}>
-          <Ionicons name="log-out-outline" size={18} color="#fff" />
-          <Text style={styles.logoutText}>Logout</Text>
-        </TouchableOpacity>
-
-        <Text style={styles.footer}>© 2026 Gojo Study • Crafted with care in Ethiopia</Text>
       </Animated.ScrollView>
+
+      <Modal visible={editModal} transparent animationType="fade" onRequestClose={() => setEditModal(false)}>
+        <View style={styles.modalBg}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Edit Profile</Text>
+
+            <TouchableOpacity
+              style={styles.editOptionBtn}
+              onPress={() => {
+                setEditModal(false);
+                requestAnimationFrame(() => pickAndSavePhoto());
+              }}
+            >
+              <Ionicons name="image-outline" size={18} color={TEXT} />
+              <Text style={styles.editOptionText}>Change Photo</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.editOptionBtn}
+              onPress={() => {
+                setEditModal(false);
+                requestAnimationFrame(() => setPwdModal(true));
+              }}
+            >
+              <Ionicons name="key-outline" size={18} color={TEXT} />
+              <Text style={styles.editOptionText}>Change Password</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity style={[styles.editOptionBtn, styles.editOptionCancel]} onPress={() => setEditModal(false)}>
+              <Ionicons name="close-outline" size={18} color={MUTED} />
+              <Text style={[styles.editOptionText, styles.editOptionCancelText]}>Cancel</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
 
       <Modal visible={pwdModal} transparent animationType="fade" onRequestClose={() => setPwdModal(false)}>
         <View style={styles.modalBg}>
@@ -578,6 +1124,7 @@ export default function ProfileScreen() {
               value={newPwd}
               onChangeText={setNewPwd}
               placeholder="New password"
+              placeholderTextColor={colors.muted}
               secureTextEntry
               style={styles.input}
             />
@@ -585,6 +1132,7 @@ export default function ProfileScreen() {
               value={confirmPwd}
               onChangeText={setConfirmPwd}
               placeholder="Confirm password"
+              placeholderTextColor={colors.muted}
               secureTextEntry
               style={styles.input}
             />
@@ -594,11 +1142,75 @@ export default function ProfileScreen() {
                 <Text style={styles.cancelText}>Cancel</Text>
               </TouchableOpacity>
               <TouchableOpacity style={[styles.modalBtn, styles.saveBtn]} onPress={savePassword} disabled={savingPwd}>
-                {savingPwd ? <ActivityIndicator color="#fff" /> : <Text style={styles.saveText}>Save</Text>}
+                {savingPwd ? <ActivityIndicator color={colors.white} /> : <Text style={styles.saveText}>Save</Text>}
               </TouchableOpacity>
             </View>
           </View>
         </View>
+      </Modal>
+
+      <Modal visible={noteReader.visible} animationType="slide" onRequestClose={closeProfileNoteReader}>
+        <SafeAreaView style={styles.noteReaderScreen}>
+          <View style={styles.noteReaderTopBar}>
+            <TouchableOpacity style={styles.noteReaderIconBtn} onPress={closeProfileNoteReader}>
+              <Ionicons name="arrow-back" size={20} color={TEXT} />
+            </TouchableOpacity>
+
+            <View style={styles.noteReaderTopText}>
+              <Text numberOfLines={1} style={styles.noteReaderUnitTitle}>
+                {noteReader.note?.title || "Chapter Note"}
+              </Text>
+              <Text numberOfLines={1} style={styles.noteReaderTopSubtitle}>
+                {noteReader.note?.subjectTitle || "Subject"}
+              </Text>
+            </View>
+
+            <TouchableOpacity style={styles.noteReaderEditBtn} onPress={openProfileNoteEditorFromReader}>
+              <Text style={styles.noteReaderEditText}>Edit</Text>
+            </TouchableOpacity>
+          </View>
+
+          <ScrollView contentContainerStyle={styles.noteReaderScroll} showsVerticalScrollIndicator={false}>
+            <View style={styles.noteReaderHero}>
+              <View style={styles.noteReaderHeaderRow}>
+                <View style={styles.noteReaderTypePill}>
+                  <Ionicons name="time-outline" size={12} color={PRIMARY} />
+                  <Text style={styles.noteReaderTypeText}>
+                    {formatNoteDate(noteReader.note?.updatedAt || noteReader.note?.createdAt)}
+                  </Text>
+                </View>
+
+                {noteReader.note?.pinned ? (
+                  <View style={styles.noteReaderPinnedPill}>
+                    <Ionicons name="pin" size={12} color={PRIMARY} />
+                    <Text style={styles.noteReaderPinnedText}>Pinned</Text>
+                  </View>
+                ) : null}
+              </View>
+
+              <Text style={styles.noteReaderTitle}>
+                {noteReader.note?.title || `${noteReader.note?.unitTitle || "Chapter"} Note`}
+              </Text>
+            </View>
+
+            <View style={[styles.noteReaderBodyCard, { backgroundColor: noteReader.note?.colorTag || "#F8FBFF" }]}>
+              <View style={styles.noteReaderBodyHeader}>
+                <Ionicons name="create-outline" size={15} color={PRIMARY} />
+                <Text style={styles.noteReaderBodyLabel}>Note Content</Text>
+              </View>
+              <View style={styles.noteReaderDivider} />
+              <Text
+                selectable
+                style={[
+                  styles.noteReaderBodyText,
+                  !noteReader.note?.text && styles.noteReaderBodyTextEmpty,
+                ]}
+              >
+                {noteReader.note?.text || "No saved note content yet."}
+              </Text>
+            </View>
+          </ScrollView>
+        </SafeAreaView>
       </Modal>
 
       <Modal visible={scheduleVisible} transparent animationType="none" onRequestClose={closeScheduleSheet}>
@@ -668,56 +1280,167 @@ export default function ProfileScreen() {
           </Animated.View>
         </View>
       </Modal>
+
     </SafeAreaView>
   );
 }
 
-function MiniPill({ icon, text }) {
+function MiniPill({ icon, text, compact = false, styles, onPress }) {
+  const iconColor = compact ? PRIMARY : "#F8FAFC";
+  const Container = onPress ? TouchableOpacity : View;
   return (
-    <View style={styles.miniPill}>
-      <Ionicons name={icon} size={13} color={PRIMARY} />
-      <Text style={styles.miniPillText}>{text}</Text>
+    <Container
+      style={[styles.miniPill, compact && styles.miniPillCompact]}
+      {...(onPress
+        ? {
+            onPress,
+            activeOpacity: 0.85,
+          }
+        : {})}
+    >
+      <MaterialCommunityIcons name={icon} size={compact ? 10 : 13} color={iconColor} />
+      <Text style={[styles.miniPillText, compact && styles.miniPillTextCompact]}>{text}</Text>
+    </Container>
+  );
+}
+
+function SwipeableProfileNoteCard({ note, onOpen, onEdit, onDelete, styles, colors }) {
+  const translateX = useRef(new Animated.Value(0)).current;
+  const openRef = useRef(false);
+  const [isOpen, setIsOpen] = useState(false);
+  const ACTION_WIDTH = 116;
+
+  const animateTo = useCallback((toValue) => {
+    openRef.current = toValue < 0;
+    setIsOpen(toValue < 0);
+    Animated.spring(translateX, {
+      toValue,
+      useNativeDriver: true,
+      bounciness: 0,
+      speed: 18,
+    }).start();
+  }, [translateX]);
+
+  const panResponder = useRef(
+    PanResponder.create({
+      onMoveShouldSetPanResponder: (_, gestureState) => {
+        return Math.abs(gestureState.dx) > 10 && Math.abs(gestureState.dx) > Math.abs(gestureState.dy);
+      },
+      onPanResponderMove: (_, gestureState) => {
+        const nextX = openRef.current
+          ? Math.min(0, Math.max(-ACTION_WIDTH, -ACTION_WIDTH + gestureState.dx))
+          : Math.min(0, Math.max(-ACTION_WIDTH, gestureState.dx));
+        translateX.setValue(nextX);
+      },
+      onPanResponderRelease: (_, gestureState) => {
+        const shouldOpen = openRef.current
+          ? gestureState.dx < 28
+          : gestureState.dx < -36;
+        animateTo(shouldOpen ? -ACTION_WIDTH : 0);
+      },
+      onPanResponderTerminate: () => {
+        animateTo(openRef.current ? -ACTION_WIDTH : 0);
+      },
+    })
+  ).current;
+
+  return (
+    <View style={styles.noteSwipeRow}>
+      <View pointerEvents={isOpen ? "auto" : "none"} style={styles.noteSwipeActions}>
+        <TouchableOpacity
+          style={[styles.noteSwipeActionBtn, styles.noteSwipeEditBtn]}
+          activeOpacity={0.9}
+          onPress={() => {
+            if (!openRef.current) return;
+            onEdit();
+          }}
+        >
+          <Ionicons name="create-outline" size={16} color="#fff" />
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[styles.noteSwipeActionBtn, styles.noteSwipeDeleteBtn]}
+          activeOpacity={0.9}
+          onPress={() => {
+            if (!openRef.current) return;
+            onDelete();
+          }}
+        >
+          <Ionicons name="trash-outline" size={16} color="#fff" />
+        </TouchableOpacity>
+      </View>
+
+      <Animated.View
+        style={[
+          styles.noteSwipeCardWrap,
+          { transform: [{ translateX }] },
+        ]}
+        {...panResponder.panHandlers}
+      >
+        <TouchableOpacity
+          style={styles.noteItemRow}
+          activeOpacity={0.9}
+          onPress={() => {
+            if (openRef.current) {
+              animateTo(0);
+              return;
+            }
+            onOpen();
+          }}
+        >
+          <View style={styles.noteItemMainTap}>
+            <View style={styles.noteItemBadge}>
+              <Ionicons name="document-text-outline" size={15} color={colors.primary} />
+            </View>
+            <View style={styles.noteItemTextWrap}>
+              <View style={styles.noteItemTopLine}>
+                <Text numberOfLines={1} style={styles.noteItemTitle}>{note.title}</Text>
+                {note.pinned ? (
+                  <View style={styles.notePinnedPill}>
+                    <Ionicons name="pin" size={10} color={colors.primary} />
+                  </View>
+                ) : null}
+              </View>
+            </View>
+          </View>
+
+          <View style={styles.noteSwipeHint}>
+            <Ionicons name="chevron-back" size={11} color={colors.muted} />
+            <Text style={styles.noteSwipeHintText}>Swipe left</Text>
+          </View>
+        </TouchableOpacity>
+      </Animated.View>
     </View>
   );
 }
 
-function ActionRow({ icon, title, subtitle, onPress }) {
+function ActionRow({ icon, title, subtitle, onPress, styles, colors }) {
   return (
     <TouchableOpacity style={styles.actionRow} onPress={onPress} activeOpacity={0.8}>
       <View style={styles.iconWrap}>
-        <Ionicons name={icon} size={18} color={PRIMARY} />
+        <Ionicons name={icon} size={18} color={colors.primary} />
       </View>
       <View style={{ flex: 1 }}>
         <Text style={styles.actionTitle}>{title}</Text>
         <Text style={styles.actionSub}>{subtitle}</Text>
       </View>
-      <Ionicons name="chevron-forward" size={18} color={MUTED} />
+      <Ionicons name="chevron-forward" size={18} color={colors.muted} />
     </TouchableOpacity>
   );
 }
 
-function Divider() {
-  return <View style={styles.divider} />;
-}
+function createStyles(colors) {
+  const BG = colors.background;
+  const CARD = colors.card;
+  const TEXT = colors.text;
+  const MUTED = colors.muted;
+  const BORDER = colors.border;
+  const SOFT = colors.soft;
 
-const styles = StyleSheet.create({
+  return StyleSheet.create({
   safe: { flex: 1, backgroundColor: BG },
   scroll: { padding: 14, paddingBottom: 28, paddingTop: 0 },
   center: { alignItems: "center", justifyContent: "center" },
-
-  backWrap: {
-    position: "absolute",
-    left: 12,
-    zIndex: 50,
-  },
-  backBtn: {
-    width: 38,
-    height: 38,
-    borderRadius: 19,
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: "rgba(0,0,0,0.35)",
-  },
 
   stretchContainer: {
     position: "absolute",
@@ -726,64 +1449,224 @@ const styles = StyleSheet.create({
     width: SCREEN_WIDTH,
     zIndex: 20,
     overflow: "hidden",
-    backgroundColor: "#DDEBFF",
+    backgroundColor: colors.soft,
   },
   stretchImage: {
     width: "100%",
     height: "100%",
     resizeMode: "cover",
   },
+  stretchFill: {
+    flex: 1,
+    backgroundColor: "#991B1B",
+  },
 
   heroCard: {
-    marginTop: 10,
+    marginTop: 0,
+    marginHorizontal: -14,
     backgroundColor: CARD,
-    borderRadius: 22,
-    padding: 18,
-    alignItems: "center",
+    borderRadius: 0,
     marginBottom: 12,
     zIndex: 3,
-    borderWidth: 1,
-    borderColor: BORDER,
+    borderWidth: 0,
+    overflow: "hidden",
   },
-  avatarWrap: { position: "relative" },
-  avatar: { width: 96, height: 96, borderRadius: 48, backgroundColor: "#EEF3FF" },
+  heroBanner: {
+    height: 110,
+    backgroundColor: "#7F1D1D",
+    position: "relative",
+    overflow: "hidden",
+    borderTopLeftRadius: 0,
+    borderTopRightRadius: 0,
+    borderBottomLeftRadius: 0,
+    borderBottomRightRadius: 0,
+  },
+  heroBannerImage: {
+    width: "100%",
+    height: "100%",
+    resizeMode: "cover",
+  },
+  heroBannerFallback: {
+    flex: 1,
+    backgroundColor: "#991B1B",
+    overflow: "hidden",
+  },
+  heroBannerOrbPrimary: {
+    position: "absolute",
+    width: 180,
+    height: 180,
+    borderRadius: 90,
+    backgroundColor: "rgba(248,113,113,0.30)",
+    top: -40,
+    right: -20,
+  },
+  heroBannerOrbSecondary: {
+    position: "absolute",
+    width: 160,
+    height: 160,
+    borderRadius: 80,
+    backgroundColor: "rgba(255,255,255,0.10)",
+    bottom: -60,
+    left: -20,
+  },
+  heroBannerOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "rgba(69,10,10,0.22)",
+  },
+  heroTopBar: {
+    position: "absolute",
+    top: 10,
+    left: 12,
+    right: 12,
+    zIndex: 30,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  heroTopActions: {
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  heroTopIconBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(15,23,42,0.38)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.16)",
+  },
+  heroTopTitle: {
+    color: "#F8FAFC",
+    fontSize: 14,
+    fontWeight: "800",
+    letterSpacing: 0.2,
+    flex: 1,
+    textAlign: "center",
+    marginHorizontal: 12,
+  },
+  heroAvatarSlot: {
+    paddingHorizontal: 18,
+    marginTop: -44,
+  },
+  avatarWrap: { position: "relative", alignSelf: "flex-start" },
+  avatar: {
+    width: 96,
+    height: 96,
+    borderRadius: 48,
+    backgroundColor: colors.soft,
+    borderWidth: 4,
+    borderColor: colors.white,
+  },
   editAvatarBtn: {
     position: "absolute",
-    right: -2,
-    bottom: -2,
-    width: 30,
-    height: 30,
-    borderRadius: 15,
+    right: 2,
+    bottom: 2,
+    width: 32,
+    height: 32,
+    borderRadius: 16,
     backgroundColor: PRIMARY,
     alignItems: "center",
     justifyContent: "center",
     borderWidth: 2,
-    borderColor: "#fff",
+    borderColor: colors.white,
   },
-  name: { marginTop: 12, fontSize: 20, fontWeight: "800", color: TEXT },
-  subText: { marginTop: 4, fontSize: 13, color: MUTED, textAlign: "center" },
-
+  heroIdentityBlock: {
+    marginTop: -6,
+    marginHorizontal: 14,
+    paddingHorizontal: 4,
+    paddingVertical: 2,
+  },
+  identityTopRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "flex-start",
+  },
+  name: { fontSize: 21, fontWeight: "800", color: TEXT },
+  editProfileBtn: {
+    marginTop: 10,
+    width: "100%",
+    backgroundColor: "#5865F2",
+    borderRadius: 8,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    minHeight: 36,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  editProfileText: {
+    color: colors.white,
+    fontSize: 13,
+    fontWeight: "700",
+  },
+  profileFilterRow: {
+    flexDirection: "row",
+    backgroundColor: colors.inputBackground,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 12,
+    padding: 4,
+    marginTop: 10,
+  },
+  profileFilterBtn: {
+    flex: 1,
+    height: 36,
+    borderRadius: 10,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  profileFilterBtnActive: {
+    backgroundColor: colors.card,
+    borderWidth: 1,
+    borderColor: colors.primary,
+  },
+  profileFilterText: {
+    fontSize: 13,
+    fontWeight: "700",
+    color: colors.muted,
+  },
+  profileFilterTextActive: {
+    color: colors.text,
+  },
+  subRow: {
+    marginTop: 4,
+    flexDirection: "row",
+    alignItems: "center",
+    flexWrap: "wrap",
+  },
+  subText: { fontSize: 11, color: MUTED, fontWeight: "600", marginRight: 8 },
   heroQuickStats: {
     flexDirection: "row",
-    flexWrap: "wrap",
-    justifyContent: "center",
-    marginTop: 12,
+    alignItems: "center",
+    marginRight: 8,
   },
   miniPill: {
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: SOFT,
+    backgroundColor: "rgba(15,23,42,0.55)",
     paddingHorizontal: 10,
-    paddingVertical: 7,
+    paddingVertical: 6,
     borderRadius: 999,
-    marginHorizontal: 4,
-    marginTop: 6,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.14)",
+  },
+  miniPillCompact: {
+    backgroundColor: SOFT,
+    paddingHorizontal: 6,
+    paddingVertical: 3,
+    borderColor: colors.border,
   },
   miniPillText: {
-    marginLeft: 6,
-    color: PRIMARY,
-    fontSize: 12,
+    marginLeft: 5,
+    color: "#F8FAFC",
+    fontSize: 11,
     fontWeight: "700",
+  },
+  miniPillTextCompact: {
+    marginLeft: 3,
+    fontSize: 9,
+    color: PRIMARY,
   },
 
   card: {
@@ -798,7 +1681,7 @@ const styles = StyleSheet.create({
   sectionTitle: { fontSize: 16, fontWeight: "800", color: TEXT, marginBottom: 10 },
 
   scheduleCard: {
-    backgroundColor: "#FAFCFF",
+    backgroundColor: colors.inputBackground,
     borderRadius: 16,
     borderWidth: 1,
     borderColor: BORDER,
@@ -831,7 +1714,7 @@ const styles = StyleSheet.create({
   schedulePreviewWrap: {
     marginTop: 12,
     borderTopWidth: 1,
-    borderTopColor: "#EEF2FA",
+    borderTopColor: colors.separator,
     paddingTop: 10,
   },
   previewRow: {
@@ -857,14 +1740,14 @@ const styles = StyleSheet.create({
     width: 34,
     height: 34,
     borderRadius: 10,
-    backgroundColor: "#EEF5FF",
+    backgroundColor: colors.soft,
     alignItems: "center",
     justifyContent: "center",
     marginRight: 10,
   },
   actionTitle: { fontSize: 14, fontWeight: "700", color: TEXT },
   actionSub: { fontSize: 12, color: MUTED, marginTop: 2 },
-  divider: { height: 1, backgroundColor: "#EEF2FA", marginLeft: 44 },
+  divider: { height: 1, backgroundColor: colors.separator, marginLeft: 44 },
 
   eventRow: { flexDirection: "row", alignItems: "flex-start", paddingVertical: 9 },
   eventDot: { width: 8, height: 8, borderRadius: 4, marginTop: 7, marginRight: 10 },
@@ -885,7 +1768,7 @@ const styles = StyleSheet.create({
     fontWeight: "800",
   },
   eventMeta: { marginTop: 3, fontSize: 12, color: MUTED },
-  eventNotes: { marginTop: 3, fontSize: 12, color: "#445A8A" },
+  eventNotes: { marginTop: 3, fontSize: 12, color: colors.muted },
   emptyText: { color: MUTED, fontSize: 13, paddingVertical: 4 },
 
   logoutBtn: {
@@ -897,33 +1780,31 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
-  logoutText: { color: "#fff", fontWeight: "800", marginLeft: 8 },
-
-  footer: { marginTop: 16, textAlign: "center", color: MUTED, fontSize: 12 },
+  logoutText: { color: colors.white, fontWeight: "800", marginLeft: 8 },
 
   modalBg: {
     flex: 1,
-    backgroundColor: "rgba(0,0,0,0.35)",
+    backgroundColor: colors.overlay,
     alignItems: "center",
     justifyContent: "center",
     padding: 20,
   },
   modalCard: {
     width: "100%",
-    backgroundColor: "#fff",
+    backgroundColor: colors.panel,
     borderRadius: 14,
     padding: 14,
   },
   modalTitle: { fontSize: 16, fontWeight: "800", color: TEXT, marginBottom: 10 },
   input: {
     borderWidth: 1,
-    borderColor: "#E4EBFA",
+    borderColor: colors.border,
     borderRadius: 10,
     height: 44,
     paddingHorizontal: 12,
     marginBottom: 10,
     color: TEXT,
-    backgroundColor: "#FAFCFF",
+    backgroundColor: colors.inputBackground,
   },
   modalActions: { flexDirection: "row", justifyContent: "flex-end", marginTop: 4 },
   modalBtn: {
@@ -934,21 +1815,423 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     marginLeft: 8,
   },
-  cancelBtn: { backgroundColor: "#EFF3FB" },
+  cancelBtn: { backgroundColor: colors.surfaceMuted },
   saveBtn: { backgroundColor: PRIMARY },
-  cancelText: { color: "#445A8A", fontWeight: "700" },
-  saveText: { color: "#fff", fontWeight: "700" },
+  cancelText: { color: colors.text, fontWeight: "700" },
+  saveText: { color: colors.white, fontWeight: "700" },
+
+  editOptionBtn: {
+    height: 46,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.inputBackground,
+    paddingHorizontal: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 10,
+  },
+  editOptionText: {
+    marginLeft: 10,
+    fontSize: 14,
+    fontWeight: "700",
+    color: TEXT,
+  },
+  editOptionCancel: {
+    marginBottom: 0,
+    backgroundColor: colors.surfaceMuted,
+  },
+  editOptionCancelText: {
+    color: MUTED,
+  },
+  noteSectionCard: {
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.inputBackground,
+    padding: 14,
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  noteSectionIconWrap: {
+    width: 42,
+    height: 42,
+    borderRadius: 12,
+    backgroundColor: colors.soft,
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 12,
+  },
+  noteSectionTitle: {
+    fontSize: 14,
+    fontWeight: "800",
+    color: TEXT,
+  },
+  noteSectionText: {
+    marginTop: 3,
+    fontSize: 12,
+    color: MUTED,
+  },
+  noteStateCard: {
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.inputBackground,
+    paddingVertical: 18,
+    paddingHorizontal: 14,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  noteStateText: {
+    marginTop: 8,
+    fontSize: 12,
+    color: MUTED,
+    fontWeight: "600",
+  },
+  noteSubjectCard: {
+    backgroundColor: CARD,
+    borderRadius: 16,
+    marginBottom: 8,
+    borderWidth: 1,
+    borderColor: colors.border,
+    overflow: "hidden",
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.025,
+    shadowRadius: 10,
+    elevation: 1,
+  },
+  noteSubjectCardSelected: {
+    borderColor: colors.primary,
+    shadowColor: PRIMARY,
+    shadowOpacity: 0.05,
+    elevation: 2,
+  },
+  noteSubjectHeader: {
+    paddingHorizontal: 11,
+    paddingVertical: 10,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  noteSubjectHeaderExpanded: {
+    backgroundColor: colors.inputBackground,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.separator,
+  },
+  noteSubjectHeaderLeft: {
+    flexDirection: "row",
+    alignItems: "center",
+    flex: 1,
+  },
+  noteSubjectCover: {
+    width: 42,
+    height: 54,
+    borderRadius: 10,
+    backgroundColor: colors.surfaceMuted,
+  },
+  noteSubjectIconContainer: {
+    justifyContent: "center",
+    alignItems: "center",
+    backgroundColor: colors.surfaceMuted,
+    borderWidth: 1,
+    borderColor: colors.separator,
+  },
+  noteSubjectInfoWrap: {
+    marginLeft: 8,
+    flex: 1,
+  },
+  noteSubjectName: {
+    fontWeight: "900",
+    fontSize: 14,
+    color: TEXT,
+  },
+  noteSubjectSub: {
+    color: colors.muted,
+    marginTop: 2,
+    fontSize: 10,
+    fontWeight: "700",
+  },
+  noteSubjectToggle: {
+    width: 26,
+    height: 26,
+    borderRadius: 9,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.inputBackground,
+    alignItems: "center",
+    justifyContent: "center",
+    marginLeft: 6,
+  },
+  noteSubjectToggleActive: {
+    borderColor: colors.primary,
+    backgroundColor: colors.soft,
+  },
+  noteUnitsContainer: {
+    paddingHorizontal: 14,
+    paddingTop: 10,
+    paddingBottom: 12,
+    backgroundColor: colors.inputBackground,
+  },
+  noteSwipeRow: {
+    marginTop: 6,
+    position: "relative",
+  },
+  noteSwipeActions: {
+    position: "absolute",
+    top: 0,
+    right: 0,
+    bottom: 0,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "flex-end",
+    gap: 8,
+    paddingRight: 2,
+  },
+  noteSwipeCardWrap: {
+    zIndex: 2,
+  },
+  noteSwipeActionBtn: {
+    width: 42,
+    height: 42,
+    borderRadius: 14,
+    alignItems: "center",
+    justifyContent: "center",
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.12,
+    shadowRadius: 12,
+    elevation: 4,
+  },
+  noteSwipeEditBtn: {
+    backgroundColor: PRIMARY,
+  },
+  noteSwipeDeleteBtn: {
+    backgroundColor: "#EF4444",
+  },
+  noteItemRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingVertical: 9,
+    paddingHorizontal: 8,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 14,
+    backgroundColor: colors.card,
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.018,
+    shadowRadius: 6,
+    elevation: 0,
+  },
+  noteItemMainTap: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  noteItemBadge: {
+    width: 26,
+    height: 26,
+    borderRadius: 13,
+    backgroundColor: colors.soft,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  noteItemTextWrap: {
+    flex: 1,
+    marginLeft: 8,
+    paddingRight: 8,
+  },
+  noteItemTopLine: {
+    flexDirection: "row",
+    alignItems: "center",
+    flexWrap: "nowrap",
+  },
+  noteItemTitle: {
+    flex: 1,
+    fontSize: 13,
+    fontWeight: "800",
+    color: colors.text,
+    marginRight: 6,
+  },
+  notePinnedPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: colors.soft,
+    paddingHorizontal: 6,
+    paddingVertical: 3,
+    borderRadius: 999,
+  },
+  noteSwipeHint: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "flex-end",
+    paddingLeft: 8,
+    marginLeft: 10,
+    opacity: 0.85,
+  },
+  noteSwipeHintText: {
+    marginLeft: 3,
+    fontSize: 8,
+    color: MUTED,
+    fontWeight: "700",
+  },
+
+  noteReaderScreen: {
+    flex: 1,
+    backgroundColor: colors.screen,
+  },
+  noteReaderTopBar: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 16,
+    paddingTop: 10,
+    paddingBottom: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.border,
+    backgroundColor: colors.card,
+  },
+  noteReaderIconBtn: {
+    width: 42,
+    height: 42,
+    borderRadius: 14,
+    backgroundColor: colors.card,
+    borderWidth: 1,
+    borderColor: colors.border,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  noteReaderTopText: {
+    flex: 1,
+    marginHorizontal: 12,
+  },
+  noteReaderUnitTitle: {
+    fontSize: 16,
+    fontWeight: "900",
+    color: TEXT,
+  },
+  noteReaderTopSubtitle: {
+    marginTop: 2,
+    fontSize: 12,
+    color: MUTED,
+    fontWeight: "600",
+  },
+  noteReaderEditBtn: {
+    minWidth: 58,
+    height: 42,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.inputBackground,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 14,
+  },
+  noteReaderEditText: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: PRIMARY,
+  },
+  noteReaderScroll: {
+    padding: 16,
+    paddingBottom: 40,
+  },
+  noteReaderHero: {
+    borderRadius: 18,
+    backgroundColor: colors.card,
+    borderWidth: 1,
+    borderColor: colors.border,
+    padding: 16,
+    marginBottom: 12,
+  },
+  noteReaderHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 12,
+  },
+  noteReaderTypePill: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: colors.soft,
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  noteReaderTypeText: {
+    marginLeft: 6,
+    fontSize: 11,
+    fontWeight: "800",
+    color: MUTED,
+  },
+  noteReaderPinnedPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: colors.surfaceMuted,
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+    gap: 4,
+  },
+  noteReaderPinnedText: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: MUTED,
+  },
+  noteReaderTitle: {
+    fontSize: 21,
+    lineHeight: 29,
+    fontWeight: "900",
+    color: TEXT,
+  },
+  noteReaderBodyCard: {
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: colors.border,
+    paddingHorizontal: 16,
+    paddingTop: 14,
+    paddingBottom: 20,
+    minHeight: 260,
+  },
+  noteReaderBodyHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 7,
+  },
+  noteReaderBodyLabel: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: PRIMARY,
+    textTransform: "uppercase",
+    letterSpacing: 0.4,
+  },
+  noteReaderDivider: {
+    height: 1,
+    backgroundColor: colors.separator,
+    marginTop: 12,
+    marginBottom: 14,
+  },
+  noteReaderBodyText: {
+    fontSize: 15,
+    lineHeight: 26,
+    color: TEXT,
+    fontWeight: "500",
+  },
+  noteReaderBodyTextEmpty: {
+    color: MUTED,
+    fontStyle: "italic",
+  },
 
   sheetOverlay: {
     flex: 1,
     justifyContent: "flex-end",
-    backgroundColor: "rgba(0,0,0,0.28)",
+    backgroundColor: colors.overlay,
   },
   sheetBackdrop: {
     flex: 1,
   },
   sheetContainer: {
-    backgroundColor: "#fff",
+    backgroundColor: colors.card,
     borderTopLeftRadius: 24,
     borderTopRightRadius: 24,
     paddingHorizontal: 16,
@@ -959,7 +2242,7 @@ const styles = StyleSheet.create({
     width: 42,
     height: 5,
     borderRadius: 999,
-    backgroundColor: "#D7DFEE",
+    backgroundColor: colors.border,
     alignSelf: "center",
     marginBottom: 12,
   },
@@ -984,7 +2267,7 @@ const styles = StyleSheet.create({
     width: 36,
     height: 36,
     borderRadius: 12,
-    backgroundColor: "#F7FAFF",
+    backgroundColor: colors.inputBackground,
     borderWidth: 1,
     borderColor: BORDER,
     alignItems: "center",
@@ -997,11 +2280,11 @@ const styles = StyleSheet.create({
     borderColor: BORDER,
     borderRadius: 16,
     padding: 12,
-    backgroundColor: "#fff",
+    backgroundColor: colors.card,
   },
   daySectionToday: {
-    backgroundColor: "#F8FBFF",
-    borderColor: "#D9E9FF",
+    backgroundColor: colors.inputBackground,
+    borderColor: colors.primary,
   },
   daySectionHeader: {
     flexDirection: "row",
@@ -1030,11 +2313,11 @@ const styles = StyleSheet.create({
     alignItems: "center",
     paddingVertical: 8,
     borderTopWidth: 1,
-    borderTopColor: "#F2F5FB",
+    borderTopColor: colors.separator,
   },
   periodBadge: {
     minWidth: 64,
-    backgroundColor: "#EEF4FF",
+    backgroundColor: colors.soft,
     borderRadius: 10,
     paddingHorizontal: 8,
     paddingVertical: 7,
@@ -1062,4 +2345,6 @@ const styles = StyleSheet.create({
     fontWeight: "600",
     paddingTop: 4,
   },
-});
+
+  });
+}

@@ -16,6 +16,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { ref, get } from "firebase/database";
 import { database } from "../constants/firebaseConfig";
 import { getSnapshot } from "./lib/dbHelpers";
+import { useAppTheme } from "../hooks/use-app-theme";
 
 const PRIMARY = "#0B72FF";
 const MUTED = "#6B78A8";
@@ -122,6 +123,8 @@ export default function SubjectAssessmentsScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const params = useLocalSearchParams();
+  const { colors } = useAppTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
   const { courseId, subject, grade, section, returnTo, returnExamFilter } = params;
 
   const handleBackNavigation = useCallback(() => {
@@ -218,7 +221,7 @@ export default function SubjectAssessmentsScreen() {
 
   if (loading) {
     return (
-      <SafeAreaView style={[styles.center, { paddingTop: insets.top, backgroundColor: BG }]}>
+      <SafeAreaView style={[styles.center, { paddingTop: insets.top }]}>
         <ActivityIndicator color={PRIMARY} size="large" />
       </SafeAreaView>
     );
@@ -389,9 +392,10 @@ export default function SubjectAssessmentsScreen() {
   );
 }
 
-const styles = StyleSheet.create({
-  screen: { flex: 1, backgroundColor: BG },
-  center: { flex: 1, alignItems: "center", justifyContent: "center" },
+function createStyles(colors) {
+  return StyleSheet.create({
+  screen: { flex: 1, backgroundColor: colors.background },
+  center: { flex: 1, alignItems: "center", justifyContent: "center", backgroundColor: colors.background },
 
   header: {
     paddingHorizontal: 16,
@@ -408,11 +412,11 @@ const styles = StyleSheet.create({
   headerTitle: {
     fontSize: 18,
     fontWeight: "900",
-    color: TEXT,
+    color: colors.text,
   },
   headerSubtitle: {
     marginTop: 2,
-    color: MUTED,
+    color: colors.muted,
     fontSize: 12,
     fontWeight: "700",
   },
@@ -420,7 +424,7 @@ const styles = StyleSheet.create({
     width: 34,
     height: 34,
     borderRadius: 10,
-    backgroundColor: "#F7F9FF",
+    backgroundColor: colors.inputBackground,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -428,9 +432,9 @@ const styles = StyleSheet.create({
     width: 34,
     height: 34,
     borderRadius: 10,
-    backgroundColor: "#F7F9FF",
+    backgroundColor: colors.inputBackground,
     borderWidth: 1,
-    borderColor: "#EAF0FF",
+    borderColor: colors.border,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -443,8 +447,8 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     borderRadius: 22,
     borderWidth: 1,
-    borderColor: "#DDE9FF",
-    backgroundColor: "#F8FBFF",
+    borderColor: colors.border,
+    backgroundColor: colors.panel,
     overflow: "hidden",
   },
   heroGlowA: {
@@ -476,9 +480,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
     paddingVertical: 6,
     borderRadius: 999,
-    backgroundColor: "#EDF4FF",
+    backgroundColor: colors.soft,
     borderWidth: 1,
-    borderColor: "#D8E7FF",
+    borderColor: colors.border,
   },
   heroChipText: {
     marginLeft: 6,
@@ -490,17 +494,17 @@ const styles = StyleSheet.create({
     marginTop: 6,
     fontSize: 18,
     fontWeight: "900",
-    color: TEXT,
+    color: colors.text,
   },
   heroSubTitle: {
     marginTop: 4,
     fontSize: 12,
-    color: MUTED,
+    color: colors.muted,
     fontWeight: "700",
   },
   heroText: {
     marginTop: 2,
-    color: MUTED,
+    color: colors.muted,
     fontSize: 12,
     lineHeight: 16,
   },
@@ -513,18 +517,18 @@ const styles = StyleSheet.create({
   statCard: {
     flex: 1,
     marginRight: 10,
-    backgroundColor: CARD,
+    backgroundColor: colors.card,
     borderWidth: 1,
-    borderColor: "#E6EEFD",
+    borderColor: colors.border,
     borderRadius: 14,
     paddingVertical: 8,
     alignItems: "center",
   },
   statCardLast: {
     flex: 1,
-    backgroundColor: CARD,
+    backgroundColor: colors.card,
     borderWidth: 1,
-    borderColor: "#E6EEFD",
+    borderColor: colors.border,
     borderRadius: 14,
     paddingVertical: 8,
     alignItems: "center",
@@ -532,12 +536,12 @@ const styles = StyleSheet.create({
   statValue: {
     fontSize: 17,
     fontWeight: "900",
-    color: TEXT,
+    color: colors.text,
   },
   statLabel: {
     marginTop: 4,
     fontSize: 12,
-    color: MUTED,
+    color: colors.muted,
     fontWeight: "700",
   },
 
@@ -549,12 +553,12 @@ const styles = StyleSheet.create({
   sectionTitle: {
     fontSize: 17,
     fontWeight: "900",
-    color: TEXT,
+    color: colors.text,
   },
   sectionSubtitle: {
     marginTop: 4,
     fontSize: 12,
-    color: MUTED,
+    color: colors.muted,
     fontWeight: "600",
   },
 
@@ -562,17 +566,17 @@ const styles = StyleSheet.create({
     marginHorizontal: 16,
     marginTop: 8,
     borderWidth: 1,
-    borderColor: BORDER,
+    borderColor: colors.border,
     borderRadius: 18,
     padding: 22,
     alignItems: "center",
-    backgroundColor: "#FBFDFF",
+    backgroundColor: colors.card,
   },
   emptyIconWrap: {
     width: 56,
     height: 56,
     borderRadius: 18,
-    backgroundColor: "#F1F5FF",
+    backgroundColor: colors.soft,
     alignItems: "center",
     justifyContent: "center",
     marginBottom: 12,
@@ -580,11 +584,11 @@ const styles = StyleSheet.create({
   emptyTitle: {
     fontSize: 16,
     fontWeight: "900",
-    color: TEXT,
+    color: colors.text,
   },
   emptyText: {
     marginTop: 6,
-    color: MUTED,
+    color: colors.muted,
     textAlign: "center",
     lineHeight: 19,
   },
@@ -593,11 +597,11 @@ const styles = StyleSheet.create({
     marginHorizontal: 16,
     marginBottom: 12,
     borderWidth: 1,
-    borderColor: "#E4ECFA",
+    borderColor: colors.border,
     borderRadius: 16,
     paddingVertical: 12,
     paddingHorizontal: 10,
-    backgroundColor: "#FFFFFF",
+    backgroundColor: colors.card,
     shadowColor: "#0F172A",
     shadowOffset: { width: 0, height: 3 },
     shadowOpacity: 0.018,
@@ -613,7 +617,7 @@ const styles = StyleSheet.create({
     width: 30,
     height: 30,
     borderRadius: 15,
-    backgroundColor: "#EDF4FF",
+    backgroundColor: colors.soft,
     alignItems: "center",
     justifyContent: "center",
     marginRight: 10,
@@ -630,11 +634,11 @@ const styles = StyleSheet.create({
   cardTitle: {
     fontSize: 14,
     fontWeight: "800",
-    color: "#1B2B45",
+    color: colors.text,
   },
   cardMetaPrimary: {
     marginTop: 3,
-    color: MUTED,
+    color: colors.muted,
     fontSize: 12,
     fontWeight: "700",
   },
@@ -659,9 +663,9 @@ const styles = StyleSheet.create({
   metaChip: {
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "#F4F7FD",
+    backgroundColor: colors.inputBackground,
     borderWidth: 1,
-    borderColor: "#E7EDF8",
+    borderColor: colors.border,
     borderRadius: 999,
     paddingHorizontal: 9,
     paddingVertical: 5,
@@ -670,7 +674,7 @@ const styles = StyleSheet.create({
   },
   metaChipText: {
     marginLeft: 6,
-    color: MUTED,
+    color: colors.muted,
     fontSize: 11,
     fontWeight: "700",
   },
@@ -679,7 +683,7 @@ const styles = StyleSheet.create({
     marginTop: 2,
     paddingTop: 10,
     borderTopWidth: 1,
-    borderTopColor: "#F2F5FB",
+    borderTopColor: colors.border,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
@@ -693,14 +697,14 @@ const styles = StyleSheet.create({
     fontSize: 12.5,
   },
   scoreHint: {
-    color: MUTED,
+    color: colors.muted,
     fontWeight: "700",
     fontSize: 11.5,
   },
   openWrap: {
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "#EEF4FF",
+    backgroundColor: colors.soft,
     borderRadius: 999,
     paddingHorizontal: 11,
     paddingVertical: 7,
@@ -712,3 +716,4 @@ const styles = StyleSheet.create({
     fontSize: 11.5,
   },
 });
+}

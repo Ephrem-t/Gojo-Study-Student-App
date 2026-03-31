@@ -17,8 +17,10 @@ import { useRouter, useLocalSearchParams } from "expo-router";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { ref, get } from "firebase/database";
 import { database } from "../../constants/firebaseConfig";
+import { useAppTheme } from "../../hooks/use-app-theme";
 import { queryUserByUsernameInSchool, queryUserByChildInSchool } from "../lib/userHelpers";
 import { getValue, getSnapshot } from "../lib/dbHelpers";
+import { extractProfileImage } from "../lib/profileImage";
 
 const { width: SCREEN_W } = Dimensions.get("window");
 
@@ -26,10 +28,6 @@ const PRIMARY = "#0B72FF";
 const GOLD = "#F2C94C";
 const SILVER = "#C0C6CC";
 const BRONZE = "#D08A3A";
-const BG = "#FFFFFF";
-const TEXT = "#0B2540";
-const MUTED = "#6B78A8";
-const BORDER = "#EAF0FF";
 
 const CARD_W = Math.round(SCREEN_W * 0.78);
 const STORY_AVATAR_SIZE = 54;
@@ -306,6 +304,9 @@ function formatGradeLabel(student) {
 export default function ExamScreen() {
   const router = useRouter();
   const routeParams = useLocalSearchParams();
+  const { colors } = useAppTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
+  const MUTED = colors.muted;
 
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -674,7 +675,7 @@ export default function ExamScreen() {
       name: profile?.name || profile?.username || item.userId,
       rank: Number(item?.rank || 0),
       points: Number(item?.totalPoints || 0),
-      avatar: profile?.profileImage || null,
+      avatar: extractProfileImage(profile),
       grade: formatGradeLabel(details?.student),
       gender,
       school,
@@ -1147,11 +1148,11 @@ export default function ExamScreen() {
                 </View>
 
                 <View style={styles.infoGrid}>
-                  <InfoRow label="Grade" value={selectedProfile?.grade || "-"} />
-                  <InfoRow label="Gender" value={selectedProfile?.gender || "-"} />
-                  <InfoRow label="School" value={selectedProfile?.school || "-"} />
-                  <InfoRow label="Region" value={selectedProfile?.region || "-"} />
-                  <InfoRow label="City" value={selectedProfile?.city || "-"} />
+                  <InfoRow label="Grade" value={selectedProfile?.grade || "-"} styles={styles} />
+                  <InfoRow label="Gender" value={selectedProfile?.gender || "-"} styles={styles} />
+                  <InfoRow label="School" value={selectedProfile?.school || "-"} styles={styles} />
+                  <InfoRow label="Region" value={selectedProfile?.region || "-"} styles={styles} />
+                  <InfoRow label="City" value={selectedProfile?.city || "-"} styles={styles} />
                 </View>
 
                 <TouchableOpacity style={styles.closeBtn} onPress={() => setProfileModalVisible(false)}>
@@ -1203,7 +1204,7 @@ export default function ExamScreen() {
   );
 }
 
-function InfoRow({ label, value }) {
+function InfoRow({ label, value, styles }) {
   return (
     <View style={styles.infoRow}>
       <Text style={styles.infoLabel}>{label}</Text>
@@ -1212,8 +1213,9 @@ function InfoRow({ label, value }) {
   );
 }
 
-const styles = StyleSheet.create({
-  screen: { flex: 1, backgroundColor: BG },
+function createStyles(colors) {
+  return StyleSheet.create({
+  screen: { flex: 1, backgroundColor: colors.background },
   center: { alignItems: "center", justifyContent: "center" },
 
   topFiltersWrap: {
@@ -1228,15 +1230,15 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
     borderRadius: 999,
     borderWidth: 1,
-    borderColor: "#DCE7FF",
-    backgroundColor: "#FFFFFF",
+    borderColor: colors.border,
+    backgroundColor: colors.card,
   },
   topFilterBtnActive: {
-    backgroundColor: "#EEF4FF",
-    borderColor: "#BBD3FF",
+    backgroundColor: colors.soft,
+    borderColor: colors.primary,
   },
   topFilterText: {
-    color: MUTED,
+    color: colors.muted,
     fontSize: 12,
     fontWeight: "700",
   },
@@ -1250,15 +1252,15 @@ const styles = StyleSheet.create({
     marginBottom: 6,
     padding: 16,
     borderRadius: 20,
-    backgroundColor: "#F7FAFF",
+    backgroundColor: colors.panel,
     borderWidth: 1,
-    borderColor: "#E7F0FF",
+    borderColor: colors.border,
   },
   heroBadge: {
     alignSelf: "flex-start",
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "#EEF4FF",
+    backgroundColor: colors.soft,
     borderRadius: 999,
     paddingHorizontal: 10,
     paddingVertical: 6,
@@ -1273,11 +1275,11 @@ const styles = StyleSheet.create({
     marginTop: 12,
     fontSize: 22,
     fontWeight: "900",
-    color: TEXT,
+    color: colors.text,
   },
   heroText: {
     marginTop: 6,
-    color: MUTED,
+    color: colors.muted,
     lineHeight: 20,
     fontSize: 13,
   },
@@ -1291,15 +1293,15 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "flex-end",
   },
-  sectionTitle: { fontSize: 18, fontWeight: "900", color: TEXT },
-  sectionSubtitle: { marginTop: 2, fontSize: 12, color: MUTED },
+  sectionTitle: { fontSize: 18, fontWeight: "900", color: colors.text },
+  sectionSubtitle: { marginTop: 2, fontSize: 12, color: colors.muted },
 
   sectionActionBtn: {
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "#FFFFFF",
+    backgroundColor: colors.card,
     borderWidth: 1,
-    borderColor: "#DCE7FF",
+    borderColor: colors.border,
     paddingHorizontal: 12,
     paddingVertical: 8,
     borderRadius: 12,
@@ -1335,7 +1337,7 @@ const styles = StyleSheet.create({
     borderRadius: (STORY_AVATAR_SIZE + 10) / 2,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "#F4F7FE",
+    backgroundColor: colors.inputBackground,
     position: "relative",
     overflow: "visible",
   },
@@ -1406,7 +1408,7 @@ const styles = StyleSheet.create({
   rankBadgeSilver: { backgroundColor: "#C0C6CC" },
   rankBadgeBronze: { backgroundColor: "#D08A3A" },
   rankBottomBadgeText: { color: "#fff", fontWeight: "900", fontSize: 10 },
-  storyName: { marginTop: 8, width: STORY_AVATAR_SIZE + 8, textAlign: "center", fontSize: 11, color: TEXT },
+  storyName: { marginTop: 8, width: STORY_AVATAR_SIZE + 8, textAlign: "center", fontSize: 11, color: colors.text },
   storyTieStackWrap: {
     marginTop: 5,
     flexDirection: "row",
@@ -1418,8 +1420,8 @@ const styles = StyleSheet.create({
     height: 18,
     borderRadius: 9,
     borderWidth: 1,
-    borderColor: "#fff",
-    backgroundColor: "#fff",
+    borderColor: colors.border,
+    backgroundColor: colors.card,
     overflow: "hidden",
   },
   storyTieAvatar: {
@@ -1442,17 +1444,17 @@ const styles = StyleSheet.create({
   },
   storyTieText: {
     marginLeft: 5,
-    color: MUTED,
+    color: colors.muted,
     fontSize: 10,
     fontWeight: "800",
   },
 
   challengeCard: {
     width: CARD_W,
-    backgroundColor: "#fff",
+    backgroundColor: colors.card,
     borderRadius: 20,
     borderWidth: 1,
-    borderColor: BORDER,
+    borderColor: colors.border,
     padding: 14,
     shadowColor: "#000",
     shadowOpacity: 0.05,
@@ -1468,7 +1470,7 @@ const styles = StyleSheet.create({
     width: 58,
     height: 58,
     borderRadius: 14,
-    backgroundColor: "#F1F5FF",
+    backgroundColor: colors.inputBackground,
   },
   challengeIconFallback: {
     width: 58,
@@ -1476,12 +1478,12 @@ const styles = StyleSheet.create({
     borderRadius: 14,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "#EEF4FF",
+    backgroundColor: colors.soft,
   },
   challengePill: {
-    backgroundColor: "#F7FAFF",
+    backgroundColor: colors.inputBackground,
     borderWidth: 1,
-    borderColor: BORDER,
+    borderColor: colors.border,
     paddingHorizontal: 10,
     paddingVertical: 6,
     borderRadius: 999,
@@ -1497,13 +1499,13 @@ const styles = StyleSheet.create({
     marginTop: 14,
     fontSize: 17,
     fontWeight: "900",
-    color: TEXT,
+    color: colors.text,
   },
   challengeDesc: {
     marginTop: 6,
     fontSize: 12,
     lineHeight: 18,
-    color: MUTED,
+    color: colors.muted,
   },
   challengeFooter: {
     marginTop: 14,
@@ -1514,7 +1516,7 @@ const styles = StyleSheet.create({
   challengeMetaBadge: {
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "#EEF4FF",
+    backgroundColor: colors.soft,
     paddingHorizontal: 10,
     paddingVertical: 7,
     borderRadius: 999,
@@ -1533,9 +1535,9 @@ const styles = StyleSheet.create({
     width: "100%",
     marginBottom: 12,
     borderRadius: 22,
-    borderColor: "#E5EDFF",
+    borderColor: colors.border,
     borderWidth: 1,
-    backgroundColor: "#FFFFFF",
+    backgroundColor: colors.card,
     shadowColor: "#1D4ED8",
     shadowOffset: { width: 0, height: 8 },
     shadowOpacity: 0.07,
@@ -1557,16 +1559,16 @@ const styles = StyleSheet.create({
   practiceIconImage: {
     borderRadius: 16,
     borderWidth: 1,
-    borderColor: "#E6EEFF",
+    borderColor: colors.border,
   },
   practiceIconFallback: {
     borderRadius: 16,
     borderWidth: 1,
-    borderColor: "#E6EEFF",
+    borderColor: colors.border,
   },
   practicePill: {
-    backgroundColor: "#EEF4FF",
-    borderColor: "#D8E6FF",
+    backgroundColor: colors.soft,
+    borderColor: colors.border,
   },
   practicePillText: {
     letterSpacing: 0.2,
@@ -1583,9 +1585,9 @@ const styles = StyleSheet.create({
     marginTop: 12,
   },
   practiceMetaBadge: {
-    backgroundColor: "#EEF4FF",
+    backgroundColor: colors.soft,
     borderWidth: 1,
-    borderColor: "#DCE8FF",
+    borderColor: colors.border,
   },
   practiceMetaText: {
     fontWeight: "900",
@@ -1597,8 +1599,8 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
     borderWidth: 1,
-    borderColor: "#DCE8FF",
-    backgroundColor: "#F8FBFF",
+    borderColor: colors.border,
+    backgroundColor: colors.inputBackground,
   },
 
   onlineListWrap: {
@@ -1607,10 +1609,10 @@ const styles = StyleSheet.create({
   },
   onlineListItemWrap: {
     marginBottom: 16,
-    backgroundColor: "#FFFFFF",
+    backgroundColor: colors.card,
     borderRadius: 22,
     borderWidth: 1,
-    borderColor: "#E7EDF8",
+    borderColor: colors.border,
     overflow: "hidden",
     shadowColor: "#0F172A",
     shadowOffset: { width: 0, height: 6 },
@@ -1626,9 +1628,9 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
   },
   onlineListItemExpanded: {
-    backgroundColor: "#FCFDFF",
+    backgroundColor: colors.inputBackground,
     borderBottomWidth: 1,
-    borderBottomColor: "#EAF0FB",
+    borderBottomColor: colors.border,
   },
   onlineListLeft: {
     flexDirection: "row",
@@ -1640,15 +1642,15 @@ const styles = StyleSheet.create({
     width: 40,
     height: 40,
     borderRadius: 10,
-    backgroundColor: "#F1F5FF",
+    backgroundColor: colors.inputBackground,
   },
   onlineListIconFallback: {
     width: 56,
     height: 74,
     borderRadius: 14,
-    backgroundColor: "#F7F9FC",
+    backgroundColor: colors.inputBackground,
     borderWidth: 1,
-    borderColor: "#EEF2F8",
+    borderColor: colors.border,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -1663,12 +1665,12 @@ const styles = StyleSheet.create({
     paddingRight: 2,
   },
   onlineListTitle: {
-    color: TEXT,
+    color: colors.text,
     fontSize: 17,
     fontWeight: "900",
   },
   practiceListTitle: {
-    color: TEXT,
+    color: colors.text,
     fontSize: 16,
     lineHeight: 21,
     fontWeight: "900",
@@ -1679,9 +1681,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: 9,
     paddingVertical: 5,
     borderRadius: 999,
-    backgroundColor: "#F4F7FD",
+    backgroundColor: colors.inputBackground,
     borderWidth: 1,
-    borderColor: "#E7EDF8",
+    borderColor: colors.border,
   },
   practiceListMetaChip: {
     marginTop: 8,
@@ -1689,9 +1691,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: 9,
     paddingVertical: 5,
     borderRadius: 999,
-    backgroundColor: "#F4F7FD",
+    backgroundColor: colors.inputBackground,
     borderWidth: 1,
-    borderColor: "#E7EDF8",
+    borderColor: colors.border,
   },
   onlineListMeta: {
     color: PRIMARY,
@@ -1709,8 +1711,8 @@ const styles = StyleSheet.create({
     height: 34,
     borderRadius: 12,
     borderWidth: 1,
-    borderColor: "#E5ECFA",
-    backgroundColor: "#F8FBFF",
+    borderColor: colors.border,
+    backgroundColor: colors.inputBackground,
     alignItems: "center",
     justifyContent: "center",
     marginLeft: 10,
@@ -1719,7 +1721,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     paddingTop: 12,
     paddingBottom: 14,
-    backgroundColor: "#F8FBFF",
+    backgroundColor: colors.panel,
   },
   onlineExamDropItem: {
     flexDirection: "row",
@@ -1729,9 +1731,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
     marginTop: 8,
     borderWidth: 1,
-    borderColor: "#E4ECFA",
+    borderColor: colors.border,
     borderRadius: 16,
-    backgroundColor: "#FFFFFF",
+    backgroundColor: colors.card,
     shadowColor: "#0F172A",
     shadowOffset: { width: 0, height: 3 },
     shadowOpacity: 0.018,
@@ -1753,9 +1755,9 @@ const styles = StyleSheet.create({
     borderRadius: 13,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "#EEF4FF",
+    backgroundColor: colors.soft,
     borderWidth: 1,
-    borderColor: "#D8E7FF",
+    borderColor: colors.border,
     marginRight: 10,
   },
   onlineExamOrderText: {
@@ -1768,13 +1770,13 @@ const styles = StyleSheet.create({
     marginRight: 10,
   },
   onlineExamDropTitle: {
-    color: TEXT,
+    color: colors.text,
     fontSize: 13,
     fontWeight: "800",
   },
   onlineExamDropMeta: {
     marginTop: 2,
-    color: MUTED,
+    color: colors.muted,
     fontSize: 11,
     fontWeight: "600",
   },
@@ -1782,17 +1784,17 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
   },
   onlineExamDropEmptyText: {
-    color: MUTED,
+    color: colors.muted,
     fontSize: 12,
     fontWeight: "600",
   },
 
   competitiveCard: {
     width: CARD_W,
-    backgroundColor: "#FFFFFF",
+    backgroundColor: colors.card,
     borderRadius: 22,
     borderWidth: 1,
-    borderColor: "#E7EDF8",
+    borderColor: colors.border,
     padding: 14,
     shadowColor: "#0F172A",
     shadowOffset: { width: 0, height: 6 },
@@ -1809,7 +1811,7 @@ const styles = StyleSheet.create({
     width: 52,
     height: 52,
     borderRadius: 12,
-    backgroundColor: "#F1F5FF",
+    backgroundColor: colors.inputBackground,
   },
   competitiveIconFallback: {
     width: 52,
@@ -1817,29 +1819,29 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "#EEF4FF",
+    backgroundColor: colors.soft,
   },
   competitiveChevronWrap: {
     width: 30,
     height: 30,
     borderRadius: 10,
     borderWidth: 1,
-    borderColor: "#DCE7FF",
+    borderColor: colors.border,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "#FFFFFF",
+    backgroundColor: colors.card,
   },
   competitiveTitle: {
     marginTop: 12,
     fontSize: 16,
     fontWeight: "900",
-    color: TEXT,
+    color: colors.text,
   },
   competitiveDesc: {
     marginTop: 5,
     fontSize: 12,
     lineHeight: 18,
-    color: MUTED,
+    color: colors.muted,
   },
   competitiveMetaRow: {
     marginTop: 12,
@@ -1851,7 +1853,7 @@ const styles = StyleSheet.create({
   competitiveMetaPill: {
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "#EEF4FF",
+    backgroundColor: colors.soft,
     paddingHorizontal: 10,
     paddingVertical: 6,
     borderRadius: 999,
@@ -1867,26 +1869,26 @@ const styles = StyleSheet.create({
     marginHorizontal: 16,
     marginBottom: 16,
     borderWidth: 1,
-    borderColor: BORDER,
-    backgroundColor: "#F9FBFF",
+    borderColor: colors.border,
+    backgroundColor: colors.panel,
     borderRadius: 14,
     padding: 14,
     flexDirection: "row",
     alignItems: "center",
     gap: 8,
   },
-  emptyAssessmentsText: { color: MUTED, fontSize: 13, fontWeight: "600" },
+  emptyAssessmentsText: { color: colors.muted, fontSize: 13, fontWeight: "600" },
 
   schoolListWrap: {
     paddingHorizontal: 16,
     paddingBottom: 20,
   },
   schoolBookCard: {
-    backgroundColor: "#FFFFFF",
+    backgroundColor: colors.card,
     borderRadius: 22,
     marginBottom: 12,
     borderWidth: 1,
-    borderColor: "#E7EDF8",
+    borderColor: colors.border,
     overflow: "hidden",
     shadowColor: "#0F172A",
     shadowOffset: { width: 0, height: 6 },
@@ -1912,9 +1914,9 @@ const styles = StyleSheet.create({
     borderRadius: 14,
     justifyContent: "center",
     alignItems: "center",
-    backgroundColor: "#F7F9FC",
+    backgroundColor: colors.inputBackground,
     borderWidth: 1,
-    borderColor: "#EEF2F8",
+    borderColor: colors.border,
   },
   schoolBookTextWrap: {
     marginLeft: 12,
@@ -1923,10 +1925,10 @@ const styles = StyleSheet.create({
   schoolBookTitle: {
     fontWeight: "900",
     fontSize: 17,
-    color: TEXT,
+    color: colors.text,
   },
   schoolBookSub: {
-    color: "#667085",
+    color: colors.muted,
     marginTop: 4,
     fontSize: 12,
     fontWeight: "700",
@@ -1942,9 +1944,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: 9,
     paddingVertical: 5,
     borderRadius: 999,
-    backgroundColor: "#F4F7FD",
+    backgroundColor: colors.inputBackground,
     borderWidth: 1,
-    borderColor: "#E7EDF8",
+    borderColor: colors.border,
     color: PRIMARY,
     fontSize: 11,
     fontWeight: "700",
@@ -1955,8 +1957,8 @@ const styles = StyleSheet.create({
     height: 34,
     borderRadius: 12,
     borderWidth: 1,
-    borderColor: "#E5ECFA",
-    backgroundColor: "#F8FBFF",
+    borderColor: colors.border,
+    backgroundColor: colors.inputBackground,
     alignItems: "center",
     justifyContent: "center",
     marginLeft: 10,
@@ -1964,7 +1966,7 @@ const styles = StyleSheet.create({
 
   profileModalOverlay: {
     flex: 1,
-    backgroundColor: "rgba(0,0,0,0.45)",
+    backgroundColor: colors.overlay,
     justifyContent: "center",
     alignItems: "center",
     padding: 20,
@@ -1972,11 +1974,11 @@ const styles = StyleSheet.create({
   profileModalCard: {
     width: "100%",
     maxWidth: 420,
-    backgroundColor: "#fff",
+    backgroundColor: colors.card,
     borderRadius: 22,
     padding: 18,
     borderWidth: 1,
-    borderColor: "#E6EEFD",
+    borderColor: colors.border,
   },
   profileHero: {
     alignItems: "center",
@@ -1986,7 +1988,7 @@ const styles = StyleSheet.create({
   modalName: {
     marginTop: 12,
     fontWeight: "900",
-    color: TEXT,
+    color: colors.text,
     fontSize: 19,
     textAlign: "center",
   },
@@ -1995,15 +1997,15 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
     paddingVertical: 6,
     borderRadius: 999,
-    backgroundColor: "#EEF4FF",
+    backgroundColor: colors.soft,
     borderWidth: 1,
-    borderColor: "#DDE9FF",
+    borderColor: colors.border,
   },
   modalRank: { color: PRIMARY, fontWeight: "800", fontSize: 12 },
   infoGrid: {
     marginTop: 10,
     borderWidth: 1,
-    borderColor: "#E7EDF8",
+    borderColor: colors.border,
     borderRadius: 14,
     overflow: "hidden",
   },
@@ -2011,15 +2013,15 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingVertical: 10,
     borderBottomWidth: 1,
-    borderBottomColor: "#EEF3FB",
+    borderBottomColor: colors.border,
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "center",
   },
-  infoLabel: { color: MUTED, fontSize: 12, fontWeight: "700" },
-  infoValue: { color: TEXT, fontSize: 12, fontWeight: "800", flexShrink: 1, textAlign: "right" },
+  infoLabel: { color: colors.muted, fontSize: 12, fontWeight: "700" },
+  infoValue: { color: colors.text, fontSize: 12, fontWeight: "800", flexShrink: 1, textAlign: "right" },
   tieModalTitle: {
-    color: TEXT,
+    color: colors.text,
     fontSize: 18,
     fontWeight: "900",
     textAlign: "center",
@@ -2027,7 +2029,7 @@ const styles = StyleSheet.create({
   tieModalSubtitle: {
     marginTop: 6,
     marginBottom: 12,
-    color: MUTED,
+    color: colors.muted,
     fontSize: 12,
     fontWeight: "700",
     textAlign: "center",
@@ -2035,9 +2037,9 @@ const styles = StyleSheet.create({
   tieOptionRow: {
     width: "100%",
     borderWidth: 1,
-    borderColor: "#E4ECFA",
+    borderColor: colors.border,
     borderRadius: 12,
-    backgroundColor: "#fff",
+    backgroundColor: colors.card,
     paddingHorizontal: 10,
     paddingVertical: 9,
     flexDirection: "row",
@@ -2049,13 +2051,13 @@ const styles = StyleSheet.create({
     borderRadius: 18,
   },
   tieOptionName: {
-    color: TEXT,
+    color: colors.text,
     fontSize: 13,
     fontWeight: "800",
   },
   tieOptionPoints: {
     marginTop: 2,
-    color: MUTED,
+    color: colors.muted,
     fontSize: 11,
     fontWeight: "700",
   },
@@ -2069,3 +2071,4 @@ const styles = StyleSheet.create({
   },
   closeBtnText: { color: "#fff", fontWeight: "800", fontSize: 14 },
 });
+}

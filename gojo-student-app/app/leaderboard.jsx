@@ -16,12 +16,14 @@ import {
   Easing,
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
-import { useRouter } from "expo-router";
+import { useLocalSearchParams, useRouter } from "expo-router";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { ref, get } from "firebase/database";
 import { database } from "../constants/firebaseConfig";
+import { useAppTheme } from "../hooks/use-app-theme";
 import { getSnapshot } from "./lib/dbHelpers";
 import { queryUserByUsernameInSchool, queryUserByChildInSchool } from "./lib/userHelpers";
+import { extractProfileImage } from "./lib/profileImage";
 
 const C = {
   primary: "#0B72FF",
@@ -163,7 +165,7 @@ function extractStudentGrade(student) {
   const normalized = normalizeGrade(raw);
   return normalized ? `Grade ${normalized}` : "-";
 }
-function PodiumItem({ item, place, rankColor, animatedStyle, onPress }) {
+function PodiumItem({ item, place, rankColor, animatedStyle, onPress, styles }) {
   const isFirst = place === 1;
   const medalColor = rankColor(place);
   const tiedItems = Array.isArray(item?.tiedItems) ? item.tiedItems : [];
@@ -267,6 +269,9 @@ function PodiumItem({ item, place, rankColor, animatedStyle, onPress }) {
 }
 export default function LeaderboardScreen() {
   const router = useRouter();
+  const params = useLocalSearchParams();
+  const { colors, statusBarStyle } = useAppTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
 
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -288,6 +293,13 @@ export default function LeaderboardScreen() {
   const [tiePickerVisible, setTiePickerVisible] = useState(false);
   const [tieCandidates, setTieCandidates] = useState([]);
   const [tieRank, setTieRank] = useState(null);
+
+  const requestedScope = useMemo(() => {
+    const raw = String(params?.scope || params?.filter || params?.level || "").toLowerCase();
+    if (raw.includes("school")) return "school";
+    if (raw.includes("country")) return "country";
+    return null;
+  }, [params?.filter, params?.level, params?.scope]);
 
   const safeTop = Platform.OS === "android" ? (StatusBar.currentHeight || 0) : 0;
 
@@ -316,7 +328,7 @@ export default function LeaderboardScreen() {
         return {
           ...r,
           name: profile?.name || profile?.username || r.userId,
-          avatar: profile?.profileImage || null,
+          avatar: extractProfileImage(profile),
           schoolCode: resolvedSchool || null,
           studentGrade,
         };
@@ -388,6 +400,17 @@ export default function LeaderboardScreen() {
   }, [enrichRows]);
 
   useEffect(() => { load(); }, [load]);
+
+  useEffect(() => {
+    if (requestedScope === "country") {
+      setScope("country");
+      return;
+    }
+
+    if (requestedScope === "school") {
+      setScope(schoolCode ? "school" : "country");
+    }
+  }, [requestedScope, schoolCode]);
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
@@ -570,7 +593,7 @@ export default function LeaderboardScreen() {
   if (loading) {
     return (
       <SafeAreaView style={[styles.screen, { paddingTop: safeTop }]}>
-        <StatusBar barStyle="dark-content" backgroundColor={C.bg} />
+        <StatusBar barStyle={statusBarStyle} backgroundColor={colors.background} />
         <View style={styles.center}>
           <ActivityIndicator color={C.primary} />
         </View>
@@ -580,11 +603,11 @@ export default function LeaderboardScreen() {
 
   return (
     <SafeAreaView style={[styles.screen, { paddingTop: safeTop }]}>
-      <StatusBar barStyle="dark-content" backgroundColor={C.bg} />
+      <StatusBar barStyle={statusBarStyle} backgroundColor={colors.background} />
 
       <View style={styles.header}>
         <TouchableOpacity onPress={() => router.replace("/dashboard/exam")} style={styles.backBtn}>
-          <Ionicons name="chevron-back" size={22} color={C.text} />
+          <Ionicons name="chevron-back" size={22} color={colors.text} />
         </TouchableOpacity>
         <View style={{ flex: 1 }}>
           <Text style={styles.title}>Leaderboard</Text>
@@ -626,6 +649,7 @@ export default function LeaderboardScreen() {
               rankColor={rankColor}
               animatedStyle={secondAnimatedStyle}
               onPress={() => handlePodiumPress(2, podiumGroups[2])}
+              styles={styles}
             />
           ) : null}
           {podium.first ? (
@@ -635,6 +659,7 @@ export default function LeaderboardScreen() {
               rankColor={rankColor}
               animatedStyle={firstAnimatedStyle}
               onPress={() => handlePodiumPress(1, podiumGroups[1])}
+              styles={styles}
             />
           ) : null}
           {podium.third ? (
@@ -644,6 +669,7 @@ export default function LeaderboardScreen() {
               rankColor={rankColor}
               animatedStyle={thirdAnimatedStyle}
               onPress={() => handlePodiumPress(3, podiumGroups[3])}
+              styles={styles}
             />
           ) : null}
         </View>
@@ -681,7 +707,7 @@ export default function LeaderboardScreen() {
                 </View>
               </View>
               <View style={styles.rowChevronWrap}>
-                <Ionicons name="chevron-forward" size={16} color={C.muted} />
+                <Ionicons name="chevron-forward" size={16} color={colors.muted} />
               </View>
             </View>
           </TouchableOpacity>
@@ -716,11 +742,11 @@ export default function LeaderboardScreen() {
                 </View>
 
                 <View style={styles.infoGrid}>
-                  <InfoRow label="Grade" value={selectedProfile?.grade || "-"} />
-                  <InfoRow label="Gender" value={selectedProfile?.gender || "-"} />
-                  <InfoRow label="School" value={selectedProfile?.school || "-"} />
-                  <InfoRow label="Region" value={selectedProfile?.region || "-"} />
-                  <InfoRow label="City" value={selectedProfile?.city || "-"} />
+                  <InfoRow label="Grade" value={selectedProfile?.grade || "-"} styles={styles} />
+                  <InfoRow label="Gender" value={selectedProfile?.gender || "-"} styles={styles} />
+                  <InfoRow label="School" value={selectedProfile?.school || "-"} styles={styles} />
+                  <InfoRow label="Region" value={selectedProfile?.region || "-"} styles={styles} />
+                  <InfoRow label="City" value={selectedProfile?.city || "-"} styles={styles} />
                 </View>
 
                 <TouchableOpacity style={styles.closeBtn} onPress={() => setProfileModalVisible(false)}>
@@ -768,7 +794,7 @@ export default function LeaderboardScreen() {
                     <Text numberOfLines={1} style={styles.tieOptionName}>{item.name}</Text>
                     <Text style={styles.tieOptionPoints}>{item.totalPoints} points</Text>
                   </View>
-                  <Ionicons name="chevron-forward" size={16} color={C.muted} />
+                  <Ionicons name="chevron-forward" size={16} color={colors.muted} />
                 </TouchableOpacity>
               )}
             />
@@ -783,7 +809,7 @@ export default function LeaderboardScreen() {
   );
 }
 
-function InfoRow({ label, value }) {
+function InfoRow({ label, value, styles }) {
   return (
     <View style={styles.infoRow}>
       <Text style={styles.infoLabel}>{label}</Text>
@@ -792,8 +818,9 @@ function InfoRow({ label, value }) {
   );
 }
 
-const styles = StyleSheet.create({
-  screen: { flex: 1, backgroundColor: C.bg },
+function createStyles(colors) {
+  return StyleSheet.create({
+  screen: { flex: 1, backgroundColor: colors.background },
   center: { flex: 1, alignItems: "center", justifyContent: "center" },
 
   header: {
@@ -810,10 +837,10 @@ const styles = StyleSheet.create({
     marginRight: 10,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "#F7F9FF",
+    backgroundColor: colors.inputBackground,
   },
-  title: { fontSize: 22, fontWeight: "900", color: C.text },
-  sub: { color: C.muted, marginTop: 2 },
+  title: { fontSize: 22, fontWeight: "900", color: colors.text },
+  sub: { color: colors.muted, marginTop: 2 },
 
   heroPanel: {
     marginHorizontal: 16,
@@ -882,17 +909,17 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
     borderRadius: 999,
     borderWidth: 1,
-    borderColor: "#DCE7FF",
-    backgroundColor: "#FFFFFF",
+    borderColor: colors.border,
+    backgroundColor: colors.card,
     alignItems: "center",
     justifyContent: "center",
     flex: 1,
   },
-  toggleOn: { backgroundColor: "#EEF4FF", borderColor: "#BBD3FF" },
-  toggleOff: { backgroundColor: "#fff", borderColor: "#DCE7FF" },
+  toggleOn: { backgroundColor: colors.soft, borderColor: colors.primary },
+  toggleOff: { backgroundColor: colors.card, borderColor: colors.border },
   toggleDisabled: { opacity: 0.55 },
   toggleTextOn: { color: C.primary, fontSize: 12, fontWeight: "700" },
-  toggleTextOff: { color: C.muted, fontSize: 12, fontWeight: "700" },
+  toggleTextOff: { color: colors.muted, fontSize: 12, fontWeight: "700" },
 
   searchWrap: {
     marginTop: 10,
@@ -973,7 +1000,7 @@ const styles = StyleSheet.create({
     borderWidth: 2.5,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "#fff",
+    backgroundColor: colors.card,
   },
   podiumAvatarWrapFirst: { width: 78, height: 78, borderRadius: 39 },
   podiumAvatar: { width: "100%", height: "100%", borderRadius: 999 },
@@ -994,7 +1021,7 @@ const styles = StyleSheet.create({
     height: 24,
     borderRadius: 12,
     borderWidth: 1.5,
-    borderColor: "#fff",
+    borderColor: colors.card,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -1003,12 +1030,12 @@ const styles = StyleSheet.create({
   podiumName: {
     marginTop: 8,
     fontWeight: "800",
-    color: C.text,
+    color: colors.text,
     fontSize: 12,
     width: 90,
     textAlign: "center",
   },
-  podiumPts: { marginTop: 2, color: C.muted, fontSize: 11, fontWeight: "700" },
+  podiumPts: { marginTop: 2, color: colors.muted, fontSize: 11, fontWeight: "700" },
   tiePreviewWrap: {
     marginTop: 6,
     flexDirection: "row",
@@ -1020,7 +1047,7 @@ const styles = StyleSheet.create({
     height: 24,
     borderRadius: 12,
     borderWidth: 1.5,
-    backgroundColor: "#fff",
+    backgroundColor: colors.card,
     overflow: "hidden",
   },
   tiePreviewAvatar: {
@@ -1061,9 +1088,9 @@ const styles = StyleSheet.create({
 
   row: {
     borderWidth: 1,
-    borderColor: "#E4ECFA",
+    borderColor: colors.border,
     borderRadius: 16,
-    backgroundColor: "#fff",
+    backgroundColor: colors.card,
     paddingHorizontal: 12,
     paddingVertical: 11,
     flexDirection: "row",
@@ -1073,7 +1100,7 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.02,
     shadowRadius: 6,
   },
-  myRow: { backgroundColor: "#F1F7FF", borderColor: "#CFE1FF" },
+  myRow: { backgroundColor: colors.soft, borderColor: colors.primary },
   rankPill: {
     minWidth: 50,
     height: 32,
@@ -1094,15 +1121,15 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   initial: { color: "#fff", fontWeight: "900" },
-  name: { color: C.text, fontWeight: "800", fontSize: 14 },
+  name: { color: colors.text, fontWeight: "800", fontSize: 14 },
   pointsChip: {
     marginTop: 4,
     alignSelf: "flex-start",
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "#EEF4FF",
+    backgroundColor: colors.soft,
     borderWidth: 1,
-    borderColor: "#DDE9FF",
+    borderColor: colors.border,
     borderRadius: 999,
     paddingHorizontal: 8,
     paddingVertical: 4,
@@ -1113,18 +1140,18 @@ const styles = StyleSheet.create({
     height: 30,
     borderRadius: 10,
     borderWidth: 1,
-    borderColor: "#E5ECFA",
-    backgroundColor: "#F8FBFF",
+    borderColor: colors.border,
+    backgroundColor: colors.inputBackground,
     alignItems: "center",
     justifyContent: "center",
   },
 
   emptyWrap: { alignItems: "center", paddingVertical: 30 },
-  emptyText: { color: C.muted, fontWeight: "700" },
+  emptyText: { color: colors.muted, fontWeight: "700" },
 
   modalOverlay: {
     flex: 1,
-    backgroundColor: "rgba(0,0,0,0.45)",
+    backgroundColor: colors.overlay,
     justifyContent: "center",
     alignItems: "center",
     padding: 20,
@@ -1132,31 +1159,31 @@ const styles = StyleSheet.create({
   modalCard: {
     width: "100%",
     maxWidth: 420,
-    backgroundColor: "#fff",
+    backgroundColor: colors.card,
     borderRadius: 22,
     padding: 18,
     borderWidth: 1,
-    borderColor: "#E6EEFD",
+    borderColor: colors.border,
   },
   tieModalCard: {
     width: "100%",
     maxWidth: 420,
-    backgroundColor: "#fff",
+    backgroundColor: colors.card,
     borderRadius: 22,
     padding: 18,
     borderWidth: 1,
-    borderColor: "#E6EEFD",
+    borderColor: colors.border,
     alignItems: "center",
   },
   tieModalTitle: {
-    color: C.text,
+    color: colors.text,
     fontSize: 18,
     fontWeight: "900",
   },
   tieModalSubtitle: {
     marginTop: 6,
     marginBottom: 14,
-    color: C.muted,
+    color: colors.muted,
     fontSize: 12,
     fontWeight: "700",
     textAlign: "center",
@@ -1164,9 +1191,9 @@ const styles = StyleSheet.create({
   tieOptionRow: {
     width: "100%",
     borderWidth: 1,
-    borderColor: "#E4ECFA",
+    borderColor: colors.border,
     borderRadius: 12,
-    backgroundColor: "#fff",
+    backgroundColor: colors.card,
     paddingHorizontal: 10,
     paddingVertical: 9,
     flexDirection: "row",
@@ -1178,13 +1205,13 @@ const styles = StyleSheet.create({
     borderRadius: 18,
   },
   tieOptionName: {
-    color: C.text,
+    color: colors.text,
     fontSize: 13,
     fontWeight: "800",
   },
   tieOptionPoints: {
     marginTop: 2,
-    color: C.muted,
+    color: colors.muted,
     fontSize: 11,
     fontWeight: "700",
   },
@@ -1196,14 +1223,14 @@ const styles = StyleSheet.create({
   modalName: {
     marginTop: 12,
     fontWeight: "900",
-    color: C.text,
+    color: colors.text,
     fontSize: 19,
   },
   modalRankBadge: {
     marginTop: 8,
-    backgroundColor: "#EEF4FF",
+    backgroundColor: colors.soft,
     borderWidth: 1,
-    borderColor: "#DCE8FF",
+    borderColor: colors.border,
     borderRadius: 999,
     paddingHorizontal: 12,
     paddingVertical: 7,
@@ -1212,14 +1239,14 @@ const styles = StyleSheet.create({
 
 
   emptyPodiumAvatarWrap: {
-  backgroundColor: "#F8FAFF",
+  backgroundColor: colors.inputBackground,
   borderStyle: "dashed",
 },
 
 podiumNameEmpty: {
   marginTop: 8,
   fontWeight: "800",
-  color: C.muted,
+  color: colors.muted,
   fontSize: 12,
   width: 90,
   textAlign: "center",
@@ -1227,22 +1254,22 @@ podiumNameEmpty: {
 
 podiumPtsEmpty: {
   marginTop: 2,
-  color: "#98A2B3",
+  color: colors.muted,
   fontSize: 11,
   fontWeight: "700",
 },
   infoGrid: { marginTop: 16, gap: 8 },
   infoRow: {
     borderWidth: 1,
-    borderColor: C.border,
+    borderColor: colors.border,
     borderRadius: 12,
     paddingHorizontal: 12,
     paddingVertical: 10,
     flexDirection: "row",
     justifyContent: "space-between",
   },
-  infoLabel: { color: C.muted, fontWeight: "700" },
-  infoValue: { color: C.text, fontWeight: "800", maxWidth: "60%", textAlign: "right" },
+  infoLabel: { color: colors.muted, fontWeight: "700" },
+  infoValue: { color: colors.text, fontWeight: "800", maxWidth: "60%", textAlign: "right" },
 
   closeBtn: {
     marginTop: 16,
@@ -1253,3 +1280,4 @@ podiumPtsEmpty: {
   },
   closeBtnText: { color: "#fff", fontWeight: "900" },
 });
+}

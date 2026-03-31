@@ -24,14 +24,8 @@ import { Ionicons } from "@expo/vector-icons";
 import * as FileSystem from "expo-file-system/legacy";
 import { WebView } from "react-native-webview";
 import { useRouter, useFocusEffect } from "expo-router";
+import { useAppTheme } from "../../hooks/use-app-theme";
 
-const PRIMARY = "#0B72FF";
-const TEXT = "#0B2540";
-const MUTED = "#6B78A8";
-const CARD = "#FFFFFF";
-const BORDER = "#EAF0FF";
-const BG = "#ffffff";
-const SUCCESS = "#12B76A";
 const MAX_NOTES_PER_CHAPTER = 5;
 
 const BOOKS_DIR = `${FileSystem.documentDirectory}books/`;
@@ -101,8 +95,24 @@ function getSubjectIcon(subjectName) {
   return 'library-outline';
 }
 
-function getSubjectColor(subjectName) {
+function getSubjectColor(subjectName, isDark = false) {
   const name = (subjectName || "").toLowerCase();
+  if (isDark) {
+    if (name.includes('math') || name.includes('mathematics')) return '#FFA4A4';
+    if (name.includes('science')) return '#7BE9E0';
+    if (name.includes('english') || name.includes('language')) return '#86D9FF';
+    if (name.includes('history') || name.includes('social')) return '#B4E9CD';
+    if (name.includes('biology')) return '#AFEFCB';
+    if (name.includes('chemistry')) return '#FFD08A';
+    if (name.includes('physics')) return '#9ACDFF';
+    if (name.includes('geography')) return '#A9E5B1';
+    if (name.includes('computer') || name.includes('ict')) return '#C1ACFF';
+    if (name.includes('art')) return '#FF9CC4';
+    if (name.includes('music')) return '#E0A8FF';
+    if (name.includes('physical') || name.includes('pe') || name.includes('sport')) return '#89E6DB';
+    return '#C4D2E3';
+  }
+
   if (name.includes('math') || name.includes('mathematics')) return '#FF6B6B';
   if (name.includes('science')) return '#4ECDC4';
   if (name.includes('english') || name.includes('language')) return '#45B7D1';
@@ -147,9 +157,16 @@ function escapeHtml(value) {
     .replace(/'/g, "&#39;");
 }
 
-function buildPremiumPdfReaderHtml(fileUrl, title) {
+function buildPremiumPdfReaderHtml(fileUrl, title, theme = {}) {
   const safeJsFileUrl = JSON.stringify(String(fileUrl || ""));
   const safeTitle = escapeHtml(title || "Chapter Reader");
+  const cssBg = String(theme.bg || "#F4F7FF");
+  const cssCard = String(theme.card || "#FFFFFF");
+  const cssLine = String(theme.line || "#DCE6FA");
+  const cssText = String(theme.text || "#13284B");
+  const cssMuted = String(theme.muted || "#5D6F99");
+  const cssPrimary = String(theme.primary || "#0B72FF");
+  const cssStateBg = String(theme.stateBg || cssCard);
 
   return `<!doctype html>
 <html>
@@ -159,13 +176,18 @@ function buildPremiumPdfReaderHtml(fileUrl, title) {
     <title>${safeTitle}</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
     <style>
-      :root { --bg:#F4F7FF; --card:#FFFFFF; --line:#DCE6FA; --text:#13284B; --muted:#5D6F99; --primary:#0B72FF; }
-      html, body { margin:0; padding:0; background:var(--bg); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; color:var(--text); overflow-x:hidden; }
-      .wrap { min-height:100vh; display:flex; flex-direction:column; }
-      .pages { padding:0; display:flex; flex-direction:column; gap:0; }
-      .pageCard { background:var(--card); border:none; border-radius:0; padding:0; box-shadow:none; }
-      canvas { width:100% !important; height:auto !important; border-radius:10px; display:block; }
-      .state { margin:16px 12px; border:1px dashed var(--line); border-radius:14px; background:#fff; padding:14px; text-align:center; color:var(--muted); font-weight:700; }
+      :root { --bg:${cssBg}; --card:${cssCard}; --line:${cssLine}; --text:${cssText}; --muted:${cssMuted}; --primary:${cssPrimary}; --state-bg:${cssStateBg}; }
+      html, body { margin:0; padding:0; min-height:100%; background:var(--bg); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; color:var(--text); overflow-x:hidden; }
+      .wrap { min-height:100vh; display:flex; flex-direction:column; padding:8px 10px 14px; box-sizing:border-box; }
+      .pages { padding:0; display:flex; flex-direction:column; gap:12px; }
+      .pageCard { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:0; overflow:hidden; box-shadow:0 4px 14px rgba(0,0,0,0.06); }
+      canvas { width:100% !important; height:auto !important; display:block; }
+      .state { margin:8px auto 12px; width:100%; max-width:560px; border:1px dashed var(--line); border-radius:12px; background:var(--state-bg); padding:12px 14px; text-align:center; color:var(--muted); font-weight:700; font-size:14px; line-height:20px; letter-spacing:0.15px; box-sizing:border-box; }
+      @media (min-width: 900px) {
+        .wrap { padding:14px 24px 24px; }
+        .pages { gap:16px; }
+        .state { font-size:15px; line-height:22px; margin-bottom:14px; }
+      }
     </style>
   </head>
   <body>
@@ -246,6 +268,22 @@ function buildPremiumPdfReaderHtml(fileUrl, title) {
 
 export default function BooksScreen() {
   const router = useRouter();
+  const { colors, resolvedAppearance } = useAppTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
+  const readerTheme = useMemo(() => ({
+    bg: colors.feedBackground,
+    card: colors.card,
+    line: colors.border,
+    text: colors.text,
+    muted: colors.muted,
+    primary: colors.primary,
+    stateBg: colors.inputBackground,
+  }), [colors]);
+
+  const PRIMARY = colors.primary;
+  const TEXT = colors.text;
+  const MUTED = colors.muted;
+  const SUCCESS = colors.success;
 
   const [loading, setLoading] = useState(true);
   const [subjects, setSubjects] = useState([]);
@@ -514,7 +552,7 @@ export default function BooksScreen() {
 
   const openRemotePdfInViewer = useCallback((remoteUrl, title, subjectName = "", localUri = null) => {
     const sourceForPremium = localUri || remoteUrl;
-    const premiumHtml = buildPremiumPdfReaderHtml(sourceForPremium, title);
+    const premiumHtml = buildPremiumPdfReaderHtml(sourceForPremium, title, readerTheme);
 
     setViewerLoading(true);
     setViewer({
@@ -527,7 +565,7 @@ export default function BooksScreen() {
       isOffline: !!localUri,
       hasRetriedPremium: false,
     });
-  }, []);
+  }, [readerTheme]);
 
   const retryPremiumWithOnlineSource = useCallback(() => {
     let changed = false;
@@ -536,7 +574,7 @@ export default function BooksScreen() {
       changed = true;
       return {
         ...prev,
-        html: buildPremiumPdfReaderHtml(prev.sourceUrl, prev.title),
+        html: buildPremiumPdfReaderHtml(prev.sourceUrl, prev.title, readerTheme),
         isOffline: false,
         hasRetriedPremium: true,
       };
@@ -547,7 +585,7 @@ export default function BooksScreen() {
       return true;
     }
     return false;
-  }, []);
+  }, [readerTheme]);
 
   const deleteFile = useCallback(async (file) => {
     await FileSystem.deleteAsync(file.uri, { idempotent: true });
@@ -973,7 +1011,7 @@ export default function BooksScreen() {
         </View>
         <View style={styles.statCard}>
           <View style={[styles.statIconWrap, styles.statIconPurple]}>
-            <Ionicons name="reader-outline" size={15} color="#7C3AED" />
+            <Ionicons name="reader-outline" size={15} color={PRIMARY} />
           </View>
           <Text style={styles.statValue}>{totalUnits}</Text>
           <Text style={styles.statLabel}>Chapters</Text>
@@ -1074,7 +1112,7 @@ export default function BooksScreen() {
             activeOpacity={0.9}
             onPress={() => openNoteEditorFromSheet(note.noteId || null)}
           >
-            <Ionicons name="create-outline" size={18} color="#fff" />
+            <Ionicons name="create-outline" size={18} color={colors.white} />
           </TouchableOpacity>
 
           <TouchableOpacity
@@ -1091,7 +1129,7 @@ export default function BooksScreen() {
               ])
             }
           >
-            <Ionicons name="trash-outline" size={18} color="#fff" />
+            <Ionicons name="trash-outline" size={18} color={colors.white} />
           </TouchableOpacity>
         </View>
 
@@ -1204,7 +1242,7 @@ export default function BooksScreen() {
 
         {isDownloading ? (
           <TouchableOpacity onPress={() => cancelDownload(url)} style={styles.progressWrap}>
-            <ActivityIndicator color="#fff" size="small" />
+            <ActivityIndicator color={colors.white} size="small" />
             <Text style={styles.progressText}>{progress}%</Text>
           </TouchableOpacity>
         ) : (
@@ -1214,7 +1252,7 @@ export default function BooksScreen() {
               style={[styles.noteActionBtn, hasNote && styles.noteActionBtnActive]}
             >
               <View style={[styles.noteActionIconWrap, hasNote && styles.noteActionIconWrapActive]}>
-                <Ionicons name={hasNote ? "create" : "create-outline"} size={16} color={hasNote ? "#FFFFFF" : PRIMARY} />
+                <Ionicons name={hasNote ? "create" : "create-outline"} size={16} color={hasNote ? colors.white : PRIMARY} />
               </View>
             </TouchableOpacity>
 
@@ -1225,7 +1263,7 @@ export default function BooksScreen() {
               <Ionicons
                 name={downloaded ? "cloud-done" : "cloud-download-outline"}
                 size={18}
-                color={downloaded ? "#fff" : PRIMARY}
+                color={downloaded ? colors.white : PRIMARY}
               />
             </TouchableOpacity>
           </View>
@@ -1331,7 +1369,7 @@ export default function BooksScreen() {
                     <Ionicons 
                       name={getSubjectIcon(item.title)} 
                       size={32} 
-                      color={getSubjectColor(item.title)} 
+                      color={getSubjectColor(item.title, resolvedAppearance === "dark")} 
                     />
                   </View>
                 )}
@@ -1429,7 +1467,7 @@ export default function BooksScreen() {
               <Text style={styles.noteEmptyTitle}>No note yet</Text>
               <Text style={styles.noteEmptyText}>Create a note for this chapter from here.</Text>
               <View style={styles.noteInlinePrimaryAction}>
-                <Ionicons name="add-outline" size={16} color="#fff" />
+                <Ionicons name="add-outline" size={16} color={colors.white} />
                 <Text style={styles.noteInlinePrimaryActionText}>Add New Note</Text>
               </View>
             </TouchableOpacity>
@@ -1483,7 +1521,7 @@ export default function BooksScreen() {
               </Text>
             </View>
 
-            <View style={[styles.noteReaderBodyCard, { backgroundColor: noteReader.note?.colorTag || "#F8FBFF" }]}>
+            <View style={[styles.noteReaderBodyCard, { backgroundColor: noteReader.note?.colorTag || colors.inputBackground }]}>
               <View style={styles.noteReaderBodyHeader}>
                 <Ionicons name="create-outline" size={15} color={PRIMARY} />
                 <Text style={styles.noteReaderBodyLabel}>Note Content</Text>
@@ -1547,8 +1585,8 @@ export default function BooksScreen() {
                   <Switch
                     value={settings.showDownloadedOnly}
                     onValueChange={(v) => updateSetting("showDownloadedOnly", v)}
-                    trackColor={{ false: "#DDE6F5", true: "#B7D3FF" }}
-                    thumbColor={settings.showDownloadedOnly ? PRIMARY : "#fff"}
+                    trackColor={{ false: colors.border, true: colors.soft }}
+                    thumbColor={settings.showDownloadedOnly ? PRIMARY : colors.white}
                   />
                 </View>
 
@@ -1560,8 +1598,8 @@ export default function BooksScreen() {
                   <Switch
                     value={settings.autoExpandSubjects}
                     onValueChange={(v) => updateSetting("autoExpandSubjects", v)}
-                    trackColor={{ false: "#DDE6F5", true: "#B7D3FF" }}
-                    thumbColor={settings.autoExpandSubjects ? PRIMARY : "#fff"}
+                    trackColor={{ false: colors.border, true: colors.soft }}
+                    thumbColor={settings.autoExpandSubjects ? PRIMARY : colors.white}
                   />
                 </View>
 
@@ -1573,8 +1611,8 @@ export default function BooksScreen() {
                   <Switch
                     value={settings.compactMode}
                     onValueChange={(v) => updateSetting("compactMode", v)}
-                    trackColor={{ false: "#DDE6F5", true: "#B7D3FF" }}
-                    thumbColor={settings.compactMode ? PRIMARY : "#fff"}
+                    trackColor={{ false: colors.border, true: colors.soft }}
+                    thumbColor={settings.compactMode ? PRIMARY : colors.white}
                   />
                 </View>
               </View>
@@ -1606,7 +1644,7 @@ export default function BooksScreen() {
                   const sourceForPremium = prev.localUri || prev.sourceUrl || "";
                   return {
                     ...prev,
-                    html: buildPremiumPdfReaderHtml(sourceForPremium, prev.title),
+                    html: buildPremiumPdfReaderHtml(sourceForPremium, prev.title, readerTheme),
                   };
                 })
               }
@@ -1752,7 +1790,7 @@ export default function BooksScreen() {
                       }
                       style={[styles.fileActionBtn, styles.fileDeleteBtn]}
                     >
-                      <Ionicons name="trash-outline" size={18} color="#d23f44" />
+                      <Ionicons name="trash-outline" size={18} color={colors.danger} />
                     </TouchableOpacity>
                   </View>
                 </View>
@@ -1765,11 +1803,20 @@ export default function BooksScreen() {
   );
 }
 
-const styles = StyleSheet.create({
+function createStyles(colors) {
+  const PRIMARY = colors.primary;
+  const TEXT = colors.text;
+  const MUTED = colors.muted;
+  const CARD = colors.card;
+  const BORDER = colors.border;
+  const BG = colors.background;
+  const SUCCESS = colors.success;
+
+  return StyleSheet.create({
   container: { flex: 1, backgroundColor: BG },
 
   stickyWrap: {
-    backgroundColor: "#F8FAFF",
+    backgroundColor: colors.panel,
     borderBottomWidth: 1,
     borderBottomColor: BORDER,
     paddingBottom: 2,
@@ -1785,9 +1832,9 @@ const styles = StyleSheet.create({
   searchCard: {
     flex: 1,
     borderWidth: 1,
-    borderColor: "#E4ECFF",
+    borderColor: BORDER,
     borderRadius: 16,
-    backgroundColor: "#FFFFFF",
+    backgroundColor: CARD,
     paddingHorizontal: 10,
     flexDirection: "row",
     alignItems: "center",
@@ -1802,7 +1849,7 @@ const styles = StyleSheet.create({
     width: 24,
     height: 24,
     borderRadius: 12,
-    backgroundColor: "#EDF4FF",
+    backgroundColor: colors.soft,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -1818,8 +1865,8 @@ const styles = StyleSheet.create({
     height: 42,
     borderRadius: 14,
     borderWidth: 1,
-    borderColor: "#E4ECFF",
-    backgroundColor: "#FFFFFF",
+    borderColor: BORDER,
+    backgroundColor: CARD,
     alignItems: "center",
     justifyContent: "center",
     marginLeft: 10,
@@ -1839,7 +1886,7 @@ const styles = StyleSheet.create({
     borderRadius: 4,
     backgroundColor: SUCCESS,
     borderWidth: 1.5,
-    borderColor: "#FFFFFF",
+    borderColor: colors.white,
   },
 
   statsRow: {
@@ -1850,9 +1897,9 @@ const styles = StyleSheet.create({
   },
   statCard: {
     flex: 1,
-    backgroundColor: "#FFFFFF",
+    backgroundColor: CARD,
     borderWidth: 1,
-    borderColor: "#E5ECFA",
+    borderColor: BORDER,
     borderRadius: 18,
     paddingVertical: 10,
     paddingHorizontal: 10,
@@ -1873,13 +1920,13 @@ const styles = StyleSheet.create({
     marginBottom: 6,
   },
   statIconBlue: {
-    backgroundColor: "#EDF4FF",
+    backgroundColor: colors.soft,
   },
   statIconPurple: {
-    backgroundColor: "#F3EEFF",
+    backgroundColor: colors.badgeBackground,
   },
   statIconGreen: {
-    backgroundColor: "#EAFBF3",
+    backgroundColor: colors.soft,
   },
   statValue: {
     fontSize: 20,
@@ -1890,7 +1937,7 @@ const styles = StyleSheet.create({
   statLabel: {
     marginTop: 2,
     fontSize: 11,
-    color: "#52607A",
+    color: MUTED,
     fontWeight: "700",
   },
 
@@ -1906,11 +1953,11 @@ const styles = StyleSheet.create({
     flexWrap: "wrap",
     paddingHorizontal: 16,
     paddingBottom: 10,
-    backgroundColor: "#fff",
+    backgroundColor: CARD,
   },
 
   activeChip: {
-    backgroundColor: "#EAF3FF",
+    backgroundColor: colors.soft,
     borderRadius: 999,
     paddingHorizontal: 10,
     paddingVertical: 6,
@@ -1930,7 +1977,7 @@ const styles = StyleSheet.create({
     borderRadius: 22,
     marginBottom: 16,
     borderWidth: 1,
-    borderColor: "#E7EDF8",
+    borderColor: BORDER,
     overflow: "hidden",
     shadowColor: "#0F172A",
     shadowOffset: { width: 0, height: 6 },
@@ -1939,7 +1986,7 @@ const styles = StyleSheet.create({
     elevation: 1,
   },
   cardSelected: {
-    borderColor: "#B9D4FF",
+    borderColor: PRIMARY,
     shadowColor: PRIMARY,
     shadowOpacity: 0.05,
     elevation: 2,
@@ -1952,9 +1999,9 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
   },
   cardHeaderExpanded: {
-    backgroundColor: "#FCFDFF",
+    backgroundColor: colors.inputBackground,
     borderBottomWidth: 1,
-    borderBottomColor: "#EAF0FB",
+    borderBottomColor: colors.separator,
   },
   cardHeaderLeft: {
     flexDirection: "row",
@@ -1966,28 +2013,28 @@ const styles = StyleSheet.create({
     height: 34,
     borderRadius: 12,
     borderWidth: 1,
-    borderColor: "#E5ECFA",
-    backgroundColor: "#F8FBFF",
+    borderColor: BORDER,
+    backgroundColor: colors.inputBackground,
     alignItems: "center",
     justifyContent: "center",
     marginLeft: 10,
   },
   cardHeaderToggleActive: {
-    borderColor: "#CFE0FF",
-    backgroundColor: "#EEF5FF",
+    borderColor: PRIMARY,
+    backgroundColor: colors.soft,
   },
   subjectIconContainer: {
     justifyContent: "center",
     alignItems: "center",
-    backgroundColor: "#F7F9FC",
+    backgroundColor: colors.badgeBackground,
     borderWidth: 1,
-    borderColor: "#EEF2F8",
+    borderColor: colors.soft,
   },
   cover: {
     width: 56,
     height: 74,
     borderRadius: 14,
-    backgroundColor: "#F7F9FC",
+    backgroundColor: colors.surfaceMuted,
   },
   subjectName: {
     fontWeight: "900",
@@ -1995,7 +2042,7 @@ const styles = StyleSheet.create({
     color: TEXT,
   },
   subjectSub: {
-    color: "#667085",
+    color: MUTED,
     marginTop: 4,
     fontSize: 12,
     fontWeight: "700",
@@ -2006,9 +2053,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: 9,
     paddingVertical: 5,
     borderRadius: 999,
-    backgroundColor: "#F4F7FD",
+    backgroundColor: colors.inputBackground,
     borderWidth: 1,
-    borderColor: "#E7EDF8",
+    borderColor: BORDER,
     color: PRIMARY,
     fontSize: 11,
     fontWeight: "700",
@@ -2018,7 +2065,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     paddingTop: 12,
     paddingBottom: 14,
-    backgroundColor: "#F8FBFF",
+    backgroundColor: colors.inputBackground,
   },
   unitRow: {
     flexDirection: "row",
@@ -2027,9 +2074,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
     marginTop: 8,
     borderWidth: 1,
-    borderColor: "#E4ECFA",
+    borderColor: BORDER,
     borderRadius: 16,
-    backgroundColor: "#FFFFFF",
+    backgroundColor: CARD,
     shadowColor: "#0F172A",
     shadowOffset: { width: 0, height: 3 },
     shadowOpacity: 0.018,
@@ -2053,7 +2100,7 @@ const styles = StyleSheet.create({
     width: 30,
     height: 30,
     borderRadius: 15,
-    backgroundColor: "#EDF4FF",
+    backgroundColor: colors.soft,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -2070,13 +2117,13 @@ const styles = StyleSheet.create({
   unitTitle: {
     fontSize: 14,
     fontWeight: "800",
-    color: "#1B2B45",
+    color: TEXT,
     marginRight: 6,
   },
   noteBadge: {
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "#EEF4FF",
+    backgroundColor: colors.soft,
     paddingHorizontal: 8,
     paddingVertical: 4,
     borderRadius: 999,
@@ -2098,21 +2145,21 @@ const styles = StyleSheet.create({
     height: 40,
     borderRadius: 12,
     borderWidth: 1,
-    borderColor: "#D9E7FF",
-    backgroundColor: "#F8FBFF",
+    borderColor: BORDER,
+    backgroundColor: colors.inputBackground,
     alignItems: "center",
     justifyContent: "center",
     marginRight: 8,
   },
   noteActionBtnActive: {
-    borderColor: "#B8D1FF",
-    backgroundColor: "#EEF5FF",
+    borderColor: PRIMARY,
+    backgroundColor: colors.soft,
   },
   noteActionIconWrap: {
     width: 26,
     height: 26,
     borderRadius: 9,
-    backgroundColor: "#EAF2FF",
+    backgroundColor: colors.soft,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -2128,7 +2175,7 @@ const styles = StyleSheet.create({
     borderColor: PRIMARY,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "#F7FAFF",
+    backgroundColor: colors.inputBackground,
   },
   iconDownloaded: {
     backgroundColor: SUCCESS,
@@ -2146,7 +2193,7 @@ const styles = StyleSheet.create({
     borderRadius: 10,
   },
   progressText: {
-    color: "#fff",
+    color: colors.white,
     marginLeft: 8,
     fontWeight: "700",
   },
@@ -2159,10 +2206,10 @@ const styles = StyleSheet.create({
     padding: 24,
   },
   emptyImage: { width: 220, height: 160, marginBottom: 18 },
-  emptyTitle: { fontSize: 20, fontWeight: "800", color: "#222", marginBottom: 6 },
+  emptyTitle: { fontSize: 20, fontWeight: "800", color: TEXT, marginBottom: 6 },
   emptySubtitle: { fontSize: 14, color: MUTED, textAlign: "center" },
 
-  readerContainer: { flex: 1, backgroundColor: "#F4F8FF" },
+  readerContainer: { flex: 1, backgroundColor: BG },
   readerHeader: {
     minHeight: 74,
     flexDirection: "row",
@@ -2170,16 +2217,16 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     paddingVertical: 10,
     borderBottomWidth: 1,
-    borderBottomColor: "#E2EAF8",
-    backgroundColor: "#FFFFFF",
+    borderBottomColor: BORDER,
+    backgroundColor: CARD,
   },
   readerHeaderIconBtn: {
     width: 42,
     height: 42,
     borderRadius: 14,
     borderWidth: 1,
-    borderColor: "#DCE6F7",
-    backgroundColor: "#F8FBFF",
+    borderColor: BORDER,
+    backgroundColor: colors.inputBackground,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -2218,17 +2265,17 @@ const styles = StyleSheet.create({
     borderRadius: 0,
     overflow: "hidden",
     borderWidth: 0,
-    backgroundColor: "#FFFFFF",
+    backgroundColor: CARD,
   },
   readerWebView: {
     flex: 1,
-    backgroundColor: "#fff",
+    backgroundColor: BG,
   },
   readerLoadingOverlay: {
     ...StyleSheet.absoluteFillObject,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "rgba(255,255,255,0.85)",
+    backgroundColor: colors.overlay,
   },
   readerLoadingText: {
     marginTop: 10,
@@ -2237,7 +2284,7 @@ const styles = StyleSheet.create({
     color: TEXT,
   },
 
-  managerContainer: { flex: 1, backgroundColor: "#fff" },
+  managerContainer: { flex: 1, backgroundColor: BG },
   managerHeader: {
     minHeight: 72,
     flexDirection: "row",
@@ -2247,15 +2294,15 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     borderBottomWidth: 1,
     borderBottomColor: BORDER,
-    backgroundColor: "#F8FBFF",
+    backgroundColor: colors.panel,
   },
   managerIconBtn: {
     width: 42,
     height: 42,
     borderRadius: 14,
     borderWidth: 1,
-    borderColor: "#E1EAFE",
-    backgroundColor: "#FFFFFF",
+    borderColor: BORDER,
+    backgroundColor: CARD,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -2277,9 +2324,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingVertical: 12,
     borderWidth: 1,
-    borderColor: "#E7EDF8",
+    borderColor: BORDER,
     borderRadius: 18,
-    backgroundColor: "#FFFFFF",
+    backgroundColor: CARD,
     marginBottom: 10,
     shadowColor: "#0F172A",
     shadowOffset: { width: 0, height: 4 },
@@ -2291,7 +2338,7 @@ const styles = StyleSheet.create({
     width: 44,
     height: 44,
     borderRadius: 14,
-    backgroundColor: "#EDF4FF",
+    backgroundColor: colors.soft,
     alignItems: "center",
     justifyContent: "center",
     marginRight: 12,
@@ -2310,7 +2357,7 @@ const styles = StyleSheet.create({
   fileMetaPill: {
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "#EEF5FF",
+    backgroundColor: colors.soft,
     borderRadius: 999,
     paddingHorizontal: 9,
     paddingVertical: 5,
@@ -2324,7 +2371,7 @@ const styles = StyleSheet.create({
     color: PRIMARY,
   },
   fileMetaPillMuted: {
-    backgroundColor: "#F5F7FB",
+    backgroundColor: colors.inputBackground,
     borderRadius: 999,
     paddingHorizontal: 9,
     paddingVertical: 5,
@@ -2351,24 +2398,24 @@ const styles = StyleSheet.create({
     borderWidth: 1,
   },
   fileOpenBtn: {
-    backgroundColor: "#F7FAFF",
-    borderColor: "#D9E7FF",
+    backgroundColor: colors.inputBackground,
+    borderColor: BORDER,
     marginRight: 8,
   },
   fileDeleteBtn: {
-    backgroundColor: "#FFF6F6",
-    borderColor: "#FFD8D8",
+    backgroundColor: CARD,
+    borderColor: colors.danger,
   },
 
   modalBackdrop: {
     flex: 1,
-    backgroundColor: "rgba(9, 20, 42, 0.35)",
+    backgroundColor: colors.overlay,
   },
   noteSheetWrap: {
     position: "absolute",
     bottom: 0,
     width: "100%",
-    backgroundColor: "#fff",
+    backgroundColor: CARD,
     borderTopLeftRadius: 24,
     borderTopRightRadius: 24,
     paddingHorizontal: 16,
@@ -2380,7 +2427,7 @@ const styles = StyleSheet.create({
     bottom: 0,
     width: "100%",
     maxHeight: "78%",
-    backgroundColor: "#fff",
+    backgroundColor: CARD,
     borderTopLeftRadius: 22,
     borderTopRightRadius: 22,
     paddingHorizontal: 16,
@@ -2391,7 +2438,7 @@ const styles = StyleSheet.create({
     width: 42,
     height: 5,
     borderRadius: 999,
-    backgroundColor: "#D7DFEE",
+    backgroundColor: colors.separator,
     alignSelf: "center",
     marginBottom: 10,
   },
@@ -2411,9 +2458,9 @@ const styles = StyleSheet.create({
   noteLimitCard: {
     marginBottom: 14,
     borderWidth: 1,
-    borderColor: "#E2ECFF",
+    borderColor: BORDER,
     borderRadius: 16,
-    backgroundColor: "#F8FBFF",
+    backgroundColor: colors.inputBackground,
     paddingHorizontal: 14,
     paddingVertical: 12,
     flexDirection: "row",
@@ -2435,10 +2482,12 @@ const styles = StyleSheet.create({
     borderRadius: 999,
     paddingHorizontal: 10,
     paddingVertical: 6,
-    backgroundColor: "#EAFBF3",
+    backgroundColor: colors.soft,
   },
   noteLimitPillFull: {
-    backgroundColor: "#FEF2F2",
+    backgroundColor: CARD,
+    borderWidth: 1,
+    borderColor: colors.danger,
   },
   noteLimitPillText: {
     fontSize: 11,
@@ -2446,14 +2495,14 @@ const styles = StyleSheet.create({
     color: SUCCESS,
   },
   noteLimitPillTextFull: {
-    color: "#EF4444",
+    color: colors.danger,
   },
   noteListCard: {
     marginBottom: 0,
     borderWidth: 1,
-    borderColor: "#E2ECFF",
+    borderColor: BORDER,
     borderRadius: 16,
-    backgroundColor: "#FCFDFF",
+    backgroundColor: colors.inputBackground,
     paddingHorizontal: 12,
     paddingVertical: 11,
     shadowColor: "#0F172A",
@@ -2496,7 +2545,7 @@ const styles = StyleSheet.create({
     backgroundColor: PRIMARY,
   },
   noteSwipeDeleteBtn: {
-    backgroundColor: "#EF4444",
+    backgroundColor: colors.danger,
   },
   noteListHeader: {
     flexDirection: "row",
@@ -2506,7 +2555,7 @@ const styles = StyleSheet.create({
     width: 38,
     height: 38,
     borderRadius: 13,
-    backgroundColor: "#ECF3FF",
+    backgroundColor: colors.soft,
     alignItems: "center",
     justifyContent: "center",
     marginRight: 10,
@@ -2530,7 +2579,7 @@ const styles = StyleSheet.create({
   notePinnedPill: {
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "#EEF4FF",
+    backgroundColor: colors.soft,
     borderRadius: 999,
     paddingHorizontal: 7,
     paddingVertical: 4,
@@ -2564,8 +2613,8 @@ const styles = StyleSheet.create({
     height: 44,
     borderRadius: 14,
     borderWidth: 1,
-    borderColor: "#DCE8FF",
-    backgroundColor: "#F8FBFF",
+    borderColor: BORDER,
+    backgroundColor: colors.inputBackground,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
@@ -2578,8 +2627,8 @@ const styles = StyleSheet.create({
     fontWeight: "800",
   },
   noteAddAnotherBtnDisabled: {
-    borderColor: "#E2E8F0",
-    backgroundColor: "#F8FAFC",
+    borderColor: colors.border,
+    backgroundColor: colors.surfaceMuted,
   },
   noteAddAnotherTextDisabled: {
     color: MUTED,
@@ -2590,13 +2639,13 @@ const styles = StyleSheet.create({
     paddingVertical: 22,
     marginBottom: 14,
     borderWidth: 1,
-    borderColor: "#E6EDF8",
+    borderColor: BORDER,
     borderRadius: 18,
-    backgroundColor: "#FBFCFF",
+    backgroundColor: colors.inputBackground,
   },
   noteReaderScreen: {
     flex: 1,
-    backgroundColor: "#F5F7FB",
+    backgroundColor: BG,
   },
   noteReaderTopBar: {
     flexDirection: "row",
@@ -2605,16 +2654,16 @@ const styles = StyleSheet.create({
     paddingTop: 10,
     paddingBottom: 12,
     borderBottomWidth: 1,
-    borderBottomColor: "#E7ECF6",
-    backgroundColor: "#FFFFFF",
+    borderBottomColor: BORDER,
+    backgroundColor: CARD,
   },
   noteReaderIconBtn: {
     width: 42,
     height: 42,
     borderRadius: 14,
     borderWidth: 1,
-    borderColor: "#DFE9FA",
-    backgroundColor: "#FFFFFF",
+    borderColor: BORDER,
+    backgroundColor: CARD,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -2638,8 +2687,8 @@ const styles = StyleSheet.create({
     height: 42,
     borderRadius: 14,
     borderWidth: 1,
-    borderColor: "#DCE6F7",
-    backgroundColor: "#F8FBFF",
+    borderColor: BORDER,
+    backgroundColor: colors.inputBackground,
     alignItems: "center",
     justifyContent: "center",
     paddingHorizontal: 14,
@@ -2655,9 +2704,9 @@ const styles = StyleSheet.create({
   },
   noteReaderHero: {
     borderRadius: 18,
-    backgroundColor: "#FFFFFF",
+    backgroundColor: CARD,
     borderWidth: 1,
-    borderColor: "#E6ECF7",
+    borderColor: BORDER,
     padding: 16,
     marginBottom: 12,
   },
@@ -2670,7 +2719,7 @@ const styles = StyleSheet.create({
   noteReaderTypePill: {
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "#EEF4FF",
+    backgroundColor: colors.soft,
     borderRadius: 999,
     paddingHorizontal: 10,
     paddingVertical: 6,
@@ -2684,7 +2733,7 @@ const styles = StyleSheet.create({
   noteReaderPinnedPill: {
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "#F5F7FB",
+    backgroundColor: colors.inputBackground,
     borderRadius: 999,
     paddingHorizontal: 8,
     paddingVertical: 5,
@@ -2704,7 +2753,7 @@ const styles = StyleSheet.create({
   noteReaderBodyCard: {
     borderRadius: 18,
     borderWidth: 1,
-    borderColor: "#E6ECF7",
+    borderColor: BORDER,
     paddingHorizontal: 16,
     paddingTop: 14,
     paddingBottom: 20,
@@ -2724,7 +2773,7 @@ const styles = StyleSheet.create({
   },
   noteReaderDivider: {
     height: 1,
-    backgroundColor: "#E5EAF5",
+    backgroundColor: colors.separator,
     marginTop: 12,
     marginBottom: 14,
   },
@@ -2742,7 +2791,7 @@ const styles = StyleSheet.create({
     width: 40,
     height: 40,
     borderRadius: 14,
-    backgroundColor: "#ECF3FF",
+    backgroundColor: colors.soft,
     alignItems: "center",
     justifyContent: "center",
     marginBottom: 10,
@@ -2770,7 +2819,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
   },
   noteInlinePrimaryActionText: {
-    color: "#fff",
+    color: colors.white,
     fontSize: 13,
     fontWeight: "800",
   },
@@ -2793,11 +2842,11 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
     paddingVertical: 8,
     borderRadius: 999,
-    backgroundColor: "#fff",
+    backgroundColor: CARD,
     marginRight: 8,
     marginBottom: 8,
   },
-  filterChipOn: { backgroundColor: "#EAF3FF", borderColor: PRIMARY },
+  filterChipOn: { backgroundColor: colors.soft, borderColor: PRIMARY },
   filterChipText: { color: MUTED, fontSize: 12, fontWeight: "700" },
   filterChipTextOn: { color: PRIMARY },
 
@@ -2806,8 +2855,9 @@ const styles = StyleSheet.create({
     alignItems: "center",
     paddingVertical: 14,
     borderBottomWidth: 1,
-    borderBottomColor: "#F1F4FA",
+    borderBottomColor: colors.separator,
   },
   settingTitle: { fontSize: 14, fontWeight: "800", color: TEXT },
   settingSubtitle: { fontSize: 12, color: MUTED, marginTop: 4 },
 });
+}

@@ -20,6 +20,7 @@ import * as ImagePicker from "expo-image-picker";
 import { ref as dbRef, get, set } from "firebase/database";
 import { ref as stRef, uploadBytes, getDownloadURL } from "firebase/storage";
 import { database, storage } from "../constants/firebaseConfig";
+import { useAppTheme } from "../hooks/use-app-theme";
 
 const PRIMARY = "#0B72FF";
 const MUTED = "#6B78A8";
@@ -34,6 +35,8 @@ export default function TakeAssessment() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const params = useLocalSearchParams();
+  const { colors } = useAppTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
   const { assessmentId } = params;
 
   const handleBackNavigation = () => {
@@ -357,7 +360,7 @@ export default function TakeAssessment() {
 
   if (loading) {
     return (
-      <SafeAreaView style={[styles.center, { paddingTop: insets.top, backgroundColor: BG }]}>
+      <SafeAreaView style={[styles.center, { paddingTop: insets.top }]}>
         <ActivityIndicator size="large" color={PRIMARY} />
       </SafeAreaView>
     );
@@ -365,8 +368,8 @@ export default function TakeAssessment() {
 
   if (!assessment) {
     return (
-      <SafeAreaView style={[styles.center, { paddingTop: insets.top, backgroundColor: BG }]}>
-        <Text style={{ color: TEXT, fontWeight: "700" }}>Assessment not found.</Text>
+      <SafeAreaView style={[styles.center, { paddingTop: insets.top }]}>
+        <Text style={{ color: colors.text, fontWeight: "700" }}>Assessment not found.</Text>
       </SafeAreaView>
     );
   }
@@ -536,7 +539,7 @@ export default function TakeAssessment() {
               {q.type === "fill_blank" && (
                 <TextInput
                   placeholder="Type your answer"
-                  placeholderTextColor="#9AA6D1"
+                    placeholderTextColor={colors.muted}
                   style={styles.input}
                   value={answers[q.id]?.value || ""}
                   onChangeText={(t) => setFillBlank(q.id, t)}
@@ -553,7 +556,7 @@ export default function TakeAssessment() {
                         ? "Writing disabled because image answer is attached."
                         : "Write your answer..."
                     }
-                    placeholderTextColor="#9AA6D1"
+                    placeholderTextColor={colors.muted}
                     style={[styles.input, { minHeight: 100 }, writtenHasImage && styles.inputDisabled]}
                     value={answers[q.id]?.textAnswer || ""}
                     onChangeText={(t) => setWrittenText(q.id, t)}
@@ -778,37 +781,38 @@ async function uriToBlob(uri) {
   return await res.blob();
 }
 
-const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: BG },
-  center: { flex: 1, alignItems: "center", justifyContent: "center" },
+function createStyles(colors) {
+  return StyleSheet.create({
+  container: { flex: 1, backgroundColor: colors.background },
+  center: { flex: 1, alignItems: "center", justifyContent: "center", backgroundColor: colors.background },
 
   topNav: { marginBottom: 8 },
   backIconBtn: {
     width: 38,
     height: 38,
     borderRadius: 12,
-    backgroundColor: "#EEF4FF",
+    backgroundColor: colors.soft,
     alignItems: "center",
     justifyContent: "center",
   },
 
   heroCard: {
     borderWidth: 1,
-    borderColor: BORDER,
+    borderColor: colors.border,
     borderRadius: 22,
     padding: 16,
-    backgroundColor: "#F8FBFF",
+    backgroundColor: colors.panel,
     marginBottom: 14,
   },
-  title: { fontSize: 22, fontWeight: "900", color: TEXT, marginBottom: 6 },
-  metaLine: { color: MUTED, marginBottom: 5, fontWeight: "700", fontSize: 12.5 },
+  title: { fontSize: 22, fontWeight: "900", color: colors.text, marginBottom: 6 },
+  metaLine: { color: colors.muted, marginBottom: 5, fontWeight: "700", fontSize: 12.5 },
 
   timerPill: {
     alignSelf: "flex-start",
     marginTop: 8,
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "#EEF4FF",
+    backgroundColor: colors.soft,
     paddingHorizontal: 10,
     paddingVertical: 7,
     borderRadius: 999,
@@ -823,30 +827,30 @@ const styles = StyleSheet.create({
     marginTop: 8,
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "#F7FAFF",
+    backgroundColor: colors.inputBackground,
     paddingHorizontal: 10,
     paddingVertical: 7,
     borderRadius: 999,
   },
   timerMutedText: {
     marginLeft: 6,
-    color: MUTED,
+    color: colors.muted,
     fontWeight: "800",
     fontSize: 12,
   },
 
   navCard: {
     borderWidth: 1,
-    borderColor: BORDER,
+    borderColor: colors.border,
     borderRadius: 18,
     padding: 12,
-    backgroundColor: "#fff",
+    backgroundColor: colors.card,
     marginBottom: 12,
   },
   navTitle: {
     fontSize: 13,
     fontWeight: "900",
-    color: TEXT,
+    color: colors.text,
     marginBottom: 10,
   },
   navPillsRow: {
@@ -857,8 +861,8 @@ const styles = StyleSheet.create({
     height: 38,
     borderRadius: 12,
     borderWidth: 1,
-    borderColor: "#DCE8FF",
-    backgroundColor: "#fff",
+    borderColor: colors.border,
+    backgroundColor: colors.card,
     alignItems: "center",
     justifyContent: "center",
     marginRight: 8,
@@ -869,11 +873,11 @@ const styles = StyleSheet.create({
     borderColor: PRIMARY,
   },
   navPillDone: {
-    backgroundColor: "#EEF8F1",
-    borderColor: "#CDEFD8",
+    backgroundColor: colors.soft,
+    borderColor: colors.border,
   },
   navPillText: {
-    color: TEXT,
+    color: colors.text,
     fontWeight: "800",
     fontSize: 12,
   },
@@ -904,11 +908,11 @@ const styles = StyleSheet.create({
 
   card: {
     borderWidth: 1,
-    borderColor: BORDER,
+    borderColor: colors.border,
     borderRadius: 18,
     padding: 14,
     marginBottom: 12,
-    backgroundColor: "#fff",
+    backgroundColor: colors.card,
   },
   qHeader: {
     flexDirection: "row",
@@ -933,14 +937,14 @@ const styles = StyleSheet.create({
   qTitle: {
     fontSize: 15,
     fontWeight: "800",
-    color: TEXT,
+    color: colors.text,
     marginTop: 10,
     lineHeight: 21,
   },
   qMeta: {
     marginTop: 4,
     fontSize: 11.5,
-    color: MUTED,
+    color: colors.muted,
     fontWeight: "700",
     textTransform: "capitalize",
   },
@@ -954,17 +958,17 @@ const styles = StyleSheet.create({
   opt: {
     padding: 11,
     borderWidth: 1,
-    borderColor: "#DCE8FF",
+    borderColor: colors.border,
     borderRadius: 12,
     marginTop: 8,
-    backgroundColor: "#fff",
+    backgroundColor: colors.card,
   },
   optSelected: {
     borderColor: PRIMARY,
-    backgroundColor: "#EEF4FF",
+    backgroundColor: colors.soft,
   },
   optText: {
-    color: TEXT,
+    color: colors.text,
     fontWeight: "600",
     fontSize: 13,
   },
@@ -974,18 +978,18 @@ const styles = StyleSheet.create({
     height: 46,
     borderRadius: 12,
     borderWidth: 1,
-    borderColor: "#DCE8FF",
-    backgroundColor: "#fff",
+    borderColor: colors.border,
+    backgroundColor: colors.card,
     alignItems: "center",
     justifyContent: "center",
     marginRight: 10,
   },
   tfBtnSelected: {
-    backgroundColor: "#EEF4FF",
+    backgroundColor: colors.soft,
     borderColor: PRIMARY,
   },
   tfText: {
-    color: TEXT,
+    color: colors.text,
     fontWeight: "700",
   },
   tfTextSelected: {
@@ -995,22 +999,22 @@ const styles = StyleSheet.create({
   input: {
     marginTop: 8,
     borderWidth: 1,
-    borderColor: "#E5EAF5",
+    borderColor: colors.border,
     borderRadius: 12,
     padding: 12,
     textAlignVertical: "top",
-    color: TEXT,
-    backgroundColor: "#fff",
+    color: colors.text,
+    backgroundColor: colors.card,
   },
   inputDisabled: {
-    backgroundColor: "#F8FAFF",
-    color: MUTED,
+    backgroundColor: colors.inputBackground,
+    color: colors.muted,
   },
 
   uploadBtn: {
     marginTop: 10,
     alignSelf: "flex-start",
-    backgroundColor: "#EEF4FF",
+    backgroundColor: colors.soft,
     paddingHorizontal: 12,
     paddingVertical: 9,
     borderRadius: 12,
@@ -1025,7 +1029,7 @@ const styles = StyleSheet.create({
   },
   helperText: {
     marginTop: 8,
-    color: MUTED,
+    color: colors.muted,
     fontSize: 11.5,
     fontWeight: "600",
   },
@@ -1046,7 +1050,7 @@ const styles = StyleSheet.create({
     width: "100%",
     height: "100%",
     borderRadius: 10,
-    backgroundColor: "#F3F4F6",
+    backgroundColor: colors.inputBackground,
   },
   removeImgBtn: {
     position: "absolute",
@@ -1077,3 +1081,4 @@ const styles = StyleSheet.create({
     fontSize: 14,
   },
 });
+}

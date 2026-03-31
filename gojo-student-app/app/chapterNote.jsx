@@ -17,11 +17,8 @@ import { Ionicons } from "@expo/vector-icons";
 import { ref, get, set, remove, update } from "firebase/database";
 import { database } from "../constants/firebaseConfig";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { useAppTheme } from "../hooks/use-app-theme";
 
-const PRIMARY = "#0B72FF";
-const TEXT = "#0B2540";
-const MUTED = "#6B78A8";
-const BORDER = "#EAF0FF";
 const MAX_NOTES_PER_CHAPTER = 5;
 
 const NOTE_COLORS = [
@@ -54,9 +51,32 @@ function countChapterNotes(value) {
   return count;
 }
 
+function getContrastTextForBackground(bgColor, colors) {
+  const fallback = colors.text;
+  if (!bgColor || typeof bgColor !== "string") return fallback;
+  const hex = bgColor.replace("#", "").trim();
+  if (!(hex.length === 3 || hex.length === 6)) return fallback;
+  const full = hex.length === 3
+    ? hex.split("").map((c) => `${c}${c}`).join("")
+    : hex;
+  const r = parseInt(full.slice(0, 2), 16);
+  const g = parseInt(full.slice(2, 4), 16);
+  const b = parseInt(full.slice(4, 6), 16);
+  if ([r, g, b].some((v) => Number.isNaN(v))) return fallback;
+  const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+  return luminance > 0.62 ? "#0B2540" : colors.white;
+}
+
 export default function ChapterNoteScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
+  const { colors } = useAppTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
+
+  const PRIMARY = colors.primary;
+  const TEXT = colors.text;
+  const MUTED = colors.muted;
+  const BORDER = colors.border;
 
   const {
     studentId,
@@ -113,6 +133,8 @@ export default function ChapterNoteScreen() {
   const isEmptyNote = useMemo(() => {
     return !String(noteText || "").trim();
   }, [noteText]);
+
+  const noteBodyTextColor = useMemo(() => getContrastTextForBackground(colorTag, colors), [colorTag, colors]);
 
   useEffect(() => {
     (async () => {
@@ -327,10 +349,10 @@ export default function ChapterNoteScreen() {
                 size={14}
                 color={
                   saveStatus === "Saved"
-                    ? "#12B76A"
+                    ? colors.success
                     : saveStatus === "Saving..."
                     ? PRIMARY
-                    : "#EF4444"
+                    : colors.danger
                 }
               />
               <Text style={styles.statusText}>{saveStatus}</Text>
@@ -376,6 +398,7 @@ export default function ChapterNoteScreen() {
                 backgroundColor: colorTag,
                 fontSize: noteFontSize,
                 lineHeight: Math.round(noteFontSize * 1.45),
+                color: noteBodyTextColor,
               },
             ]}
           />
@@ -409,7 +432,7 @@ export default function ChapterNoteScreen() {
               ])
             }
           >
-            <Ionicons name="trash-outline" size={18} color="#EF4444" />
+            <Ionicons name="trash-outline" size={18} color={colors.danger} />
             <Text style={styles.deleteBtnText}>Delete</Text>
           </TouchableOpacity>
         </View>
@@ -432,7 +455,7 @@ export default function ChapterNoteScreen() {
                 style={[styles.settingPinChip, pinned && styles.settingPinChipActive]}
                 onPress={() => setPinned((p) => !p)}
               >
-                <Ionicons name={pinned ? "pin" : "pin-outline"} size={14} color={pinned ? "#fff" : PRIMARY} />
+                <Ionicons name={pinned ? "pin" : "pin-outline"} size={14} color={pinned ? colors.white : PRIMARY} />
                 <Text style={[styles.settingPinChipText, pinned && styles.settingPinChipTextActive]}>
                   {pinned ? "Pinned" : "Pin"}
                 </Text>
@@ -493,7 +516,7 @@ export default function ChapterNoteScreen() {
                 <Ionicons
                   name={showHelperTip ? "checkmark-circle" : "ellipse-outline"}
                   size={14}
-                  color={showHelperTip ? "#fff" : PRIMARY}
+                  color={showHelperTip ? colors.white : PRIMARY}
                 />
                 <Text style={[styles.toggleChipText, showHelperTip && styles.toggleChipTextActive]}>
                   {showHelperTip ? "On" : "Off"}
@@ -515,7 +538,7 @@ export default function ChapterNoteScreen() {
                 <Ionicons
                   name={autoSaveEnabled ? "checkmark-circle" : "ellipse-outline"}
                   size={14}
-                  color={autoSaveEnabled ? "#fff" : PRIMARY}
+                  color={autoSaveEnabled ? colors.white : PRIMARY}
                 />
                 <Text style={[styles.toggleChipText, autoSaveEnabled && styles.toggleChipTextActive]}>
                   {autoSaveEnabled ? "On" : "Off"}
@@ -533,8 +556,14 @@ export default function ChapterNoteScreen() {
   );
 }
 
-const styles = StyleSheet.create({
-  screen: { flex: 1, backgroundColor: "#F3F7FD" },
+function createStyles(colors) {
+  const PRIMARY = colors.primary;
+  const TEXT = colors.text;
+  const MUTED = colors.muted;
+  const BORDER = colors.border;
+
+  return StyleSheet.create({
+  screen: { flex: 1, backgroundColor: colors.background },
   center: { flex: 1, alignItems: "center", justifyContent: "center" },
 
   topBar: {
@@ -543,16 +572,16 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     paddingBottom: 9,
     borderBottomWidth: 1,
-    borderBottomColor: "#E1E9FA",
-    backgroundColor: "#FFFFFF",
+    borderBottomColor: BORDER,
+    backgroundColor: colors.card,
   },
   topIconBtn: {
     width: 38,
     height: 38,
     borderRadius: 11,
-    backgroundColor: "#FFFFFF",
+    backgroundColor: colors.card,
     borderWidth: 1,
-    borderColor: "#DCE7FF",
+    borderColor: BORDER,
     alignItems: "center",
     justifyContent: "center",
     shadowColor: "#0F172A",
@@ -575,8 +604,8 @@ const styles = StyleSheet.create({
 
   statusCard: {
     borderWidth: 1,
-    borderColor: "#E4ECFF",
-    backgroundColor: "#FFFFFF",
+    borderColor: BORDER,
+    backgroundColor: colors.card,
     borderRadius: 14,
     paddingHorizontal: 11,
     paddingVertical: 8,
@@ -602,7 +631,7 @@ const styles = StyleSheet.create({
   statusPill: {
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "#F8FBFF",
+    backgroundColor: colors.inputBackground,
     borderWidth: 1,
     borderColor: BORDER,
     borderRadius: 999,
@@ -617,8 +646,8 @@ const styles = StyleSheet.create({
   },
   editorCard: {
     borderWidth: 1,
-    borderColor: "#E4ECFF",
-    backgroundColor: "#FFFFFF",
+    borderColor: BORDER,
+    backgroundColor: colors.card,
     borderRadius: 14,
     paddingHorizontal: 11,
     paddingVertical: 9,
@@ -638,14 +667,14 @@ const styles = StyleSheet.create({
 
   titleInput: {
     borderWidth: 1,
-    borderColor: "#DCE7FF",
+    borderColor: BORDER,
     borderRadius: 12,
     paddingHorizontal: 14,
     height: 42,
     fontSize: 15,
     color: TEXT,
     fontWeight: "800",
-    backgroundColor: "#FBFDFF",
+    backgroundColor: colors.inputBackground,
   },
 
   sectionLabel: {
@@ -679,7 +708,7 @@ const styles = StyleSheet.create({
   bodyInput: {
     minHeight: 250,
     borderWidth: 1,
-    borderColor: "#DCE7FF",
+    borderColor: BORDER,
     borderRadius: 14,
     padding: 12,
     fontSize: 15,
@@ -690,8 +719,8 @@ const styles = StyleSheet.create({
   helperCard: {
     marginTop: 4,
     borderWidth: 1,
-    borderColor: "#EDE7D0",
-    backgroundColor: "#FFFDF6",
+    borderColor: BORDER,
+    backgroundColor: colors.inputBackground,
     borderRadius: 14,
     padding: 12,
   },
@@ -728,7 +757,7 @@ const styles = StyleSheet.create({
     marginRight: 10,
   },
   primaryBtnText: {
-    color: "#fff",
+    color: colors.white,
     fontWeight: "800",
     marginLeft: 8,
   },
@@ -738,21 +767,21 @@ const styles = StyleSheet.create({
     height: 50,
     borderRadius: 14,
     borderWidth: 1,
-    borderColor: "#FECACA",
-    backgroundColor: "#FFF5F5",
+    borderColor: colors.danger,
+    backgroundColor: colors.card,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
   },
   deleteBtnText: {
-    color: "#EF4444",
+    color: colors.danger,
     fontWeight: "800",
     marginLeft: 6,
   },
 
   settingsBackdrop: {
     flex: 1,
-    backgroundColor: "rgba(9, 20, 42, 0.38)",
+    backgroundColor: colors.overlay,
   },
   settingsSheet: {
     position: "absolute",
@@ -760,7 +789,7 @@ const styles = StyleSheet.create({
     width: "100%",
     borderTopLeftRadius: 24,
     borderTopRightRadius: 24,
-    backgroundColor: "#FFFFFF",
+    backgroundColor: colors.card,
     paddingHorizontal: 14,
     paddingTop: 10,
   },
@@ -768,7 +797,7 @@ const styles = StyleSheet.create({
     width: 42,
     height: 5,
     borderRadius: 999,
-    backgroundColor: "#D7DFEE",
+    backgroundColor: colors.separator,
     alignSelf: "center",
     marginBottom: 10,
   },
@@ -780,9 +809,9 @@ const styles = StyleSheet.create({
   },
   settingsCard: {
     borderWidth: 1,
-    borderColor: "#E4ECFF",
+    borderColor: BORDER,
     borderRadius: 14,
-    backgroundColor: "#FBFDFF",
+    backgroundColor: colors.inputBackground,
     paddingHorizontal: 11,
     paddingVertical: 10,
   },
@@ -810,7 +839,7 @@ const styles = StyleSheet.create({
     borderRadius: 999,
     paddingHorizontal: 10,
     paddingVertical: 6,
-    backgroundColor: "#fff",
+    backgroundColor: colors.card,
     marginLeft: 8,
   },
   settingPinChipActive: {
@@ -823,7 +852,7 @@ const styles = StyleSheet.create({
     fontSize: 12,
   },
   settingPinChipTextActive: {
-    color: "#fff",
+    color: colors.white,
   },
   settingsDoneBtn: {
     marginTop: 12,
@@ -839,7 +868,7 @@ const styles = StyleSheet.create({
     elevation: 5,
   },
   settingsDoneText: {
-    color: "#fff",
+    color: colors.white,
     fontWeight: "900",
     fontSize: 14,
   },
@@ -862,8 +891,8 @@ const styles = StyleSheet.create({
     height: 30,
     borderRadius: 10,
     borderWidth: 1,
-    borderColor: "#D4E2FF",
-    backgroundColor: "#FFFFFF",
+    borderColor: BORDER,
+    backgroundColor: colors.card,
     alignItems: "center",
     justifyContent: "center",
     marginLeft: 6,
@@ -878,14 +907,14 @@ const styles = StyleSheet.create({
     color: PRIMARY,
   },
   sizeChipTextActive: {
-    color: "#fff",
+    color: colors.white,
   },
   toggleChip: {
     height: 30,
     borderRadius: 999,
     borderWidth: 1,
     borderColor: PRIMARY,
-    backgroundColor: "#fff",
+    backgroundColor: colors.card,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
@@ -901,6 +930,7 @@ const styles = StyleSheet.create({
     color: PRIMARY,
   },
   toggleChipTextActive: {
-    color: "#fff",
+    color: colors.white,
   },
 });
+}

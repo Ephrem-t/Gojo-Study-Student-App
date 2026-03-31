@@ -1,11 +1,17 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ThemeProvider } from "@react-navigation/native";
 import { SafeAreaView, StyleSheet, View, Text, TouchableOpacity, Animated, Easing } from "react-native";
-import { Slot, useRouter } from "expo-router";
+import { Stack, usePathname, useRouter } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Ionicons } from "@expo/vector-icons";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { getValue } from "./lib/dbHelpers";
+import { AppThemeProvider, useAppTheme } from "../hooks/use-app-theme";
+
+export const unstable_settings = {
+  initialRouteName: "index",
+};
 
 type Notif = {
   id: string;
@@ -26,17 +32,56 @@ type Notif = {
 
 export default function RootLayout() {
   return (
-    <SafeAreaView style={styles.container}>
-      <StatusBar style="auto" />
-      <GlobalNotificationToast />
-      <Slot />
-    </SafeAreaView>
+    <AppThemeProvider>
+      <ThemedRootLayout />
+    </AppThemeProvider>
+  );
+}
+
+function ThemedRootLayout() {
+  const router = useRouter();
+  const pathname = usePathname();
+  const { colors, navigationTheme, statusBarStyle } = useAppTheme();
+  const bootRedirectDoneRef = useRef(false);
+
+  useEffect(() => {
+    if (bootRedirectDoneRef.current) return;
+
+    (async () => {
+      const role = await AsyncStorage.getItem("role");
+      const userId = await AsyncStorage.getItem("userId");
+      if (role !== "student" || !userId) return;
+
+      const currentPath = String(pathname || "/");
+      const shouldForceHome =
+        currentPath === "/" ||
+        currentPath === "/index" ||
+        currentPath === "/setting";
+
+      if (shouldForceHome) {
+        bootRedirectDoneRef.current = true;
+        router.replace("/dashboard/home");
+      }
+    })();
+  }, [pathname, router]);
+
+  return (
+    <ThemeProvider value={navigationTheme}>
+      <SafeAreaView style={[styles.container, { backgroundColor: colors.background }]}>
+        <StatusBar style={statusBarStyle} backgroundColor={colors.background} />
+        <GlobalNotificationToast />
+        <Stack initialRouteName="index" screenOptions={{ headerShown: false, contentStyle: { backgroundColor: colors.background } }}>
+          <Stack.Screen name="setting" options={{ animation: "slide_from_right", presentation: "card" }} />
+        </Stack>
+      </SafeAreaView>
+    </ThemeProvider>
   );
 }
 
 function GlobalNotificationToast() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
+  const { colors } = useAppTheme();
 
   const [current, setCurrent] = useState<Notif | null>(null);
   const [queue, setQueue] = useState<Notif[]>([]);
@@ -195,7 +240,7 @@ function GlobalNotificationToast() {
     <Animated.View style={[styles.toastWrap, { top: insets.top + 8, transform: [{ translateY: slideY }], opacity }]}>
       <TouchableOpacity
         activeOpacity={0.92}
-        style={styles.toastCard}
+        style={[styles.toastCard, { backgroundColor: colors.card, borderColor: colors.border }]}
         onPress={async () => {
           const n = current;
           hideToast();
@@ -206,17 +251,17 @@ function GlobalNotificationToast() {
           <View style={[styles.toastIconWrap, { backgroundColor: vis.bg }]}>
             <Ionicons name={vis.icon} size={16} color={vis.color} />
           </View>
-          <Text style={styles.toastTitle} numberOfLines={1}>
+          <Text style={[styles.toastTitle, { color: colors.text }]} numberOfLines={1}>
             {current.title || "New Notification"}
           </Text>
         </View>
         {!!current.body && (
-          <Text style={styles.toastBody} numberOfLines={2}>
+          <Text style={[styles.toastBody, { color: colors.muted }]} numberOfLines={2}>
             {current.body}
           </Text>
         )}
-        <View style={styles.toastBarTrack}>
-          <Animated.View style={[styles.toastBarFill, { width: progressWidth }]} />
+        <View style={[styles.toastBarTrack, { backgroundColor: colors.surfaceMuted }]}>
+          <Animated.View style={[styles.toastBarFill, { width: progressWidth, backgroundColor: colors.primary }]} />
         </View>
       </TouchableOpacity>
     </Animated.View>
@@ -224,7 +269,7 @@ function GlobalNotificationToast() {
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: "#fff" },
+  container: { flex: 1 },
 
   toastWrap: {
     position: "absolute",
@@ -234,9 +279,7 @@ const styles = StyleSheet.create({
     elevation: 9999,
   },
   toastCard: {
-    backgroundColor: "#fff",
     borderWidth: 1,
-    borderColor: "#EAF0FF",
     borderRadius: 12,
     paddingHorizontal: 12,
     paddingVertical: 10,
@@ -254,18 +297,16 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     marginRight: 8,
   },
-  toastTitle: { color: "#0B2540", fontWeight: "900", flex: 1 },
-  toastBody: { marginTop: 6, color: "#6B78A8", fontSize: 12, lineHeight: 16 },
+  toastTitle: { fontWeight: "900", flex: 1 },
+  toastBody: { marginTop: 6, fontSize: 12, lineHeight: 16 },
   toastBarTrack: {
     marginTop: 8,
     height: 4,
     borderRadius: 999,
     overflow: "hidden",
-    backgroundColor: "#EAF0FF",
   },
   toastBarFill: {
     height: 4,
     borderRadius: 999,
-    backgroundColor: "#0B72FF",
   },
 });

@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback, useRef } from "react";
+import React, { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import {
   View,
   Text,
@@ -21,9 +21,9 @@ import { useRouter } from "expo-router";
 import { setOpenedChat } from "./lib/chatStore";
 import { useFocusEffect } from "@react-navigation/native";
 import { getUserVal } from "./lib/userHelpers";
+import { useAppTheme } from "../hooks/use-app-theme";
+import { extractProfileImage, normalizeProfileImageUri } from "./lib/profileImage";
 
-const PRIMARY = "#007AFB";
-const MUTED = "#6B78A8";
 const AVATAR_PLACEHOLDER = require("../assets/images/avatar_placeholder.png");
 
 const FILTERS = ["Parents", "Teachers", "Management", "Support"];
@@ -51,6 +51,8 @@ function fmtTime12(ts) {
 
 export default function ChatsScreen() {
   const router = useRouter();
+  const { colors, statusBarStyle } = useAppTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
 
   const [loadingInitial, setLoadingInitial] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -283,7 +285,7 @@ export default function ChatsScreen() {
           userId: p?.userId || nodeK,
           name: p?.name || p?.username || "Teacher",
           role: "Teacher",
-          profileImage: p?.profileImage || null,
+          profileImage: extractProfileImage(p),
           type: "teacher",
           chatId: null,
           lastMessage: null,
@@ -302,7 +304,7 @@ export default function ChatsScreen() {
           userId: p?.userId || nodeK,
           name: p?.name || p?.username || "Parent",
           role: "Parent",
-          profileImage: p?.profileImage || null,
+          profileImage: extractProfileImage(p),
           type: "parent",
           chatId: null,
           lastMessage: null,
@@ -323,7 +325,7 @@ export default function ChatsScreen() {
           userId: p?.userId || nodeK,
           name: p?.name || p?.username || roleLabel,
           role: roleLabel, // Registerer / Finance / Management
-          profileImage: p?.profileImage || null,
+          profileImage: extractProfileImage(p),
           type: "management",
           chatId: null,
           lastMessage: null,
@@ -344,7 +346,7 @@ export default function ChatsScreen() {
           userId: p?.userId || nodeK,
           name: p?.name || p?.username || roleLabel,
           role: roleLabel,
-          profileImage: p?.profileImage || null,
+          profileImage: extractProfileImage(p),
           type: "support",
           chatId: null,
           lastMessage: null,
@@ -503,7 +505,7 @@ export default function ChatsScreen() {
       contactKey: contact.key || "",
       contactUserId: contactUserId || "",
       contactName: contact.name || "",
-      contactImage: contact.profileImage || "",
+      contactImage: normalizeProfileImageUri(contact.profileImage) || "",
     });
 
     router.push("/messages");
@@ -531,11 +533,11 @@ export default function ChatsScreen() {
 
   return (
     <SafeAreaView edges={["top", "bottom"]} style={styles.safe}>
-      <StatusBar barStyle="dark-content" backgroundColor="#ffffff" translucent={false} />
+      <StatusBar barStyle={statusBarStyle === "dark" ? "dark-content" : "light-content"} backgroundColor={colors.background} translucent={false} />
       <View style={styles.container}>
         <View style={styles.headerRow}>
           <TouchableOpacity onPress={onBackPress} style={styles.backButton}>
-            <Ionicons name="chevron-back" size={22} color="#222" />
+            <Ionicons name="chevron-back" size={22} color={colors.text} />
           </TouchableOpacity>
 
           {searchActive ? (
@@ -571,7 +573,7 @@ export default function ChatsScreen() {
             }}
             style={styles.searchToggle}
           >
-            <Ionicons name={searchActive ? "close" : "search-outline"} size={20} color={MUTED} />
+            <Ionicons name={searchActive ? "close" : "search-outline"} size={20} color={colors.muted} />
           </TouchableOpacity>
         </View>
 
@@ -588,7 +590,7 @@ export default function ChatsScreen() {
         ) : null}
 
         {loadingInitial && contacts.length === 0 ? (
-          <View style={styles.center}><ActivityIndicator size="large" color={PRIMARY} /></View>
+          <View style={styles.center}><ActivityIndicator size="large" color={colors.primary} /></View>
         ) : searchActive && !shouldShowSearchResults ? (
           <View style={styles.emptyWrap}>
             <Text style={styles.emptyTitle}>Search chats</Text>
@@ -614,7 +616,7 @@ export default function ChatsScreen() {
               return (
                 <TouchableOpacity style={styles.itemWrapper} onPress={() => onOpenChat(item)} activeOpacity={0.9}>
                   <View style={styles.row}>
-                    <Image source={item.profileImage ? { uri: item.profileImage } : AVATAR_PLACEHOLDER} style={styles.avatar} />
+                    <Image source={normalizeProfileImageUri(item.profileImage) ? { uri: normalizeProfileImageUri(item.profileImage) } : AVATAR_PLACEHOLDER} style={styles.avatar} />
                     <View style={{ flex: 1, marginLeft: 12 }}>
                       <View style={styles.rowTop}>
                         <View style={{ flex: 1, flexDirection: "row", alignItems: "center" }}>
@@ -626,7 +628,7 @@ export default function ChatsScreen() {
                           <Text style={styles.time}>{fmtTime12(item.lastTime)}</Text>
                           <View style={{ width: 8 }} />
                           {lastWasMine ? (
-                            <Ionicons name={seenFlag ? "checkmark-done" : "checkmark"} size={16} color={seenFlag ? PRIMARY : MUTED} />
+                            <Ionicons name={seenFlag ? "checkmark-done" : "checkmark"} size={16} color={seenFlag ? colors.primary : colors.muted} />
                           ) : null}
                           {item.unread ? <View style={styles.unreadPill}><Text style={styles.unreadText}>{item.unread}</Text></View> : null}
                         </View>
@@ -651,13 +653,14 @@ export default function ChatsScreen() {
   );
 }
 
-const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: "#fff" },
-  container: { flex: 1, backgroundColor: "#fff" },
+function createStyles(colors) {
+  return StyleSheet.create({
+  safe: { flex: 1, backgroundColor: colors.background },
+  container: { flex: 1, backgroundColor: colors.background },
 
   headerRow: { paddingHorizontal: 12, paddingTop: 12, paddingBottom: 6, flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
   backButton: { width: 36, height: 36, alignItems: "center", justifyContent: "center" },
-  headerTitle: { fontSize: 20, fontWeight: "800", color: "#111" },
+  headerTitle: { fontSize: 20, fontWeight: "800", color: colors.text },
   searchToggle: { width: 36, height: 36, alignItems: "center", justifyContent: "center" },
   searchBar: {
     flex: 1,
@@ -665,8 +668,8 @@ const styles = StyleSheet.create({
     marginHorizontal: 10,
     borderRadius: 14,
     borderWidth: 1,
-    borderColor: "#DCE7FF",
-    backgroundColor: "#F8FBFF",
+    borderColor: colors.border,
+    backgroundColor: colors.inputBackground,
     paddingHorizontal: 12,
     flexDirection: "row",
     alignItems: "center",
@@ -674,7 +677,7 @@ const styles = StyleSheet.create({
   searchInput: {
     flex: 1,
     marginLeft: 8,
-    color: "#111",
+    color: colors.text,
     fontSize: 14,
     fontWeight: "600",
     paddingVertical: 0,
@@ -703,36 +706,37 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
     borderRadius: 999,
     borderWidth: 1,
-    borderColor: "#DCE7FF",
-    backgroundColor: "#FFFFFF",
+    borderColor: colors.border,
+    backgroundColor: colors.card,
     justifyContent: "center",
     alignItems: "center",
   },
   filterPillActive: {
-    backgroundColor: "#EEF4FF",
-    borderColor: "#BBD3FF",
+    backgroundColor: colors.soft,
+    borderColor: colors.primary,
   },
-  filterPillText: { color: MUTED, fontWeight: "700", fontSize: 12 },
-  filterPillTextActive: { color: PRIMARY },
+  filterPillText: { color: colors.muted, fontWeight: "700", fontSize: 12 },
+  filterPillTextActive: { color: colors.primary },
 
   itemWrapper: { paddingHorizontal: 0 },
-  row: { flexDirection: "row", alignItems: "center", paddingVertical: 12, backgroundColor: "#fff" },
-  avatar: { width: 56, height: 56, borderRadius: 28, backgroundColor: "#F1F3F8" },
+  row: { flexDirection: "row", alignItems: "center", paddingVertical: 12, backgroundColor: colors.background },
+  avatar: { width: 56, height: 56, borderRadius: 28, backgroundColor: colors.surfaceMuted },
   rowTop: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
-  name: { fontWeight: "700", fontSize: 16, color: "#111", marginRight: 8 },
-  badge: { marginLeft: -4, paddingHorizontal: 7, paddingVertical: 3, borderRadius: 8, backgroundColor: "#F1F7FF" },
-  badgeText: { color: PRIMARY, fontWeight: "700", fontSize: 11 },
-  subtitleText: { color: MUTED, fontSize: 13, flex: 1 },
+  name: { fontWeight: "700", fontSize: 16, color: colors.text, marginRight: 8 },
+  badge: { marginLeft: -4, paddingHorizontal: 7, paddingVertical: 3, borderRadius: 8, backgroundColor: colors.badgeBackground },
+  badgeText: { color: colors.primary, fontWeight: "700", fontSize: 11 },
+  subtitleText: { color: colors.muted, fontSize: 13, flex: 1 },
 
-  time: { color: MUTED, fontSize: 11 },
-  unreadPill: { marginTop: 8, backgroundColor: PRIMARY, paddingHorizontal: 8, paddingVertical: 3, borderRadius: 12, minWidth: 24, alignItems: "center" },
-  unreadText: { color: "#fff", fontWeight: "700", fontSize: 12 },
+  time: { color: colors.muted, fontSize: 11 },
+  unreadPill: { marginTop: 8, backgroundColor: colors.primary, paddingHorizontal: 8, paddingVertical: 3, borderRadius: 12, minWidth: 24, alignItems: "center" },
+  unreadText: { color: colors.white, fontWeight: "700", fontSize: 12 },
 
-  separatorLine: { height: 1, backgroundColor: "#EEF4FF", marginLeft: 56 + 12 + 8, marginRight: 0 },
+  separatorLine: { height: 1, backgroundColor: colors.separator, marginLeft: 56 + 12 + 8, marginRight: 0 },
 
   center: { flex: 1, alignItems: "center", justifyContent: "center" },
 
   emptyWrap: { flex: 1, alignItems: "center", justifyContent: "center", paddingTop: 40, paddingHorizontal: 24 },
-  emptyTitle: { fontWeight: "700", fontSize: 16, color: "#222", textAlign: "center" },
-  emptySubtitle: { color: MUTED, marginTop: 6, textAlign: "center" },
+  emptyTitle: { fontWeight: "700", fontSize: 16, color: colors.text, textAlign: "center" },
+  emptySubtitle: { color: colors.muted, marginTop: 6, textAlign: "center" },
 });
+}

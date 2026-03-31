@@ -17,6 +17,7 @@ import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
 import { SafeAreaView } from "react-native-safe-area-context";
 import * as EthiopianDate from "ethiopian-date";
+import { useAppTheme } from "../hooks/use-app-theme";
 
 const PRIMARY = "#2563EB";
 const PRIMARY_DARK = "#1D4ED8";
@@ -520,6 +521,8 @@ function buildMovableClosureEvents(yearStart, yearEnd, amharic = false) {
 
 export default function CalendarTab() {
   const router = useRouter();
+  const { colors } = useAppTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
   const todayEth = getTodayEthiopian();
 
   const [loading, setLoading] = useState(true);
@@ -1402,21 +1405,28 @@ export default function CalendarTab() {
   );
 }
 
-const styles = StyleSheet.create({
+function createStyles(colors) {
+  const BG = colors.background;
+  const CARD = colors.card;
+  const TEXT = colors.text;
+  const MUTED = colors.muted;
+  const BORDER = colors.border;
+
+  return StyleSheet.create({
   container: { flex: 1, backgroundColor: BG },
   modalBackdrop: {
     flex: 1,
-    backgroundColor: "rgba(15,23,42,0.22)",
+    backgroundColor: colors.overlay,
   },
   bottomSheet: {
-    backgroundColor: "#FFFFFF",
+    backgroundColor: colors.card,
     borderTopLeftRadius: 24,
     borderTopRightRadius: 24,
     paddingHorizontal: 18,
     paddingTop: 10,
     paddingBottom: 28,
     borderTopWidth: 1,
-    borderColor: "#E5EDFA",
+    borderColor: colors.border,
     shadowColor: "#0F172A",
     shadowOffset: { width: 0, height: -8 },
     shadowOpacity: 0.08,
@@ -1428,7 +1438,7 @@ const styles = StyleSheet.create({
     width: 42,
     height: 5,
     borderRadius: 999,
-    backgroundColor: "#CBD5E1",
+    backgroundColor: colors.border,
     marginBottom: 12,
   },
   sheetTitle: {
@@ -1447,9 +1457,9 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    backgroundColor: "#FAFCFF",
+    backgroundColor: colors.inputBackground,
     borderWidth: 1,
-    borderColor: "#E4ECF9",
+    borderColor: colors.border,
     borderRadius: 16,
     paddingHorizontal: 12,
     paddingVertical: 12,
@@ -1465,7 +1475,7 @@ const styles = StyleSheet.create({
     width: 38,
     height: 38,
     borderRadius: 12,
-    backgroundColor: "#EEF4FF",
+    backgroundColor: colors.soft,
     alignItems: "center",
     justifyContent: "center",
     marginRight: 10,
@@ -1488,7 +1498,7 @@ const styles = StyleSheet.create({
     color: PRIMARY,
     fontSize: 11,
     fontWeight: "800",
-    backgroundColor: "#EEF4FF",
+    backgroundColor: colors.soft,
     borderRadius: 999,
     paddingHorizontal: 10,
     paddingVertical: 6,
@@ -1506,8 +1516,8 @@ const styles = StyleSheet.create({
     height: 34,
     borderRadius: 17,
     borderWidth: 1,
-    borderColor: "#DCEAFE",
-    backgroundColor: "#F8FBFF",
+    borderColor: colors.border,
+    backgroundColor: colors.inputBackground,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -1581,9 +1591,9 @@ const styles = StyleSheet.create({
     lineHeight: 16,
   },
   heroModePill: {
-    backgroundColor: "#F8FBFF",
+    backgroundColor: colors.inputBackground,
     borderWidth: 1,
-    borderColor: "#DCEAFE",
+    borderColor: colors.border,
     borderRadius: 999,
     flexDirection: "row",
     alignItems: "center",
@@ -1607,9 +1617,9 @@ const styles = StyleSheet.create({
     borderRadius: 999,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "#F8FBFF",
+    backgroundColor: colors.inputBackground,
     borderWidth: 1,
-    borderColor: "#DCEAFE",
+    borderColor: colors.border,
   },
   heroMetaRow: {
     flexDirection: "row",
@@ -1618,9 +1628,9 @@ const styles = StyleSheet.create({
   },
   heroMetaChip: {
     flex: 1,
-    backgroundColor: "#FAFCFF",
+    backgroundColor: colors.inputBackground,
     borderWidth: 1,
-    borderColor: "#E3EDFF",
+    borderColor: colors.border,
     borderRadius: 12,
     paddingHorizontal: 10,
     paddingVertical: 9,
@@ -1653,7 +1663,7 @@ const styles = StyleSheet.create({
     backgroundColor: CARD,
     borderRadius: 20,
     borderWidth: 1,
-    borderColor: "#E8EEF8",
+    borderColor: colors.border,
     paddingVertical: 14,
     paddingHorizontal: 14,
     marginBottom: 12,
@@ -1674,9 +1684,9 @@ const styles = StyleSheet.create({
   softChip: {
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "#F8FAFF",
+    backgroundColor: colors.inputBackground,
     borderWidth: 1,
-    borderColor: "#DBEAFE",
+    borderColor: colors.border,
     borderRadius: 999,
     paddingHorizontal: 11,
     paddingVertical: 7,
@@ -1697,9 +1707,9 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     marginBottom: 12,
-    backgroundColor: "#F8FAFF",
+    backgroundColor: colors.inputBackground,
     borderWidth: 1,
-    borderColor: "#E5EDFA",
+    borderColor: colors.border,
     borderRadius: 14,
     paddingHorizontal: 8,
     paddingVertical: 8,
@@ -1708,7 +1718,7 @@ const styles = StyleSheet.create({
     width: 34,
     height: 34,
     borderRadius: 17,
-    backgroundColor: "#EDF4FF",
+    backgroundColor: colors.soft,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -1735,17 +1745,17 @@ const styles = StyleSheet.create({
     flex: 1,
     justifyContent: "center",
     paddingHorizontal: 18,
-    backgroundColor: "rgba(15,23,42,0.18)",
+    backgroundColor: colors.overlay,
   },
   pickerBackdrop: {
     ...StyleSheet.absoluteFillObject,
   },
   pickerSheet: {
-    backgroundColor: "#FFFFFF",
+    backgroundColor: colors.card,
     borderRadius: 28,
     padding: 20,
     borderWidth: 1,
-    borderColor: "#E6EEF9",
+    borderColor: colors.border,
     shadowColor: "#0F172A",
     shadowOffset: { width: 0, height: 14 },
     shadowOpacity: 0.1,
@@ -1766,10 +1776,10 @@ const styles = StyleSheet.create({
     paddingRight: 12,
   },
   pickerPreviewCard: {
-    backgroundColor: "#F8FAFF",
+    backgroundColor: colors.inputBackground,
     borderRadius: 18,
     borderWidth: 1,
-    borderColor: "#E3ECFB",
+    borderColor: colors.border,
     paddingHorizontal: 14,
     paddingVertical: 13,
     marginBottom: 14,
@@ -1810,9 +1820,9 @@ const styles = StyleSheet.create({
     paddingBottom: 4,
   },
   pickerChip: {
-    backgroundColor: "#FAFCFF",
+    backgroundColor: colors.inputBackground,
     borderWidth: 1,
-    borderColor: "#E1EAF8",
+    borderColor: colors.border,
     borderRadius: 16,
     minHeight: 46,
     paddingHorizontal: 12,
@@ -1869,9 +1879,9 @@ const styles = StyleSheet.create({
     paddingRight: 6,
   },
   choiceChip: {
-    backgroundColor: "#FFFFFF",
+    backgroundColor: colors.card,
     borderWidth: 1,
-    borderColor: "#E6EDF8",
+    borderColor: colors.border,
     borderRadius: 999,
     paddingHorizontal: 11,
     paddingVertical: 8,
@@ -1913,9 +1923,9 @@ const styles = StyleSheet.create({
 
   weekRow: {
     flexDirection: "row",
-    backgroundColor: "#F3F7FF",
+    backgroundColor: colors.surfaceMuted,
     borderWidth: 1,
-    borderColor: "#DDE7F6",
+    borderColor: colors.border,
     borderRadius: 12,
     overflow: "hidden",
     marginBottom: 4,
@@ -1923,20 +1933,20 @@ const styles = StyleSheet.create({
   weekCell: {
     width: `${100 / 7}%`,
     borderRightWidth: 1,
-    borderRightColor: "#E4ECF9",
+    borderRightColor: colors.border,
     paddingVertical: 8,
   },
   weekText: {
     textAlign: "center",
     fontSize: 11,
-    color: "#475569",
+    color: colors.muted,
     fontWeight: "800",
   },
 
   gridWrap: {
-    backgroundColor: "#FFFFFF",
+    backgroundColor: colors.card,
     borderWidth: 1,
-    borderColor: "#DDE7F6",
+    borderColor: colors.border,
     borderRadius: 14,
     padding: 0,
     flexDirection: "row",
@@ -1951,14 +1961,14 @@ const styles = StyleSheet.create({
     borderRadius: 0,
     borderRightWidth: 1,
     borderBottomWidth: 1,
-    borderColor: "#E6EDF9",
+    borderColor: colors.border,
     paddingTop: 5,
     paddingBottom: 2,
     overflow: "hidden",
-    backgroundColor: "#FFFFFF",
+    backgroundColor: colors.card,
   },
   dayCellOutside: {
-    backgroundColor: "#F8FAFF",
+    backgroundColor: colors.inputBackground,
   },
   daySelected: {
     backgroundColor: "#EAF2FF",
@@ -1973,7 +1983,7 @@ const styles = StyleSheet.create({
     color: PRIMARY_DARK,
   },
   dayTextOutside: {
-    color: "#94A3B8",
+    color: colors.muted,
     fontWeight: "700",
     fontSize: 14,
   },
@@ -2019,9 +2029,9 @@ const styles = StyleSheet.create({
   selectedDatePill: {
     minWidth: "48%",
     flexGrow: 1,
-    backgroundColor: "#FAFCFF",
+    backgroundColor: colors.inputBackground,
     borderWidth: 1,
-    borderColor: "#E4ECF9",
+    borderColor: colors.border,
     borderRadius: 14,
     paddingHorizontal: 11,
     paddingVertical: 10,
@@ -2044,12 +2054,12 @@ const styles = StyleSheet.create({
 
   eventCard: {
     borderWidth: 1,
-    borderColor: "#E8EEF8",
+    borderColor: colors.border,
     borderRadius: 16,
     paddingHorizontal: 12,
     paddingVertical: 10,
     marginBottom: 8,
-    backgroundColor: "#FCFDFF",
+    backgroundColor: colors.card,
   },
   eventTop: {
     flexDirection: "row",
@@ -2088,9 +2098,9 @@ const styles = StyleSheet.create({
   eventMetaPill: {
     minWidth: "48%",
     flexGrow: 1,
-    backgroundColor: "#F7FAFF",
+    backgroundColor: colors.inputBackground,
     borderWidth: 1,
-    borderColor: "#E6EDF9",
+    borderColor: colors.border,
     borderRadius: 12,
     paddingHorizontal: 10,
     paddingVertical: 8,
@@ -2142,7 +2152,7 @@ const styles = StyleSheet.create({
   eventNoteCompact: {
     marginTop: 8,
     fontSize: 12,
-    color: "#334155",
+    color: colors.muted,
     lineHeight: 17,
   },
 
@@ -2151,9 +2161,9 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     alignItems: "flex-start",
     borderWidth: 1,
-    borderColor: "#E8EEF8",
+    borderColor: colors.border,
     borderRadius: 14,
-    backgroundColor: "#FCFDFF",
+    backgroundColor: colors.card,
     paddingHorizontal: 12,
     paddingVertical: 10,
     marginBottom: 8,
@@ -2175,7 +2185,7 @@ const styles = StyleSheet.create({
   },
   upcomingSub: {
     fontSize: 11,
-    color: "#475569",
+    color: colors.muted,
     marginTop: 2,
     lineHeight: 16,
   },
@@ -2185,3 +2195,4 @@ const styles = StyleSheet.create({
     paddingTop: 2,
   },
 });
+}

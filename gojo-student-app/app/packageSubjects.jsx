@@ -18,15 +18,13 @@ import { useLocalSearchParams, useRouter } from "expo-router";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { getValue, safeUpdate } from "./lib/dbHelpers";
+import { useAppTheme } from "../hooks/use-app-theme";
 
 if (Platform.OS === "android" && UIManager.setLayoutAnimationEnabledExperimental) {
   UIManager.setLayoutAnimationEnabledExperimental(true);
 }
 
 const PRIMARY = "#0B72FF";
-const BG = "#FFFFFF";
-const TEXT = "#0B2540";
-const MUTED = "#6B78A8";
 const HEART_REFILL_MS = 20 * 60 * 1000;
 const DEFAULT_GLOBAL_MAX_LIVES = 5;
 const HEART_COLOR = "#EF4444";
@@ -83,6 +81,12 @@ function computeRefillState({ currentLives, maxLives, lastConsumedAt, refillMs, 
 export default function PackageSubjects() {
   const router = useRouter();
   const params = useLocalSearchParams();
+  const { colors } = useAppTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
+  const modalStyles = useMemo(() => createModalStyles(colors), [colors]);
+
+  const TEXT = colors.text;
+  const MUTED = colors.muted;
 
   const packageId = params.packageId;
   const packageName = params.packageName || "Package";
@@ -590,7 +594,7 @@ export default function PackageSubjects() {
 
       {whatsNew.length > 0 ? (
         <View style={{ paddingHorizontal: 16, paddingBottom: 8 }}>
-          <Text style={{ fontWeight: "900", color: TEXT, marginBottom: 8 }}>What’s New</Text>
+          <Text style={styles.whatsNewTitle}>What’s New</Text>
           <FlatList
             horizontal
             data={whatsNew}
@@ -812,7 +816,7 @@ export default function PackageSubjects() {
             <Text style={modalStyles.text}>Lives are global and configured by backend appConfig / studentLives.</Text>
             <View style={{ marginTop: 12, alignItems: "center" }}>
               <Ionicons name={globalLives != null && globalLives > 0 ? "heart" : "heart-outline"} size={32} color={globalLives != null && globalLives > 0 ? HEART_COLOR : MUTED} />
-              <Text style={{ fontWeight: "900", marginTop: 8, fontSize: 18 }}>{globalLives != null ? `${globalLives} / ${globalMaxLives}` : `— / ${globalMaxLives}`}</Text>
+              <Text style={styles.heartCountText}>{globalLives != null ? `${globalLives} / ${globalMaxLives}` : `— / ${globalMaxLives}`}</Text>
               <Text style={{ marginTop: 8, color: MUTED }}>
                 {globalLives != null && globalLives >= globalMaxLives ? "Lives full" : `Next life in: ${formatMsToMMSS(nextHeartInMs)}`}
               </Text>
@@ -830,8 +834,12 @@ export default function PackageSubjects() {
   );
 }
 
-const styles = StyleSheet.create({
-  screen: { flex: 1, backgroundColor: BG },
+function createStyles(colors) {
+  const TEXT = colors.text;
+  const MUTED = colors.muted;
+
+  return StyleSheet.create({
+  screen: { flex: 1, backgroundColor: colors.background },
   center: { alignItems: "center", justifyContent: "center" },
 
   header: {
@@ -848,7 +856,7 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
     marginRight: 10,
-    backgroundColor: "#F7F9FF",
+    backgroundColor: colors.inputBackground,
   },
   headerTitleWrap: { flex: 1, minWidth: 0, marginRight: 8 },
   title: { fontSize: 21, fontWeight: "900", color: TEXT, flexShrink: 1 },
@@ -867,12 +875,14 @@ const styles = StyleSheet.create({
     paddingHorizontal: 4,
   },
   badgeTxt: { color: "#fff", fontSize: 10, fontWeight: "900" },
+  whatsNewTitle: { fontWeight: "900", color: TEXT, marginBottom: 8 },
+  heartCountText: { fontWeight: "900", marginTop: 8, fontSize: 18, color: TEXT },
 
   newCard: {
     width: 230,
-    backgroundColor: "#F8FAFF",
+    backgroundColor: colors.card,
     borderWidth: 1,
-    borderColor: "#EAF0FF",
+    borderColor: colors.border,
     borderRadius: 12,
     padding: 10,
   },
@@ -893,8 +903,8 @@ const styles = StyleSheet.create({
     marginBottom: 10,
     borderRadius: 22,
     borderWidth: 1,
-    borderColor: "#DDE9FF",
-    backgroundColor: "#F8FBFF",
+    borderColor: colors.border,
+    backgroundColor: colors.panel,
     paddingHorizontal: 14,
     paddingVertical: 10,
     overflow: "hidden",
@@ -928,9 +938,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
     paddingVertical: 6,
     borderRadius: 999,
-    backgroundColor: "#EDF4FF",
+    backgroundColor: colors.soft,
     borderWidth: 1,
-    borderColor: "#D8E7FF",
+    borderColor: colors.border,
   },
   heroChipText: {
     marginLeft: 6,
@@ -959,9 +969,9 @@ const styles = StyleSheet.create({
   },
   heroStatCard: {
     flex: 1,
-    backgroundColor: "#FFFFFF",
+    backgroundColor: colors.card,
     borderWidth: 1,
-    borderColor: "#E6EEFD",
+    borderColor: colors.border,
     borderRadius: 14,
     paddingVertical: 7,
     alignItems: "center",
@@ -979,10 +989,10 @@ const styles = StyleSheet.create({
   },
 
   subjectCard: {
-    backgroundColor: "#FFFFFF",
+    backgroundColor: colors.card,
     borderRadius: 22,
     borderWidth: 1,
-    borderColor: "#E7EDF8",
+    borderColor: colors.border,
     overflow: "hidden",
     shadowColor: "#0F172A",
     shadowOffset: { width: 0, height: 6 },
@@ -991,7 +1001,7 @@ const styles = StyleSheet.create({
     elevation: 1,
   },
   subjectCardExpanded: {
-    borderColor: "#B9D4FF",
+    borderColor: colors.primary,
     shadowColor: PRIMARY,
     shadowOpacity: 0.05,
     elevation: 2,
@@ -1004,9 +1014,9 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
   },
   subjectTopExpanded: {
-    backgroundColor: "#FCFDFF",
+    backgroundColor: colors.inputBackground,
     borderBottomWidth: 1,
-    borderBottomColor: "#EAF0FB",
+    borderBottomColor: colors.separator,
   },
   subjectTopLeft: {
     flexDirection: "row",
@@ -1019,9 +1029,9 @@ const styles = StyleSheet.create({
     borderRadius: 14,
     justifyContent: "center",
     alignItems: "center",
-    backgroundColor: "#F7F9FC",
+    backgroundColor: colors.surfaceMuted,
     borderWidth: 1,
-    borderColor: "#EEF2F8",
+    borderColor: colors.border,
   },
   subjectTextWrap: {
     marginLeft: 12,
@@ -1033,7 +1043,7 @@ const styles = StyleSheet.create({
     color: TEXT,
   },
   subjectChapter: {
-    color: "#667085",
+    color: MUTED,
     marginTop: 4,
     fontSize: 12,
     fontWeight: "700",
@@ -1049,9 +1059,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: 9,
     paddingVertical: 5,
     borderRadius: 999,
-    backgroundColor: "#F4F7FD",
+    backgroundColor: colors.inputBackground,
     borderWidth: 1,
-    borderColor: "#E7EDF8",
+    borderColor: colors.border,
     color: PRIMARY,
     fontSize: 11,
     fontWeight: "700",
@@ -1062,22 +1072,22 @@ const styles = StyleSheet.create({
     height: 34,
     borderRadius: 12,
     borderWidth: 1,
-    borderColor: "#E5ECFA",
-    backgroundColor: "#F8FBFF",
+    borderColor: colors.border,
+    backgroundColor: colors.inputBackground,
     alignItems: "center",
     justifyContent: "center",
     marginLeft: 10,
   },
   subjectChevronWrapActive: {
-    borderColor: "#CFE0FF",
-    backgroundColor: "#EEF5FF",
+    borderColor: colors.primary,
+    backgroundColor: colors.soft,
   },
 
   expandArea: {
     paddingHorizontal: 14,
     paddingTop: 12,
     paddingBottom: 14,
-    backgroundColor: "#F8FBFF",
+    backgroundColor: colors.inputBackground,
   },
   roundRow: {
     flexDirection: "row",
@@ -1087,9 +1097,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
     marginTop: 8,
     borderWidth: 1,
-    borderColor: "#E4ECFA",
+    borderColor: colors.border,
     borderRadius: 16,
-    backgroundColor: "#FFFFFF",
+    backgroundColor: colors.card,
     shadowColor: "#0F172A",
     shadowOffset: { width: 0, height: 3 },
     shadowOpacity: 0.018,
@@ -1106,7 +1116,7 @@ const styles = StyleSheet.create({
     width: 30,
     height: 30,
     borderRadius: 15,
-    backgroundColor: "#EDF4FF",
+    backgroundColor: colors.soft,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -1120,7 +1130,7 @@ const styles = StyleSheet.create({
     marginLeft: 10,
     paddingRight: 10,
   },
-  roundName: { fontSize: 14, fontWeight: "800", color: "#1B2B45", marginRight: 6 },
+  roundName: { fontSize: 14, fontWeight: "800", color: colors.text, marginRight: 6 },
   roundMeta: { marginTop: 3, color: MUTED, fontSize: 12 },
 
   startBtn: {
@@ -1134,19 +1144,19 @@ const styles = StyleSheet.create({
     shadowRadius: 8,
     elevation: 2,
   },
-  startBtnDisabled: { backgroundColor: "#DDE8FF" },
+  startBtnDisabled: { backgroundColor: colors.badgeBackground },
   startBtnText: { color: "#fff", fontWeight: "900", fontSize: 12, letterSpacing: 0.2 },
 
   lockInfo: {
     marginTop: 6,
     marginLeft: 2,
     borderWidth: 1,
-    borderColor: "#FED7AA",
-    backgroundColor: "#FFF7ED",
+    borderColor: colors.border,
+    backgroundColor: colors.inputBackground,
     borderRadius: 10,
     padding: 8,
   },
-  noHeartText: { color: "#B54708", fontWeight: "800", fontSize: 12 },
+  noHeartText: { color: colors.danger, fontWeight: "800", fontSize: 12 },
   refillText: { marginTop: 2, color: MUTED, fontSize: 12, fontWeight: "700" },
 
   notifHeaderRow: {
@@ -1156,11 +1166,11 @@ const styles = StyleSheet.create({
   },
   filterBtn: {
     borderWidth: 1,
-    borderColor: "#EAF0FF",
+    borderColor: colors.border,
     borderRadius: 999,
     paddingHorizontal: 10,
     paddingVertical: 5,
-    backgroundColor: "#F8FAFF",
+    backgroundColor: colors.inputBackground,
   },
   filterBtnTxt: { color: TEXT, fontWeight: "800", fontSize: 12 },
 
@@ -1173,12 +1183,12 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   notifUnread: {
-    borderColor: "#BFDBFE",
-    backgroundColor: "#F8FBFF",
+    borderColor: colors.primary,
+    backgroundColor: colors.inputBackground,
   },
   notifRead: {
-    borderColor: "#E5E7EB",
-    backgroundColor: "#FAFAFA",
+    borderColor: colors.border,
+    backgroundColor: colors.card,
   },
   notifIconWrap: {
     width: 34,
@@ -1192,17 +1202,22 @@ const styles = StyleSheet.create({
     width: 8,
     height: 8,
     borderRadius: 4,
-    backgroundColor: "#2563EB",
+    backgroundColor: colors.primary,
     marginLeft: 8,
   },
   notifTitle: { color: TEXT, fontWeight: "800", fontSize: 13 },
   notifBody: { color: MUTED, marginTop: 4, fontSize: 12 },
 });
+}
 
-const modalStyles = StyleSheet.create({
+function createModalStyles(colors) {
+  const TEXT = colors.text;
+  const MUTED = colors.muted;
+
+  return StyleSheet.create({
   overlay: {
     flex: 1,
-    backgroundColor: "rgba(0,0,0,0.45)",
+    backgroundColor: colors.overlay,
     justifyContent: "center",
     alignItems: "center",
     padding: 20,
@@ -1210,7 +1225,9 @@ const modalStyles = StyleSheet.create({
   card: {
     width: "100%",
     maxWidth: 420,
-    backgroundColor: "#fff",
+    backgroundColor: colors.card,
+    borderWidth: 1,
+    borderColor: colors.border,
     borderRadius: 14,
     padding: 18,
     alignItems: "center",
@@ -1220,3 +1237,4 @@ const modalStyles = StyleSheet.create({
   closeBtnPrimary: { marginTop: 18, backgroundColor: PRIMARY, paddingVertical: 10, borderRadius: 10, alignItems: "center", width: "100%" },
   closeBtnTextPrimary: { color: "#fff", fontWeight: "900" },
 });
+}

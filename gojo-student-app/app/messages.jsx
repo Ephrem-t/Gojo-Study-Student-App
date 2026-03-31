@@ -26,6 +26,8 @@ import { getOpenedChat, clearOpenedChat } from "./lib/chatStore";
 import { useSafeAreaInsets, SafeAreaView } from "react-native-safe-area-context";
 // school-aware helpers
 import { getUserVal } from "./lib/userHelpers";
+import { useAppTheme } from "../hooks/use-app-theme";
+import { extractProfileImage, normalizeProfileImageUri } from "./lib/profileImage";
 
 /**
  * app/messages.jsx
@@ -40,13 +42,6 @@ import { getUserVal } from "./lib/userHelpers";
  * - Avoids inline `await` inside template literals — builds a prefix string first.
  */
 
-const PRIMARY = "#007AFB";
-const MUTED = "#6B78A8";
-const BG = "#FFFFFF";
-const INCOMING_BG = "#F6F7FB";
-const OUTGOING_BG = "#007AFB";
-const INCOMING_TEXT = "#111";
-const OUTGOING_TEXT = "#fff";
 const AVATAR_PLACEHOLDER = require("../assets/images/avatar_placeholder.png");
 
 function fmtTime12(ts) {
@@ -93,6 +88,10 @@ export default function MessagesScreen(props) {
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const storage = getStorage();
+  const { colors, statusBarStyle } = useAppTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
+  const PRIMARY = colors.primary;
+  const MUTED = colors.muted;
 
   const opened = getOpenedChat() || {};
   const routeParams = (props && props.route && props.route.params) ? props.route.params : {};
@@ -128,6 +127,7 @@ export default function MessagesScreen(props) {
   const [viewerIndex, setViewerIndex] = useState(0);
   const [viewerFallbackUri, setViewerFallbackUri] = useState(null);
   const [viewerLibAvailable, setViewerLibAvailable] = useState(null);
+  const safeContactImage = useMemo(() => normalizeProfileImageUri(contactImage), [contactImage]);
 
   const messagesRefRef = useRef(null);
   const lastMessageRefRef = useRef(null);
@@ -177,7 +177,7 @@ export default function MessagesScreen(props) {
         if (v && mounted) {
           if (v.userId) setContactUserId(v.userId);
           setContactName((prev) => prev || v.name || v.username || "");
-          setContactImage((prev) => prev || v.profileImage || null);
+          setContactImage((prev) => prev || extractProfileImage(v));
           const subtitle = (v.subject && String(v.subject).trim()) ? v.subject : (v.role || v.designation || "");
           setContactSubtitle(subtitle || "");
           return;
@@ -847,7 +847,7 @@ export default function MessagesScreen(props) {
       } else {
         return (
           <View style={[styles.messageRow, styles.messageRowLeft]}>
-            {showAvatar ? <Image source={contactImage ? { uri: contactImage } : AVATAR_PLACEHOLDER} style={styles.msgAvatar} /> : <View style={{ width: 36 }} />}
+            {showAvatar ? <Image source={safeContactImage ? { uri: safeContactImage } : AVATAR_PLACEHOLDER} style={styles.msgAvatar} /> : <View style={{ width: 36 }} />}
             <View style={{ width: 8 }} />
             <View>
               <TouchableOpacity activeOpacity={0.9} onPress={() => openImageViewer(m)}>
@@ -867,7 +867,7 @@ export default function MessagesScreen(props) {
     // text message
     return (
       <View style={[styles.messageRow, isMe ? styles.messageRowRight : styles.messageRowLeft]}>
-        {!isMe && showAvatar && <Image source={contactImage ? { uri: contactImage } : AVATAR_PLACEHOLDER} style={styles.msgAvatar} />}
+        {!isMe && showAvatar && <Image source={safeContactImage ? { uri: safeContactImage } : AVATAR_PLACEHOLDER} style={styles.msgAvatar} />}
         {!isMe && !showAvatar && <View style={{ width: 36 }} />}
 
         <View style={[styles.bubbleWrap, isMe ? { alignItems: "flex-end" } : { alignItems: "flex-start" }]}>
@@ -904,12 +904,12 @@ export default function MessagesScreen(props) {
 
   return (
     <SafeAreaView style={[styles.safe, { paddingTop: insets.top }]} edges={["bottom"]}>
-      <StatusBar barStyle="dark-content" backgroundColor={BG} translucent={false} />
+      <StatusBar barStyle={statusBarStyle === "dark" ? "dark-content" : "light-content"} backgroundColor={colors.background} translucent={false} />
       <View style={[styles.container, { paddingBottom: insets.bottom }]}>
         {/* Header */}
         <View style={styles.header}>
           <TouchableOpacity style={styles.back} onPress={() => router.back()}>
-            <Ionicons name="chevron-back" size={22} color="#222" />
+            <Ionicons name="chevron-back" size={22} color={colors.text} />
           </TouchableOpacity>
 
           <View style={styles.headerCenter}>
@@ -918,7 +918,7 @@ export default function MessagesScreen(props) {
           </View>
 
           <TouchableOpacity style={styles.headerRight} onPress={() => Alert.alert("Contact", "Open contact profile")}>
-            <Image source={contactImage ? { uri: contactImage } : AVATAR_PLACEHOLDER} style={styles.headerAvatar} />
+            <Image source={safeContactImage ? { uri: safeContactImage } : AVATAR_PLACEHOLDER} style={styles.headerAvatar} />
           </TouchableOpacity>
         </View>
 
@@ -947,7 +947,7 @@ export default function MessagesScreen(props) {
 
           <TextInput
             placeholder="Message"
-            placeholderTextColor="#9AA4C0"
+            placeholderTextColor={colors.muted}
             value={text}
             onChangeText={setText}
             style={styles.input}
@@ -960,7 +960,7 @@ export default function MessagesScreen(props) {
             onPress={sendMessage}
             disabled={!text.trim() || sending}
           >
-            <Ionicons name="send" size={20} color={text.trim() ? "#fff" : "#BFCBEF"} />
+            <Ionicons name="send" size={20} color={text.trim() ? colors.white : colors.muted} />
           </TouchableOpacity>
         </View>
 
@@ -968,7 +968,7 @@ export default function MessagesScreen(props) {
         <Modal visible={viewerVisible && !viewerLibAvailable} transparent animationType="fade" onRequestClose={closeViewer}>
           <View style={styles.modalOverlay}>
             <TouchableOpacity style={styles.modalCloseBtn} onPress={closeViewer}>
-              <Ionicons name="close" size={28} color="#fff" />
+              <Ionicons name="close" size={28} color={colors.white} />
             </TouchableOpacity>
             <View style={styles.modalContent}>
               {viewerFallbackUri ? (
@@ -984,20 +984,20 @@ export default function MessagesScreen(props) {
   );
 }
 
-/* Styles (unchanged from previous) */
-const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: BG },
-  container: { flex: 1, backgroundColor: BG },
+function createStyles(colors) {
+  return StyleSheet.create({
+  safe: { flex: 1, backgroundColor: colors.background },
+  container: { flex: 1, backgroundColor: colors.background },
 
-  header: { height: 62, flexDirection: "row", alignItems: "center", paddingHorizontal: 12, borderBottomColor: "#F1F4FF", borderBottomWidth: 1, backgroundColor: BG },
+  header: { height: 62, flexDirection: "row", alignItems: "center", paddingHorizontal: 12, borderBottomColor: colors.separator, borderBottomWidth: 1, backgroundColor: colors.background },
   back: { width: 36, height: 36, alignItems: "center", justifyContent: "center" },
   headerCenter: { flex: 1, alignItems: "center" },
-  headerName: { fontSize: 16, fontWeight: "700", color: "#111", letterSpacing: 0.1 },
-  headerSub: { fontSize: 12, color: MUTED, marginTop: 2 },
+  headerName: { fontSize: 16, fontWeight: "700", color: colors.text, letterSpacing: 0.1 },
+  headerSub: { fontSize: 12, color: colors.muted, marginTop: 2 },
   headerRight: { width: 36, alignItems: "center", justifyContent: "center" },
-  headerAvatar: { width: 36, height: 36, borderRadius: 18, backgroundColor: "#F1F3F8" },
+  headerAvatar: { width: 36, height: 36, borderRadius: 18, backgroundColor: colors.surfaceMuted },
 
-  messagesWrap: { flex: 1, paddingHorizontal: 12, backgroundColor: BG },
+  messagesWrap: { flex: 1, paddingHorizontal: 12, backgroundColor: colors.background },
 
   messageRow: { flexDirection: "row", marginVertical: 6, alignItems: "flex-end" },
   messageRowLeft: { justifyContent: "flex-start" },
@@ -1016,16 +1016,16 @@ const styles = StyleSheet.create({
     shadowRadius: 2,
     elevation: 0,
   },
-  bubbleLeft: { backgroundColor: INCOMING_BG, borderTopLeftRadius: 6, borderTopRightRadius: 14, borderBottomRightRadius: 14, borderBottomLeftRadius: 14 },
-  bubbleRight: { backgroundColor: OUTGOING_BG, borderTopRightRadius: 6, borderTopLeftRadius: 14, borderBottomRightRadius: 14, borderBottomLeftRadius: 14, marginRight: -12 },
+  bubbleLeft: { backgroundColor: colors.incomingBubble, borderTopLeftRadius: 6, borderTopRightRadius: 14, borderBottomRightRadius: 14, borderBottomLeftRadius: 14 },
+  bubbleRight: { backgroundColor: colors.outgoingBubble, borderTopRightRadius: 6, borderTopLeftRadius: 14, borderBottomRightRadius: 14, borderBottomLeftRadius: 14, marginRight: -12 },
 
   bubbleText: { fontSize: 15, lineHeight: 20 },
-  bubbleTextLeft: { color: INCOMING_TEXT, fontWeight: "500" },
-  bubbleTextRight: { color: OUTGOING_TEXT, fontWeight: "500" },
+  bubbleTextLeft: { color: colors.incomingText, fontWeight: "500" },
+  bubbleTextRight: { color: colors.outgoingText, fontWeight: "500" },
 
   bubbleMetaRow: { flexDirection: "row", alignItems: "center", justifyContent: "flex-end", marginTop: 6 },
   bubbleTime: { fontSize: 10, opacity: 0.9 },
-  bubbleTimeLeft: { color: MUTED, textAlign: "left" },
+  bubbleTimeLeft: { color: colors.muted, textAlign: "left" },
   bubbleTimeRight: { color: "rgba(255,255,255,0.85)", textAlign: "right" },
 
   leftTailContainer: { position: "absolute", left: -6, bottom: -2, width: 12, height: 8, overflow: "hidden", alignItems: "flex-start" },
@@ -1037,7 +1037,7 @@ const styles = StyleSheet.create({
     borderBottomWidth: 8,
     borderLeftColor: "transparent",
     borderRightColor: "transparent",
-    borderBottomColor: INCOMING_BG,
+    borderBottomColor: colors.incomingBubble,
     transform: [{ rotate: "180deg" }],
   },
 
@@ -1050,22 +1050,22 @@ const styles = StyleSheet.create({
     borderBottomWidth: 8,
     borderLeftColor: "transparent",
     borderRightColor: "transparent",
-    borderBottomColor: OUTGOING_BG,
+    borderBottomColor: colors.outgoingBubble,
     transform: [{ rotate: "0deg" }],
   },
 
-  incomingImage: { width: 220, height: 140, borderRadius: 12, resizeMode: "cover", backgroundColor: "#eaeefb" },
-  outgoingImage: { width: 220, height: 140, borderRadius: 12, resizeMode: "cover", backgroundColor: "#005ecc" , marginRight: -12},
+  incomingImage: { width: 220, height: 140, borderRadius: 12, resizeMode: "cover", backgroundColor: colors.surfaceMuted },
+  outgoingImage: { width: 220, height: 140, borderRadius: 12, resizeMode: "cover", backgroundColor: colors.outgoingBubble , marginRight: -12},
   imageMeta: { position: "absolute", right: 8, bottom: 6, flexDirection: "row", alignItems: "center" },
   incomingImageMeta: { position: "absolute", left: 8, bottom: 6, flexDirection: "row", alignItems: "center" },
   imageTime: { color: "rgba(255,255,255,0.9)", fontSize: 11 },
-  imageTimeIncoming: { color: MUTED, fontSize: 11 },
+  imageTimeIncoming: { color: colors.muted, fontSize: 11 },
 
   dateSeparator: { flexDirection: "row", alignItems: "center", justifyContent: "center" },
-  dateLine: { height: 1, backgroundColor: "#EEF4FF", flex: 1, marginHorizontal: 12 },
-  dateText: { color: MUTED, fontSize: 12 },
+  dateLine: { height: 1, backgroundColor: colors.separator, flex: 1, marginHorizontal: 12 },
+  dateText: { color: colors.muted, fontSize: 12 },
 
-  inputRow: { flexDirection: "row", alignItems: "flex-end", paddingHorizontal: 8, paddingVertical: 10, borderTopColor: "#F1F4FF", borderTopWidth: 1, backgroundColor: BG },
+  inputRow: { flexDirection: "row", alignItems: "flex-end", paddingHorizontal: 8, paddingVertical: 10, borderTopColor: colors.separator, borderTopWidth: 1, backgroundColor: colors.background },
   attachmentBtn: { width: 40, height: 40, alignItems: "center", justifyContent: "center", marginRight: 6 },
   input: {
     flex: 1,
@@ -1074,18 +1074,19 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingVertical: Platform.OS === "ios" ? 8 : 6,
     borderRadius: 20,
-    backgroundColor: "#F8FAFF",
-    color: "#111",
+    backgroundColor: colors.inputBackground,
+    color: colors.text,
     fontSize: 15,
     marginRight: 8,
   },
   sendBtn: { width: 44, height: 44, borderRadius: 22, alignItems: "center", justifyContent: "center" },
-  sendBtnActive: { backgroundColor: PRIMARY },
-  sendBtnDisabled: { backgroundColor: "#F1F4FF" },
+  sendBtnActive: { backgroundColor: colors.primary },
+  sendBtnDisabled: { backgroundColor: colors.surfaceMuted },
 
   // modal fallback styles
-  modalOverlay: { flex: 1, backgroundColor: "rgba(0,0,0,0.95)", justifyContent: "center", alignItems: "center" },
+  modalOverlay: { flex: 1, backgroundColor: colors.imageOverlay, justifyContent: "center", alignItems: "center" },
   modalContent: { flex: 1, justifyContent: "center", alignItems: "center", width: "100%", padding: 12 },
   modalImage: { width: "100%", height: "100%" },
   modalCloseBtn: { position: "absolute", top: 40, right: 20, zIndex: 20 },
 });
+}
