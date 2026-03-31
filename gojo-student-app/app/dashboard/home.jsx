@@ -8,7 +8,6 @@ import {
   TouchableOpacity,
   ActivityIndicator,
   RefreshControl,
-  Dimensions,
   Alert,
   Animated,
   Modal,
@@ -35,6 +34,8 @@ import { database } from "../../constants/firebaseConfig";
 import { queryUserByUsernameInSchool, queryUserByChildInSchool } from "../lib/userHelpers";
 import { useAppTheme } from "../../hooks/use-app-theme";
 import { extractProfileImage, normalizeProfileImageUri } from "../lib/profileImage";
+import { getInstagramFeedAspectRatio } from "../lib/instagramMedia";
+import { getSavedPostsLocation, toggleSavedPostEntry } from "../lib/savedPosts";
 
 /**
  * Home feed with pagination ("load more") for older posts.
@@ -43,8 +44,6 @@ import { extractProfileImage, normalizeProfileImageUri } from "../lib/profileIma
  * 2) Image tap opens full-screen viewer
  */
 
-const SCREEN_WIDTH = Dimensions.get("window").width;
-const IMAGE_HEIGHT = Math.round(SCREEN_WIDTH * 0.9 * 0.65);
 const PAGE_SIZE = 20;
 const DESCRIPTION_PREVIEW_LENGTH = 140;
 
@@ -130,6 +129,7 @@ export default function HomeScreen() {
   const [loadingMore, setLoadingMore] = useState(false);
   const [hasMore, setHasMore] = useState(true);
   const [userId, setUserId] = useState(null);
+  const [savedPostsMap, setSavedPostsMap] = useState({});
   const [expandedDescriptions, setExpandedDescriptions] = useState({});
   const [postMenuPostId, setPostMenuPostId] = useState(null);
 
@@ -139,6 +139,7 @@ export default function HomeScreen() {
 
   const adminCacheRef = useRef({});
   const postsQueryRef = useRef(null);
+  const savedPostsQueryRef = useRef(null);
 
   const loadUserContext = useCallback(async () => {
     const uid = await AsyncStorage.getItem("userId");
@@ -170,6 +171,12 @@ export default function HomeScreen() {
   }, []);
 
   const combinedPosts = useMemo(() => [...postsLatest, ...postsOlder], [postsLatest, postsOlder]);
+
+  const findLoadedPost = useCallback((postId) => {
+    return postsLatest.find((item) => item.postId === postId)
+      || postsOlder.find((item) => item.postId === postId)
+      || null;
+  }, [postsLatest, postsOlder]);
 
   const postsRefForSchool = async () => {
     const sk = await AsyncStorage.getItem("schoolKey");
@@ -354,6 +361,39 @@ export default function HomeScreen() {
     };
   }, [loadUserContext, resolvePosterForPost]);
 
+  useEffect(() => {
+    let unsubscribe = null;
+    let mounted = true;
+
+    (async () => {
+      const location = await getSavedPostsLocation();
+      if (!location?.basePath) {
+        if (mounted) setSavedPostsMap({});
+        return;
+      }
+
+      const savedRef = ref(database, location.basePath);
+      savedPostsQueryRef.current = savedRef;
+
+      unsubscribe = onValue(
+        savedRef,
+        (snap) => {
+          if (!mounted) return;
+          setSavedPostsMap(snap.exists() ? snap.val() || {} : {});
+        },
+        () => {
+          if (mounted) setSavedPostsMap({});
+        }
+      );
+    })();
+
+    return () => {
+      mounted = false;
+      if (unsubscribe) unsubscribe();
+      if (savedPostsQueryRef.current) off(savedPostsQueryRef.current);
+    };
+  }, []);
+
   const onRefresh = async () => {
     setRefreshing(true);
     setTimeout(() => setRefreshing(false), 700);
@@ -451,17 +491,9 @@ export default function HomeScreen() {
       return;
     }
 
-    const findPost = () => {
-      let p = postsLatest.find((x) => x.postId === postId);
-      if (p) return { which: "latest", p };
-      p = postsOlder.find((x) => x.postId === postId);
-      if (p) return { which: "older", p };
-      return null;
-    };
-
-    const found = findPost();
+    const found = findLoadedPost(postId);
     if (!found) return;
-    const currentlyLiked = !!(found.p.likesMap && found.p.likesMap[uid]);
+    const currentlyLiked = !!(found.likesMap && found.likesMap[uid]);
 
     const optimisticUpdater = (post) => {
       const likes = { ...(post.likesMap || {}) };
@@ -470,8 +502,8 @@ export default function HomeScreen() {
       return { ...post, likesMap: likes, data: { ...post.data, likeCount: Object.keys(likes).length } };
     };
 
-    if (found.which === "latest") setPostsLatest((prev) => prev.map((p) => (p.postId === postId ? optimisticUpdater(p) : p)));
-    else setPostsOlder((prev) => prev.map((p) => (p.postId === postId ? optimisticUpdater(p) : p)));
+    setPostsLatest((prev) => prev.map((p) => (p.postId === postId ? optimisticUpdater(p) : p)));
+    setPostsOlder((prev) => prev.map((p) => (p.postId === postId ? optimisticUpdater(p) : p)));
 
     try {
       const sk = await AsyncStorage.getItem("schoolKey");
@@ -506,6 +538,45 @@ export default function HomeScreen() {
       Alert.alert("Error", "Unable to update like. Please try again.");
     }
   };
+
+  const toggleSavePost = useCallback(async (postId) => {
+    const uid = userId || (await loadUserContext());
+    if (!uid) {
+      Alert.alert("Not signed in", "You must be signed in to save posts.");
+      return;
+    }
+
+    const post = findLoadedPost(postId);
+    if (!post) return;
+
+    const wasSaved = !!savedPostsMap[postId];
+
+    setSavedPostsMap((prev) => {
+      const next = { ...prev };
+      if (wasSaved) delete next[postId];
+      else next[postId] = { postId, savedAt: Date.now() };
+      return next;
+    });
+
+    try {
+      const result = await toggleSavedPostEntry(postId, post.data);
+      setSavedPostsMap((prev) => {
+        const next = { ...prev };
+        if (result.saved) next[postId] = result.payload || { postId, savedAt: Date.now() };
+        else delete next[postId];
+        return next;
+      });
+    } catch (error) {
+      console.warn("toggle save post failed:", error);
+      setSavedPostsMap((prev) => {
+        const next = { ...prev };
+        if (wasSaved) next[postId] = prev[postId] || { postId, savedAt: Date.now() };
+        else delete next[postId];
+        return next;
+      });
+      Alert.alert("Error", "Unable to update saved posts. Please try again.");
+    }
+  }, [findLoadedPost, loadUserContext, savedPostsMap, userId]);
 
   const toggleDescription = useCallback((postId) => {
     setExpandedDescriptions((prev) => ({
@@ -602,7 +673,9 @@ export default function HomeScreen() {
     const { postId, data, admin, likesMap = {}, seenMap = {} } = item;
     const likesCount = data.likeCount || Object.keys(likesMap || {}).length;
     const isLiked = userId ? !!likesMap[userId] : false;
+    const isSaved = !!savedPostsMap[postId];
     const imageUri = normalizeProfileImageUri(data.postUrl);
+    const [mediaAspectRatio, setMediaAspectRatio] = useState(1);
     const message = String(data.message || "").trim();
     const targetRoleLabel = formatTargetRoleLabel(data);
     const posterName = getPosterName(admin, data);
@@ -612,6 +685,25 @@ export default function HomeScreen() {
     const previewMessage = shouldTruncate && !isExpanded
       ? `${message.slice(0, DESCRIPTION_PREVIEW_LENGTH).trimEnd()}...`
       : message;
+
+    useEffect(() => {
+      let active = true;
+
+      if (!imageUri) {
+        setMediaAspectRatio(1);
+        return () => {
+          active = false;
+        };
+      }
+
+      getInstagramFeedAspectRatio(imageUri).then((nextAspectRatio) => {
+        if (active) setMediaAspectRatio(nextAspectRatio);
+      });
+
+      return () => {
+        active = false;
+      };
+    }, [imageUri]);
 
     const scale = useRef(new Animated.Value(1)).current;
     const animateHeart = () => {
@@ -664,18 +756,21 @@ export default function HomeScreen() {
               setViewerVisible(true);
             }}
           >
-            <Image source={{ uri: imageUri }} style={styles.postImage} resizeMode="cover" />
+            <Image source={{ uri: imageUri }} style={[styles.postImage, { aspectRatio: mediaAspectRatio }]} resizeMode="cover" />
           </TouchableOpacity>
         ) : null}
 
         <View style={styles.reactionsSummary}>
           <View style={styles.reactionsLeft}>
+            <TouchableOpacity style={styles.likeIconOnlyBtn} activeOpacity={0.85} onPress={onHeartPress}>
+              <Animated.View style={{ transform: [{ scale }] }}>
+                <Ionicons name={isLiked ? "heart" : "heart-outline"} size={24} color={isLiked ? "#ED4956" : colors.text} />
+              </Animated.View>
+            </TouchableOpacity>
             <Text style={styles.reactionCountText}>{likesCount} {likesCount === 1 ? "like" : "likes"}</Text>
           </View>
-          <TouchableOpacity style={styles.likeIconOnlyBtn} activeOpacity={0.85} onPress={onHeartPress}>
-            <Animated.View style={{ transform: [{ scale }] }}>
-              <Ionicons name={isLiked ? "heart" : "heart-outline"} size={24} color={isLiked ? "#ED4956" : colors.text} />
-            </Animated.View>
+          <TouchableOpacity style={styles.actionIconBtn} activeOpacity={0.85} onPress={() => toggleSavePost(postId)}>
+            <Ionicons name={isSaved ? "bookmark" : "bookmark-outline"} size={20} color={colors.text} />
           </TouchableOpacity>
         </View>
       </View>
@@ -710,7 +805,7 @@ export default function HomeScreen() {
 
   if (!combinedPosts || combinedPosts.length === 0) {
     return (
-      <View style={{ flex: 1, backgroundColor: colors.background }}>
+      <View style={{ flex: 1, backgroundColor: "#FFFFFF" }}>
         <EmptyState />
       </View>
     );
@@ -783,20 +878,24 @@ export default function HomeScreen() {
 
 function createStyles(colors) {
   return StyleSheet.create({
-  list: { paddingVertical: 10, backgroundColor: colors.feedBackground },
-  center: { flex: 1, alignItems: "center", justifyContent: "center", padding: 20, backgroundColor: colors.feedBackground },
+  list: { paddingVertical: 0, backgroundColor: "#FFFFFF" },
+  center: { flex: 1, alignItems: "center", justifyContent: "center", padding: 20, backgroundColor: "#FFFFFF" },
   card: {
-    backgroundColor: colors.card,
-    marginBottom: 10,
+    backgroundColor: "#FFFFFF",
+    marginBottom: 6,
+    marginHorizontal: 0,
     overflow: "hidden",
     borderRadius: 0,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderColor: "#DBDBDB",
   },
   cardHeader: {
     flexDirection: "row",
     alignItems: "center",
     paddingHorizontal: 12,
-    paddingTop: 12,
-    paddingBottom: 8,
+    paddingTop: 10,
+    paddingBottom: 6,
   },
   avatar: {
     width: 40,
@@ -820,7 +919,7 @@ function createStyles(colors) {
     justifyContent: "center",
   },
 
-  messageWrap: { paddingHorizontal: 12, paddingBottom: 10 },
+  messageWrap: { paddingHorizontal: 12, paddingBottom: 8 },
   messageText: { color: colors.text, lineHeight: 20, fontSize: 15 },
   seeMoreText: {
     color: colors.muted,
@@ -830,7 +929,6 @@ function createStyles(colors) {
 
   postImage: {
     width: "100%",
-    height: IMAGE_HEIGHT,
     backgroundColor: "#DDD",
   },
   reactionsSummary: {
@@ -838,11 +936,13 @@ function createStyles(colors) {
     justifyContent: "space-between",
     alignItems: "center",
     paddingHorizontal: 12,
-    paddingVertical: 10,
+    paddingTop: 4,
+    paddingBottom: 4,
   },
   reactionsLeft: {
     flexDirection: "row",
     alignItems: "center",
+    gap: 6,
   },
   reactionCountText: {
     color: colors.text,
@@ -852,8 +952,14 @@ function createStyles(colors) {
   likeIconOnlyBtn: {
     alignItems: "center",
     justifyContent: "center",
-    width: 34,
-    height: 34,
+    width: 28,
+    height: 28,
+  },
+  actionIconBtn: {
+    alignItems: "center",
+    justifyContent: "center",
+    width: 26,
+    height: 26,
   },
   menuOverlay: {
     flex: 1,
@@ -905,7 +1011,7 @@ function createStyles(colors) {
     marginHorizontal: 18,
   },
 
-  emptyContainer: { flex: 1, backgroundColor: colors.background, alignItems: "center", justifyContent: "center", padding: 28 },
+  emptyContainer: { flex: 1, backgroundColor: "#FFFFFF", alignItems: "center", justifyContent: "center", padding: 28 },
   emptyImage: { width: 220, height: 160, marginBottom: 18 },
   emptyFallbackIcon: { width: 120, height: 120, borderRadius: 60, backgroundColor: colors.soft, alignItems: "center", justifyContent: "center", marginBottom: 12 },
   emptyTitle: { fontSize: 20, fontWeight: "700", color: "#222", marginBottom: 6 },

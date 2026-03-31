@@ -465,6 +465,15 @@ export default function SettingScreen() {
               />
               <Divider styles={styles} />
               <SettingRow
+                icon="bookmark-outline"
+                label="Saved Posts"
+                caption="See the posts you bookmarked from home"
+                onPress={() => router.push("/savedPosts")}
+                colors={colors}
+                styles={styles}
+              />
+              <Divider styles={styles} />
+              <SettingRow
                 icon="podium-outline"
                 label="Leaderboard"
                 caption="See the current ranking board"
