@@ -47,17 +47,17 @@ function toMsTs(v) {
   if (!Number.isFinite(n) || n <= 0) return 0;
   return n < 1e12 ? n * 1000 : n;
 }
-function getSubjectVisual(subjectKey, subjectName) {
+function getSubjectVisual(subjectKey, subjectName, colors) {
   const k = `${subjectKey || ""} ${subjectName || ""}`.toLowerCase();
-  if (k.includes("math")) return { icon: "calculator-variant-outline", bg: "#EEF4FF", color: "#0B72FF" };
-  if (k.includes("physics")) return { icon: "atom-variant", bg: "#EFFCF6", color: "#10B981" };
-  if (k.includes("chem")) return { icon: "flask-outline", bg: "#FFF7ED", color: "#F97316" };
-  if (k.includes("bio")) return { icon: "dna", bg: "#F5F3FF", color: "#8B5CF6" };
-  if (k.includes("science")) return { icon: "beaker-outline", bg: "#ECFEFF", color: "#0891B2" };
-  if (k.includes("english")) return { icon: "alphabetical", bg: "#FEF2F2", color: "#EF4444" };
-  if (k.includes("history")) return { icon: "book-open-page-variant-outline", bg: "#FFF7ED", color: "#EA580C" };
-  if (k.includes("geography")) return { icon: "earth", bg: "#ECFDF5", color: "#16A34A" };
-  return { icon: "book-education-outline", bg: "#EEF4FF", color: PRIMARY };
+  if (k.includes("math")) return { icon: "calculator-variant-outline", bg: colors.infoSurface, color: colors.primary };
+  if (k.includes("physics")) return { icon: "atom-variant", bg: colors.successSurface, color: "#10B981" };
+  if (k.includes("chem")) return { icon: "flask-outline", bg: colors.warningSurface, color: "#F97316" };
+  if (k.includes("bio")) return { icon: "dna", bg: colors.soft, color: "#8B5CF6" };
+  if (k.includes("science")) return { icon: "beaker-outline", bg: colors.infoSurface, color: "#0891B2" };
+  if (k.includes("english")) return { icon: "alphabetical", bg: colors.dangerSurface, color: "#EF4444" };
+  if (k.includes("history")) return { icon: "book-open-page-variant-outline", bg: colors.warningSurface, color: "#EA580C" };
+  if (k.includes("geography")) return { icon: "earth", bg: colors.successSurface, color: "#16A34A" };
+  return { icon: "book-education-outline", bg: colors.infoSurface, color: colors.primary };
 }
 function computeRefillState({ currentLives, maxLives, lastConsumedAt, refillMs, now = Date.now() }) {
   const current = Number(currentLives ?? 0);
@@ -133,12 +133,12 @@ export default function PackageSubjects() {
 
   const notifVisual = useCallback((type) => {
     const t = String(type || "").toLowerCase();
-    if (t === "new_package") return { icon: "cube-outline", color: "#2563EB", bg: "#EFF6FF" };
-    if (t === "new_round") return { icon: "layers-outline", color: "#7C3AED", bg: "#F5F3FF" };
-    if (t === "round_live") return { icon: "flash-outline", color: "#EA580C", bg: "#FFF7ED" };
-    if (t === "result_released") return { icon: "trophy-outline", color: "#16A34A", bg: "#ECFDF5" };
-    return { icon: "notifications-outline", color: "#0B72FF", bg: "#EEF4FF" };
-  }, []);
+    if (t === "new_package") return { icon: "cube-outline", color: colors.primary, bg: colors.infoSurface };
+    if (t === "new_round") return { icon: "layers-outline", color: "#7C3AED", bg: colors.soft };
+    if (t === "round_live") return { icon: "flash-outline", color: colors.warningText, bg: colors.warningSurface };
+    if (t === "result_released") return { icon: "trophy-outline", color: colors.success, bg: colors.successSurface };
+    return { icon: "notifications-outline", color: colors.primary, bg: colors.infoSurface };
+  }, [colors]);
 
   const parseDeepLink = useCallback((dl) => {
     const deep = String(dl || "");
@@ -659,7 +659,7 @@ export default function PackageSubjects() {
         ItemSeparatorComponent={() => <View style={{ height: 14 }} />}
         renderItem={({ item }) => {
           const expanded = expandedId === item.id;
-          const v = getSubjectVisual(item.keyName, item.name);
+          const v = getSubjectVisual(item.keyName, item.name, colors);
 
           return (
             <View style={[styles.subjectCard, expanded && styles.subjectCardExpanded]}>

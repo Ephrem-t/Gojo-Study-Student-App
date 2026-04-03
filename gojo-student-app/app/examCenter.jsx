@@ -952,7 +952,7 @@ useEffect(() => {
               </View>
               <TouchableOpacity style={{ minWidth: 72, alignItems: "flex-end" }} onPress={() => setShowHeartInfoModal(true)}>
                 <View style={{ flexDirection: "row", alignItems: "center" }}>
-                  <Ionicons name={globalLives != null && globalLives > 0 ? "heart" : "heart-outline"} size={18} color={globalLives != null && globalLives > 0 ? HEART_COLOR : C.muted} />
+                  <Ionicons name={globalLives != null && globalLives > 0 ? "heart" : "heart-outline"} size={18} color={globalLives != null && globalLives > 0 ? HEART_COLOR : colors.muted} />
                   <Text style={{ marginLeft: 6, color: C.primary, fontWeight: "900" }}>{globalLives != null ? `${globalLives}` : `—`}</Text>
                 </View>
               </TouchableOpacity>
@@ -1025,9 +1025,10 @@ useEffect(() => {
                   >
                     <View style={{ flexDirection: "row", alignItems: "center" }}>
                       <Ionicons name="alert-circle-outline" size={20} color="#C2410C" />
+                      <Ionicons name="alert-circle-outline" size={20} color={colors.warningText} />
                       <Text style={styles.noAttemptsTitle}>Attempts exhausted</Text>
                     </View>
-                    <Ionicons name={showAttemptsExhaustedDetails ? "chevron-up" : "chevron-down"} size={18} color="#C2410C" />
+                    <Ionicons name={showAttemptsExhaustedDetails ? "chevron-up" : "chevron-down"} size={18} color={colors.warningText} />
                   </TouchableOpacity>
 
                   {showAttemptsExhaustedDetails ? (
@@ -1045,7 +1046,7 @@ useEffect(() => {
 
               {!isCompetitive && (
                 <View style={styles.feedbackRow}>
-                  <Text style={{ fontWeight: "800", color: C.text, marginRight: 8 }}>Feedback</Text>
+                  <Text style={{ fontWeight: "800", color: colors.text, marginRight: 8 }}>Feedback</Text>
                   <View style={{ flexDirection: "row" }}>
                     <TouchableOpacity style={[styles.toggleBtn, feedbackMode === "instant" ? styles.toggleOn : styles.toggleOff]} onPress={() => setFeedbackMode("instant")}>
                       <Text style={feedbackMode === "instant" ? styles.toggleTextOn : styles.toggleTextOff}>Instant</Text>
@@ -1055,7 +1056,7 @@ useEffect(() => {
                     </TouchableOpacity>
                   </View>
                   <TouchableOpacity style={{ marginLeft: 10 }} onPress={() => setShowFeedbackInfoModal(true)}>
-                    <Ionicons name="information-circle-outline" size={18} color={C.muted} />
+                    <Ionicons name="information-circle-outline" size={18} color={colors.muted} />
                   </TouchableOpacity>
                 </View>
               )}
@@ -1079,7 +1080,7 @@ useEffect(() => {
         {stage === "exam" && (
           <View style={styles.panel}>
             <View style={styles.headerBar}>
-              <TouchableOpacity onPress={handleBackNavigation} style={styles.backBtn}><Ionicons name="chevron-back" size={22} color={C.text} /></TouchableOpacity>
+              <TouchableOpacity onPress={handleBackNavigation} style={styles.backBtn}><Ionicons name="chevron-back" size={22} color={colors.text} /></TouchableOpacity>
               <View style={{ flex: 1 }}>
                 <Text style={styles.title}>{examMeta?.name || "Exam"}</Text>
                 <Text style={styles.subtitle}>Question {Math.min(currentIndex + 1, totalQ)} / {totalQ}</Text>
@@ -1161,7 +1162,7 @@ useEffect(() => {
           <View style={styles.panel}>
             <View style={styles.headerBar}>
               <TouchableOpacity onPress={handleBackNavigation} style={styles.backBtn}>
-                <Ionicons name="chevron-back" size={22} color={C.text} />
+                <Ionicons name="chevron-back" size={22} color={colors.text} />
               </TouchableOpacity>
               <View style={{ flex: 1 }}>
                 <Text style={styles.title}>Review Answers</Text>
@@ -1343,12 +1344,12 @@ useEffect(() => {
             <Text style={modalStyles.title}>Lives & refill</Text>
             <Text style={modalStyles.text}>Hearts are global across subjects.</Text>
             <View style={{ marginTop: 12, alignItems: "center" }}>
-              <Ionicons name={globalLives != null && globalLives > 0 ? "heart" : "heart-outline"} size={32} color={globalLives != null && globalLives > 0 ? HEART_COLOR : C.muted} />
+              <Ionicons name={globalLives != null && globalLives > 0 ? "heart" : "heart-outline"} size={32} color={globalLives != null && globalLives > 0 ? HEART_COLOR : colors.muted} />
               <Text style={{ fontWeight: "900", marginTop: 8, fontSize: 18 }}>{globalLives != null ? `${globalLives} / ${globalMaxLives}` : `— / ${globalMaxLives}`}</Text>
-              <Text style={{ marginTop: 8, color: C.muted }}>
+              <Text style={{ marginTop: 8, color: colors.muted }}>
                 {globalLives != null && globalLives >= globalMaxLives ? "Lives full" : `Next life in: ${formatMsToMMSS(nextHeartInMs)}`}
               </Text>
-              <Text style={{ marginTop: 6, color: C.muted, fontSize: 12 }}>Refill interval: {Math.round(globalRefillMs / 60000)} min</Text>
+              <Text style={{ marginTop: 6, color: colors.muted, fontSize: 12 }}>Refill interval: {Math.round(globalRefillMs / 60000)} min</Text>
             </View>
             <TouchableOpacity style={modalStyles.closeBtnPrimary} onPress={() => setShowHeartInfoModal(false)}>
               <Text style={modalStyles.closeBtnTextPrimary}>Close</Text>
@@ -1408,17 +1409,17 @@ function createStyles(colors) {
   noAttemptsCard: {
     marginTop: 12,
     borderWidth: 1,
-    borderColor: C.warningBorder,
-    backgroundColor: C.warningBg,
+    borderColor: colors.warningBorder,
+    backgroundColor: colors.warningSurface,
     borderRadius: 12,
     padding: 12,
   },
-  noAttemptsTitle: { marginLeft: 8, fontWeight: "900", color: "#C2410C" },
-  noAttemptsSub: { marginTop: 8, color: "#9A3412", lineHeight: 20, fontWeight: "600" },
+  noAttemptsTitle: { marginLeft: 8, fontWeight: "900", color: colors.warningText },
+  noAttemptsSub: { marginTop: 8, color: colors.warningText, lineHeight: 20, fontWeight: "600" },
   noAttemptsTimer: { marginTop: 8, color: C.primary, fontWeight: "900" },
 
   feedbackRow: { flexDirection: "row", alignItems: "center", marginTop: 10, marginBottom: 8 },
-  warning: { marginTop: 12, color: "#B54708", fontWeight: "700" },
+  warning: { marginTop: 12, color: colors.warningText, fontWeight: "700" },
 
   primaryBtn: { marginTop: 18, backgroundColor: C.primary, borderRadius: 12, alignItems: "center", paddingVertical: 14 },
   primaryBtnSmall: { backgroundColor: C.primary, borderRadius: 12, alignItems: "center", paddingVertical: 12, paddingHorizontal: 24 },
@@ -1447,8 +1448,8 @@ function createStyles(colors) {
   option: { marginTop: 10, borderRadius: 12, padding: 12, flexDirection: "row", alignItems: "center" },
   optionDefault: { backgroundColor: colors.inputBackground, borderWidth: 1, borderColor: colors.border },
   optionSelected: { backgroundColor: C.primary },
-  correctFlash: { backgroundColor: "#ECFDF3", borderColor: "#ABEFC6" },
-  wrongFlash: { backgroundColor: "#FEF3F2", borderColor: "#FECACA" },
+  correctFlash: { backgroundColor: colors.successSurface, borderColor: colors.successBorder },
+  wrongFlash: { backgroundColor: colors.dangerSurface, borderColor: colors.dangerBorder },
 
   optBadge: { width: 34, height: 34, borderRadius: 17, marginRight: 10, alignItems: "center", justifyContent: "center" },
   optBadgeDef: { borderWidth: 1, borderColor: C.muted },

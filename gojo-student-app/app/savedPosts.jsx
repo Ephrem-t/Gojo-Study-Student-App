@@ -524,10 +524,10 @@ function createStyles(colors) {
   return StyleSheet.create({
     screen: {
       flex: 1,
-      backgroundColor: "#FFFFFF",
+      backgroundColor: colors.feedBackground,
     },
     topBarWrap: {
-      backgroundColor: "#FFFFFF",
+      backgroundColor: colors.background,
       borderBottomWidth: 1,
       borderBottomColor: colors.border,
     },
@@ -561,21 +561,21 @@ function createStyles(colors) {
       flex: 1,
       alignItems: "center",
       justifyContent: "center",
-      backgroundColor: "#FFFFFF",
+      backgroundColor: colors.feedBackground,
     },
     list: {
       paddingVertical: 0,
-      backgroundColor: "#FFFFFF",
+      backgroundColor: colors.feedBackground,
     },
     card: {
-      backgroundColor: "#FFFFFF",
+      backgroundColor: colors.card,
       marginBottom: 6,
       marginHorizontal: 0,
       overflow: "hidden",
       borderRadius: 0,
       borderTopWidth: StyleSheet.hairlineWidth,
       borderBottomWidth: StyleSheet.hairlineWidth,
-      borderColor: "#DBDBDB",
+      borderColor: colors.border,
     },
     cardHeader: {
       flexDirection: "row",
@@ -638,7 +638,7 @@ function createStyles(colors) {
     },
     postImage: {
       width: "100%",
-      backgroundColor: "#DDD",
+      backgroundColor: colors.surfaceMuted,
     },
     reactionsSummary: {
       flexDirection: "row",
@@ -683,7 +683,7 @@ function createStyles(colors) {
       flex: 1,
       alignItems: "center",
       justifyContent: "center",
-      backgroundColor: "#FFFFFF",
+      backgroundColor: colors.feedBackground,
       paddingHorizontal: 28,
     },
     emptyIconWrap: {
@@ -723,7 +723,7 @@ function createStyles(colors) {
       width: 40,
       height: 40,
       borderRadius: 20,
-      backgroundColor: "rgba(255,255,255,0.18)",
+      backgroundColor: colors.tabGlassHighlight,
       alignItems: "center",
       justifyContent: "center",
     },

@@ -426,8 +426,7 @@ export default function DashboardLayout() {
           options={{
             title: "Exams",
             tabBarLabel: "Exam",
-            headerTitle: "Exams",
-            headerRight: () => null,
+            headerShown: false,
             tabBarIcon: ({ color, size }) => <ExamTabIcon color={color} size={size} />,
           }}
         />
@@ -458,11 +457,7 @@ export default function DashboardLayout() {
           name="profile"
           options={{
             title: "Profile",
-            headerTitle: "Profile",
-            headerRight: () => null,
-            headerStyle: { height: 56, paddingTop: 0 },
-            headerTitleStyle: { fontSize: 16, fontWeight: "800" },
-            headerTitleAlign: "center",
+            headerShown: false,
             tabBarIcon: ({ color, size, focused }) => <ProfileTabIcon color={color} size={size} focused={focused} />,
           }}
         />
@@ -511,9 +506,9 @@ function createStyles(colors) {
     flexDirection: "row",
     alignItems: "center",
     paddingHorizontal: 6,
-    backgroundColor: "rgba(255,255,255,0.9)",
+    backgroundColor: colors.tabGlass,
     borderWidth: 1,
-    borderColor: "rgba(221,228,240,0.95)",
+    borderColor: colors.tabGlassBorder,
     shadowColor: "#0F172A",
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.045,
@@ -528,7 +523,7 @@ function createStyles(colors) {
     top: 1,
     height: 1,
     borderRadius: 999,
-    backgroundColor: "rgba(255,255,255,0.72)",
+    backgroundColor: colors.tabGlassHighlight,
   },
 
   telegramTabItem: {
@@ -546,7 +541,7 @@ function createStyles(colors) {
   },
 
   telegramTabItemActive: {
-    backgroundColor: "rgba(0,122,251,0.08)",
+    backgroundColor: colors.tabGlassActive,
   },
 
   telegramTabIconWrap: {
@@ -684,7 +679,7 @@ function createStyles(colors) {
     minWidth: 18,
     height: 18,
     borderRadius: 9,
-    backgroundColor: "#FF3B30",
+    backgroundColor: colors.danger,
     alignItems: "center",
     justifyContent: "center",
     paddingHorizontal: 4,

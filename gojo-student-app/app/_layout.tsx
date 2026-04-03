@@ -132,12 +132,12 @@ function GlobalNotificationToast() {
 
   const notifVisual = useCallback((type?: string) => {
     const t = String(type || "").toLowerCase();
-    if (t === "new_package") return { icon: "cube-outline" as const, color: "#2563EB", bg: "#EFF6FF" };
-    if (t === "new_round") return { icon: "layers-outline" as const, color: "#7C3AED", bg: "#F5F3FF" };
-    if (t === "round_live") return { icon: "flash-outline" as const, color: "#EA580C", bg: "#FFF7ED" };
-    if (t === "result_released") return { icon: "trophy-outline" as const, color: "#16A34A", bg: "#ECFDF5" };
-    return { icon: "notifications-outline" as const, color: "#0B72FF", bg: "#EEF4FF" };
-  }, []);
+    if (t === "new_package") return { icon: "cube-outline" as const, color: colors.primary, bg: colors.infoSurface };
+    if (t === "new_round") return { icon: "layers-outline" as const, color: "#8B5CF6", bg: colors.soft };
+    if (t === "round_live") return { icon: "flash-outline" as const, color: colors.warningText, bg: colors.warningSurface };
+    if (t === "result_released") return { icon: "trophy-outline" as const, color: colors.success, bg: colors.successSurface };
+    return { icon: "notifications-outline" as const, color: colors.primary, bg: colors.soft };
+  }, [colors]);
 
   const parseDeepLink = useCallback((dl?: string) => {
     const deep = String(dl || "");

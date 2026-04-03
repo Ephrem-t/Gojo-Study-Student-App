@@ -22,8 +22,8 @@ import { ref, get, remove, update } from "firebase/database";
 import { database } from "../../constants/firebaseConfig";
 import { Ionicons } from "@expo/vector-icons";
 import * as FileSystem from "expo-file-system/legacy";
-import { WebView } from "react-native-webview";
 import { useRouter, useFocusEffect } from "expo-router";
+import NativePdfView, { nativePdfUnavailableMessage } from "../../components/native-pdf-view";
 import { useAppTheme } from "../../hooks/use-app-theme";
 
 const MAX_NOTES_PER_CHAPTER = 5;
@@ -148,137 +148,10 @@ function normalizeChapterNotes(value) {
     .filter((note) => typeof note === "object" && (typeof note.text === "string" || typeof note.title === "string"));
 }
 
-function escapeHtml(value) {
-  return String(value || "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
-function buildPremiumPdfReaderHtml(fileUrl, title, theme = {}) {
-  const safeJsFileUrl = JSON.stringify(String(fileUrl || ""));
-  const safeTitle = escapeHtml(title || "Chapter Reader");
-  const cssBg = String(theme.bg || "#F4F7FF");
-  const cssCard = String(theme.card || "#FFFFFF");
-  const cssLine = String(theme.line || "#DCE6FA");
-  const cssText = String(theme.text || "#13284B");
-  const cssMuted = String(theme.muted || "#5D6F99");
-  const cssPrimary = String(theme.primary || "#0B72FF");
-  const cssStateBg = String(theme.stateBg || cssCard);
-
-  return `<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
-    <title>${safeTitle}</title>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
-    <style>
-      :root { --bg:${cssBg}; --card:${cssCard}; --line:${cssLine}; --text:${cssText}; --muted:${cssMuted}; --primary:${cssPrimary}; --state-bg:${cssStateBg}; }
-      html, body { margin:0; padding:0; min-height:100%; background:var(--bg); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; color:var(--text); overflow-x:hidden; }
-      .wrap { min-height:100vh; display:flex; flex-direction:column; padding:8px 10px 14px; box-sizing:border-box; }
-      .pages { padding:0; display:flex; flex-direction:column; gap:12px; }
-      .pageCard { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:0; overflow:hidden; box-shadow:0 4px 14px rgba(0,0,0,0.06); }
-      canvas { width:100% !important; height:auto !important; display:block; }
-      .state { margin:8px auto 12px; width:100%; max-width:560px; border:1px dashed var(--line); border-radius:12px; background:var(--state-bg); padding:12px 14px; text-align:center; color:var(--muted); font-weight:700; font-size:14px; line-height:20px; letter-spacing:0.15px; box-sizing:border-box; }
-      @media (min-width: 900px) {
-        .wrap { padding:14px 24px 24px; }
-        .pages { gap:16px; }
-        .state { font-size:15px; line-height:22px; margin-bottom:14px; }
-      }
-    </style>
-  </head>
-  <body>
-    <div class="wrap">
-      <div id="state" class="state">Loading chapter...</div>
-      <div id="pages" class="pages"></div>
-    </div>
-
-    <script>
-      const fileUrl = ${safeJsFileUrl};
-      const stateEl = document.getElementById("state");
-      const pagesEl = document.getElementById("pages");
-
-      let pdfDoc = null;
-      let zoomFactor = 1;
-
-      async function renderAllPages() {
-        if (!pdfDoc) return;
-        pagesEl.innerHTML = "";
-
-        for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum += 1) {
-          const page = await pdfDoc.getPage(pageNum);
-          const baseViewport = page.getViewport({ scale: 1 });
-          const containerWidth = Math.max(320, pagesEl.clientWidth || window.innerWidth || 360);
-          const fitScale = containerWidth / baseViewport.width;
-          const viewport = page.getViewport({ scale: fitScale * zoomFactor });
-
-          const card = document.createElement("div");
-          card.className = "pageCard";
-
-          const canvas = document.createElement("canvas");
-          const context = canvas.getContext("2d");
-          canvas.width = viewport.width;
-          canvas.height = viewport.height;
-
-          card.appendChild(canvas);
-          pagesEl.appendChild(card);
-
-          await page.render({ canvasContext: context, viewport }).promise;
-        }
-      }
-
-      function setStateError(msg) {
-        stateEl.style.display = "block";
-        stateEl.textContent = msg;
-      }
-
-      function clearState() {
-        stateEl.style.display = "none";
-      }
-
-      window.addEventListener("resize", () => {
-        renderAllPages();
-      });
-
-      (async () => {
-        try {
-          if (!window.pdfjsLib) {
-            setStateError("Reader engine could not load.");
-            window.ReactNativeWebView?.postMessage(JSON.stringify({ type: "pdf_error", message: "pdfjs_unavailable" }));
-            return;
-          }
-
-          pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
-          pdfDoc = await pdfjsLib.getDocument({ url: fileUrl, withCredentials: false }).promise;
-
-          clearState();
-          await renderAllPages();
-        } catch (err) {
-          setStateError("Could not render this PDF.");
-          window.ReactNativeWebView?.postMessage(JSON.stringify({ type: "pdf_error", message: String(err?.message || err || "error") }));
-        }
-      })();
-    </script>
-  </body>
-</html>`;
-}
-
 export default function BooksScreen() {
   const router = useRouter();
   const { colors, resolvedAppearance } = useAppTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
-  const readerTheme = useMemo(() => ({
-    bg: colors.feedBackground,
-    card: colors.card,
-    line: colors.border,
-    text: colors.text,
-    muted: colors.muted,
-    primary: colors.primary,
-    stateBg: colors.inputBackground,
-  }), [colors]);
 
   const PRIMARY = colors.primary;
   const TEXT = colors.text;
@@ -311,13 +184,10 @@ export default function BooksScreen() {
 
   const [viewer, setViewer] = useState({
     visible: false,
-    html: null,
     title: "",
     subjectName: "",
-    sourceUrl: null,
     localUri: null,
-    isOffline: false,
-    hasRetriedPremium: false,
+    reloadKey: 0,
   });
   const [viewerLoading, setViewerLoading] = useState(false);
   const [notesMap, setNotesMap] = useState({});
@@ -427,6 +297,11 @@ export default function BooksScreen() {
       const uri = `${BOOKS_DIR}${name}`;
       const info = await FileSystem.getInfoAsync(uri);
       if (!info.exists) continue;
+      if (Number(info.size || 0) <= 0) {
+        await FileSystem.deleteAsync(uri, { idempotent: true });
+        await removeDownloadMetadata(name);
+        continue;
+      }
       const meta = idx[name] || {};
       list.push({
         name,
@@ -441,7 +316,7 @@ export default function BooksScreen() {
 
     list.sort((a, b) => (b.modificationTime || 0) - (a.modificationTime || 0));
     setDownloadedFilesList(list);
-  }, [ensureBooksDir, loadDownloadIndex]);
+  }, [ensureBooksDir, loadDownloadIndex, removeDownloadMetadata]);
 
   const cancelDownload = useCallback(async (url) => {
     const active = activeDownloadsRef.current[url];
@@ -472,6 +347,27 @@ export default function BooksScreen() {
     await ensureBooksDir();
     const localPath = getLocalPathForUrl(url);
 
+    const finishDownload = async (fileUri) => {
+      const resolvedUri = fileUri || localPath;
+      const info = await FileSystem.getInfoAsync(resolvedUri);
+
+      if (!info.exists || Number(info.size || 0) <= 0) {
+        await FileSystem.deleteAsync(resolvedUri, { idempotent: true });
+        throw new Error("Downloaded file is empty.");
+      }
+
+      setDownloadingMap((s) => {
+        const c = { ...s };
+        delete c[url];
+        return c;
+      });
+      setDownloadProgress((s) => ({ ...s, [url]: 1 }));
+      delete activeDownloadsRef.current[url];
+      await registerDownloadMetadata(url, meta);
+      await refreshDownloadedFiles();
+      return resolvedUri;
+    };
+
     setDownloadingMap((s) => ({ ...s, [url]: true }));
     setDownloadProgress((s) => ({ ...s, [url]: 0 }));
 
@@ -493,29 +389,11 @@ export default function BooksScreen() {
 
     try {
       const out = await resumable.downloadAsync();
-      setDownloadingMap((s) => {
-        const c = { ...s };
-        delete c[url];
-        return c;
-      });
-      setDownloadProgress((s) => ({ ...s, [url]: 1 }));
-      delete activeDownloadsRef.current[url];
-      await registerDownloadMetadata(url, meta);
-      await refreshDownloadedFiles();
-      return out.uri;
+      return await finishDownload(out?.uri);
     } catch (err) {
       try {
         const fb = await FileSystem.downloadAsync(url, localPath);
-        setDownloadingMap((s) => {
-          const c = { ...s };
-          delete c[url];
-          return c;
-        });
-        setDownloadProgress((s) => ({ ...s, [url]: 1 }));
-        delete activeDownloadsRef.current[url];
-        await registerDownloadMetadata(url, meta);
-        await refreshDownloadedFiles();
-        return fb.uri;
+        return await finishDownload(fb?.uri);
       } catch (e) {
         const info = await FileSystem.getInfoAsync(localPath);
         if (info.exists) await FileSystem.deleteAsync(localPath, { idempotent: true });
@@ -540,52 +418,44 @@ export default function BooksScreen() {
     setViewerLoading(false);
     setViewer({
       visible: false,
-      html: null,
       title: "",
       subjectName: "",
-      sourceUrl: null,
       localUri: null,
-      isOffline: false,
-      hasRetriedPremium: false,
+      reloadKey: 0,
     });
   }, []);
 
-  const openRemotePdfInViewer = useCallback((remoteUrl, title, subjectName = "", localUri = null) => {
-    const sourceForPremium = localUri || remoteUrl;
-    const premiumHtml = buildPremiumPdfReaderHtml(sourceForPremium, title, readerTheme);
+  const openLocalPdfInViewer = useCallback((localUri, title, subjectName = "") => {
+    if (!localUri) {
+      Alert.alert("Unable to load", "This chapter is not downloaded on your phone yet.");
+      return;
+    }
+
+    if (!NativePdfView) {
+      Alert.alert("PDF reader unavailable", nativePdfUnavailableMessage);
+      return;
+    }
 
     setViewerLoading(true);
     setViewer({
       visible: true,
-      html: premiumHtml,
       title,
       subjectName,
-      sourceUrl: remoteUrl,
-      localUri: localUri || null,
-      isOffline: !!localUri,
-      hasRetriedPremium: false,
+      localUri,
+      reloadKey: 0,
     });
-  }, [readerTheme]);
+  }, []);
 
-  const retryPremiumWithOnlineSource = useCallback(() => {
-    let changed = false;
+  const reloadViewer = useCallback(() => {
+    setViewerLoading(true);
     setViewer((prev) => {
-      if (prev.hasRetriedPremium || !prev.sourceUrl) return prev;
-      changed = true;
+      if (!prev.localUri) return prev;
       return {
         ...prev,
-        html: buildPremiumPdfReaderHtml(prev.sourceUrl, prev.title, readerTheme),
-        isOffline: false,
-        hasRetriedPremium: true,
+        reloadKey: prev.reloadKey + 1,
       };
     });
-
-    if (changed) {
-      setViewerLoading(true);
-      return true;
-    }
-    return false;
-  }, [readerTheme]);
+  }, []);
 
   const deleteFile = useCallback(async (file) => {
     await FileSystem.deleteAsync(file.uri, { idempotent: true });
@@ -926,24 +796,33 @@ export default function BooksScreen() {
     const url = unit.pdfUrl;
     if (!url) return Alert.alert("No PDF", "This unit has no pdfUrl.");
 
+    if (downloadingMap[url]) {
+      Alert.alert("Download in progress", "Wait for this chapter to finish downloading before opening it.");
+      return;
+    }
+
     let localUri = null;
     try {
       const localPath = getLocalPathForUrl(url);
       const info = localPath ? await FileSystem.getInfoAsync(localPath) : { exists: false };
-      if (info.exists) localUri = localPath;
+      if (info.exists && Number(info.size || 0) > 0) {
+        localUri = localPath;
+      } else if (info.exists && localPath) {
+        await FileSystem.deleteAsync(localPath, { idempotent: true });
+      }
     } catch {}
 
     if (!localUri) {
       try {
         localUri = await downloadToLocal(url, { title: unit.title, subjectName });
       } catch {
-        Alert.alert("Download required", "This chapter must be downloaded before opening in the reader.");
+        Alert.alert("Download failed", "This chapter could not be saved to your phone. Please try downloading it again.");
         return;
       }
     }
 
-    openRemotePdfInViewer(url, unit.title, subjectName, localUri);
-  }, [downloadToLocal, getLocalPathForUrl, openRemotePdfInViewer]);
+    openLocalPdfInViewer(localUri, unit.title, subjectName);
+  }, [downloadToLocal, downloadingMap, getLocalPathForUrl, openLocalPdfInViewer]);
 
   const downloadOrCancel = useCallback(async (unit, subjectName) => {
     const url = unit.pdfUrl;
@@ -1634,20 +1513,12 @@ export default function BooksScreen() {
                 <Text style={styles.readerSubtitle} numberOfLines={1}>{viewer.subjectName}</Text>
               )}
               <Text style={styles.readerStatusText} numberOfLines={1}>
-                {viewer.isOffline ? "Downloaded chapter (offline-ready)" : "Opening online chapter"}
+                Opened from your phone storage
               </Text>
             </View>
 
             <TouchableOpacity
-              onPress={() =>
-                setViewer((prev) => {
-                  const sourceForPremium = prev.localUri || prev.sourceUrl || "";
-                  return {
-                    ...prev,
-                    html: buildPremiumPdfReaderHtml(sourceForPremium, prev.title, readerTheme),
-                  };
-                })
-              }
+              onPress={reloadViewer}
               style={styles.readerHeaderIconBtn}
             >
               <Ionicons name="refresh" size={18} color={PRIMARY} />
@@ -1655,44 +1526,19 @@ export default function BooksScreen() {
           </View>
 
           <View style={styles.readerBodyWrap}>
-            {viewer.html ? (
+            {viewer.localUri && NativePdfView ? (
               <>
-                <WebView
-                  source={{ html: viewer.html }}
-                  originWhitelist={["*"]}
-                  javaScriptEnabled
-                  domStorageEnabled
-                  startInLoadingState
+                <NativePdfView
+                  key={`${viewer.localUri}-${viewer.reloadKey}`}
+                  source={{ uri: viewer.localUri }}
                   style={styles.readerWebView}
-                  onLoadStart={() => setViewerLoading(true)}
-                  onLoadEnd={() => setViewerLoading(false)}
-                  onMessage={(event) => {
-                    try {
-                      const payload = JSON.parse(event?.nativeEvent?.data || "{}");
-                      if (payload?.type === "pdf_error") {
-                        setViewerLoading(false);
-                        if (!retryPremiumWithOnlineSource()) {
-                          Alert.alert("Unable to load", "Could not render this chapter in the premium reader.");
-                        }
-                      }
-                    } catch {}
-                  }}
-                  onError={() => {
+                  onLoadComplete={() => setViewerLoading(false)}
+                  onError={(error) => {
+                    console.warn("Textbook PDF load error:", error);
                     setViewerLoading(false);
-                    if (!retryPremiumWithOnlineSource()) {
-                      Alert.alert("Unable to load", "Could not open this chapter in the premium reader.");
-                    }
+                    Alert.alert("Unable to load", "This PDF could not be opened from your phone. Delete it and download it again.");
                   }}
-                  onHttpError={() => {
-                    setViewerLoading(false);
-                    if (!retryPremiumWithOnlineSource()) {
-                      Alert.alert("Unable to load", "Could not open this chapter in the premium reader.");
-                    }
-                  }}
-                  mixedContentMode="always"
-                  allowFileAccess
-                  allowUniversalAccessFromFileURLs
-                  setSupportMultipleWindows={false}
+                  enableDoubleTapZoom
                 />
 
                 {viewerLoading ? (
@@ -1762,8 +1608,8 @@ export default function BooksScreen() {
                   <View style={styles.fileActionGroup}>
                     <TouchableOpacity
                       onPress={() => {
-                        if (item.url || item.uri) openRemotePdfInViewer(item.url || item.uri, item.title, item.subjectName || "", item.uri || null);
-                        else Alert.alert("No online link", "This cached file has no source URL.");
+                        if (item.uri) openLocalPdfInViewer(item.uri, item.title, item.subjectName || "");
+                        else Alert.alert("Missing file", "This cached file is no longer on your phone.");
                       }}
                       style={[styles.fileActionBtn, styles.fileOpenBtn]}
                     >

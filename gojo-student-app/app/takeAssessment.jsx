@@ -93,6 +93,7 @@ export default function TakeAssessment() {
 
   const [timeLeftMs, setTimeLeftMs] = useState(null);
   const autoSubmittedRef = useRef(false);
+  const submitAssessmentRef = useRef(null);
 
   const draftKey = useMemo(() => {
     if (!assessmentId || !studentId) return null;
@@ -194,7 +195,7 @@ export default function TakeAssessment() {
 
       if (left <= 0 && !autoSubmittedRef.current && !submitting && !alreadySubmitted) {
         autoSubmittedRef.current = true;
-        submitAssessment(true);
+        submitAssessmentRef.current?.(true);
       }
     };
 
@@ -421,21 +422,7 @@ export default function TakeAssessment() {
     }
   };
 
-  if (loading) {
-    return (
-      <SafeAreaView style={[styles.center, { paddingTop: insets.top }]}>
-        <ActivityIndicator size="large" color={PRIMARY} />
-      </SafeAreaView>
-    );
-  }
-
-  if (!assessment) {
-    return (
-      <SafeAreaView style={[styles.center, { paddingTop: insets.top }]}>
-        <Text style={{ color: colors.text, fontWeight: "700" }}>Assessment not found.</Text>
-      </SafeAreaView>
-    );
-  }
+  submitAssessmentRef.current = submitAssessment;
 
   const timerText = formatTimeLeft(timeLeftMs);
   const dueLabel = formatDueDate(assessment?.dueDate);
@@ -461,6 +448,22 @@ export default function TakeAssessment() {
 
     Animated.stagger(30, anims).start();
   }, [shouldCelebrate, sparkleAnims]);
+
+  if (loading) {
+    return (
+      <SafeAreaView style={[styles.center, { paddingTop: insets.top }]}>
+        <ActivityIndicator size="large" color={PRIMARY} />
+      </SafeAreaView>
+    );
+  }
+
+  if (!assessment) {
+    return (
+      <SafeAreaView style={[styles.center, { paddingTop: insets.top }]}>
+        <Text style={{ color: colors.text, fontWeight: "700" }}>Assessment not found.</Text>
+      </SafeAreaView>
+    );
+  }
 
   const closeResultModal = () => {
     setResultModalVisible(false);

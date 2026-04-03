@@ -10,6 +10,7 @@ import {
   UIManager,
   Platform,
   ScrollView,
+  RefreshControl,
   Modal,
   Animated,
   Image,
@@ -26,7 +27,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { ref, get, query, orderByChild, equalTo } from "firebase/database";
 import { database } from "../../constants/firebaseConfig";
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
-import { Svg, Circle, Rect, Line, Text as SvgText, G } from "react-native-svg";
+import { Svg, Circle, Rect, Line, Path, Text as SvgText, G } from "react-native-svg";
 import { setOpenedChat } from "../lib/chatStore";
 import { useAppTheme } from "../../hooks/use-app-theme";
 
@@ -38,18 +39,24 @@ import { getUserVal } from "../lib/userHelpers";
    - Shows empty state when no courses found
 */
 
-const { height: SCREEN_H } = Dimensions.get("window");
+const { width: SCREEN_W, height: SCREEN_H } = Dimensions.get("window");
 const PRIMARY = "#007AFB";
 const MUTED = "#6B78A8";
 const SUCCESS = "#27AE60";
 const WARNING = "#F2C94C";
 const DANGER = "#EB5757";
 const CARD_BORDER = "#F1F3F8";
+const SVG_HITBOX_FILL = "rgba(15,23,42,0.001)";
 const MARK_FILTER_OPTIONS = [
   { key: "all", label: "All" },
   { key: "submitted", label: "Submitted" },
   { key: "unsubmitted", label: "Unsubmitted" },
   { key: "analytics", label: "Analytics" },
+];
+const ANALYTICS_TERM_OPTIONS = [
+  { key: "semester1", label: "Semester 1" },
+  { key: "semester2", label: "Semester 2" },
+  { key: "average", label: "Average" },
 ];
 
 if (Platform.OS === "android" && UIManager.setLayoutAnimationEnabledExperimental) {
@@ -82,14 +89,15 @@ function getSubjectIcon(subjectText = "") {
 
 /* Circular overall progress (white center) */
 function CircularProgress({ size = 112, strokeWidth = 9, percent = 0, color, textSize = 18 }) {
+  const { colors } = useAppTheme();
   const radius = (size - strokeWidth) / 2;
   const circumference = 2 * Math.PI * radius;
   const pct = clamp(Math.round(percent || 0), 0, 100);
   const strokeDashoffset = circumference - (circumference * pct) / 100;
   return (
-    <View style={{ width: size, height: size, alignItems: "center", justifyContent: "center", backgroundColor: "#fff", borderRadius: size / 2 }}>
+    <View style={{ width: size, height: size, alignItems: "center", justifyContent: "center", backgroundColor: colors.card, borderRadius: size / 2 }}>
       <Svg width={size} height={size}>
-        <Circle fill="none" stroke="#EEF4FF" cx={size / 2} cy={size / 2} r={radius} strokeWidth={strokeWidth} />
+        <Circle fill="none" stroke={colors.border} cx={size / 2} cy={size / 2} r={radius} strokeWidth={strokeWidth} />
         <Circle
           fill="none"
           stroke={color || percentColor(pct)}
@@ -115,28 +123,128 @@ function shortSubjectLabel(value = "") {
   return parts.slice(0, 2).map((part) => part.charAt(0)).join("").toUpperCase();
 }
 
-function AnalyticsBarChart({ data = [], colors }) {
+function truncateChartLabel(value = "", maxLength = 18) {
+  const label = String(value || "").trim();
+  if (label.length <= maxLength) return label;
+  return `${label.slice(0, Math.max(0, maxLength - 1)).trim()}…`;
+}
+
+function getAnalyticsPerformanceMeta(value, colors) {
+  const numericValue = Math.max(0, Number(value || 0));
+  if (numericValue >= 85) {
+    return { label: "Excellent", message: "Elite performance in this view.", color: SUCCESS };
+  }
+  if (numericValue >= 70) {
+    return { label: "Strong", message: "Strong performance in this view.", color: colors?.primary || PRIMARY };
+  }
+  if (numericValue >= 50) {
+    return { label: "Developing", message: "A small lift will move this subject higher.", color: WARNING };
+  }
+  return { label: "Needs focus", message: "This subject needs extra attention next.", color: DANGER };
+}
+
+function AnalyticsChartTooltip({ x, y, label, value, colors, plotStartX, plotEndX }) {
+  if (x == null || y == null) return null;
+
+  const bubbleWidth = Math.max(92, Math.min(136, 52 + String(label || "").length * 4.25));
+  const bubbleHeight = 40;
+  const bubbleX = Math.max(plotStartX, Math.min(plotEndX - bubbleWidth, x - bubbleWidth / 2));
+  const bubbleY = Math.max(6, y - 54);
+  const tone = getAnalyticsPerformanceMeta(value, colors);
+
+  return (
+    <G pointerEvents="none">
+      <Line
+        x1={x}
+        y1={bubbleY + bubbleHeight}
+        x2={x}
+        y2={Math.max(10, y - 6)}
+        stroke={tone.color}
+        strokeWidth="1.5"
+        strokeDasharray="4 4"
+        opacity="0.35"
+      />
+      <Rect
+        x={bubbleX}
+        y={bubbleY}
+        width={bubbleWidth}
+        height={bubbleHeight}
+        rx={12}
+        fill={colors.card}
+        stroke={colors.border}
+        strokeWidth="1"
+      />
+      <SvgText
+        x={bubbleX + bubbleWidth / 2}
+        y={bubbleY + 15}
+        fontSize="9"
+        fontWeight="700"
+        fill={colors.muted}
+        textAnchor="middle"
+      >
+        {truncateChartLabel(label, 18)}
+      </SvgText>
+      <SvgText
+        x={bubbleX + bubbleWidth / 2}
+        y={bubbleY + 30}
+        fontSize="13"
+        fontWeight="900"
+        fill={tone.color}
+        textAnchor="middle"
+      >
+        {`${Math.round(Number(value || 0))}%`}
+      </SvgText>
+    </G>
+  );
+}
+
+function AnalyticsBarChart({ data = [], colors, chartWidth: chartWidthProp, selectedKey, onSelect }) {
   if (!data.length) {
     return <Text style={{ color: MUTED }}>No submitted marks yet for chart view.</Text>;
   }
 
-  const chartWidth = Math.max(210, SCREEN_H * 0.36);
+  const chartWidth = Math.max(220, Number(chartWidthProp || 0) || SCREEN_W - 70);
   const chartHeight = 164;
   const baselineY = 124;
+  const axisLabelWidth = 26;
+  const axisGap = 8;
+  const chartPaddingRight = 8;
+  const availablePlotWidth = Math.max(40, chartWidth - axisLabelWidth - axisGap - chartPaddingRight);
+  const plotWidth = Math.max(40, availablePlotWidth * 0.9);
+  const plotStartX = axisLabelWidth + axisGap + (availablePlotWidth - plotWidth) / 2;
+  const plotEndX = plotStartX + plotWidth;
+  const subjectCount = data.length;
+  const isDense = subjectCount >= 8;
+  const isUltraDense = subjectCount >= 11;
   const maxValue = Math.max(100, ...data.map((item) => Number(item.value || 0)));
-  const slotWidth = chartWidth / data.length;
-  const barWidth = Math.min(22, Math.max(12, slotWidth * 0.4));
+  const slotWidth = plotWidth / data.length;
+  const barWidth = Math.min(
+    22,
+    Math.max(isUltraDense ? 4 : isDense ? 6 : 10, slotWidth * (isUltraDense ? 0.28 : isDense ? 0.33 : 0.4))
+  );
+  const valueFontSize = isUltraDense ? 7 : isDense ? 8 : 9;
+  const xLabelFontSize = isUltraDense ? 7 : isDense ? 8 : 9;
+  const showValueLabels = subjectCount <= 6;
+  const labelStep = Math.max(1, Math.ceil(subjectCount / 6));
   const gridValues = [0, 25, 50, 75, 100];
+  const selectedItem = data.find((item) => item.key === selectedKey) || null;
+  const selectedIndex = selectedItem ? data.findIndex((item) => item.key === selectedItem.key) : -1;
+  const selectedValue = selectedItem ? Math.max(0, Number(selectedItem.value || 0)) : 0;
+  const selectedBarHeight = selectedItem ? ((baselineY - 22) * selectedValue) / maxValue : 0;
+  const selectedX = selectedItem
+    ? plotStartX + slotWidth * selectedIndex + (slotWidth - barWidth) / 2 + barWidth / 2
+    : null;
+  const selectedY = selectedItem ? baselineY - selectedBarHeight : null;
 
   return (
-    <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+    <View style={{ width: "100%", alignItems: "center" }}>
       <Svg width={chartWidth} height={chartHeight}>
         {gridValues.map((tick) => {
           const y = baselineY - ((baselineY - 18) * tick) / maxValue;
           return (
             <G key={`grid-${tick}`}>
-              <Line x1="0" y1={y} x2={chartWidth} y2={y} stroke="#E8EEF9" strokeWidth="1" />
-              <SvgText x="0" y={Math.max(12, y - 4)} fontSize="10" fontWeight="700" fill={colors.muted}>
+              <Line x1={plotStartX} y1={y} x2={plotEndX} y2={y} stroke="#E8EEF9" strokeWidth="1" />
+              <SvgText x={axisLabelWidth} y={Math.max(12, y - 4)} fontSize="10" fontWeight="700" fill={colors.muted} textAnchor="end">
                 {String(tick)}
               </SvgText>
             </G>
@@ -146,43 +254,79 @@ function AnalyticsBarChart({ data = [], colors }) {
         {data.map((item, index) => {
           const value = Math.max(0, Number(item.value || 0));
           const barHeight = ((baselineY - 22) * value) / maxValue;
-          const x = slotWidth * index + (slotWidth - barWidth) / 2;
+          const x = plotStartX + slotWidth * index + (slotWidth - barWidth) / 2;
           const y = baselineY - barHeight;
+          const isSelected = item.key === selectedItem?.key;
+          const fillColor = value >= 70 ? colors.primary : value >= 50 ? WARNING : DANGER;
+          const hitBoxWidth = Math.max(barWidth + 14, slotWidth * 0.86);
           return (
-            <G key={item.key || item.label || index}>
+            <G key={item.key || item.label || index} onPress={() => onSelect?.(item.key)}>
+              <Rect
+                x={x + barWidth / 2 - hitBoxWidth / 2}
+                y={10}
+                width={hitBoxWidth}
+                height={138}
+                fill={SVG_HITBOX_FILL}
+              />
+              {isSelected ? (
+                <Rect
+                  x={x - 4}
+                  y={Math.max(14, y - 6)}
+                  width={barWidth + 8}
+                  height={barHeight + 8}
+                  rx={(barWidth + 8) / 2.2}
+                  fill={fillColor}
+                  opacity={0.16}
+                />
+              ) : null}
               <Rect
                 x={x}
                 y={y}
                 width={barWidth}
                 height={barHeight}
                 rx={barWidth / 2.4}
-                fill={value >= 70 ? colors.primary : value >= 50 ? WARNING : DANGER}
+                fill={fillColor}
+                opacity={isSelected ? 1 : 0.84}
               />
               <SvgText
                 x={x + barWidth / 2}
                 y={Math.max(14, y - 6)}
-                fontSize="9"
+                fontSize={String(valueFontSize)}
                 fontWeight="800"
-                fill={colors.text}
+                fill={isSelected ? fillColor : colors.text}
                 textAnchor="middle"
               >
-                {`${Math.round(value)}%`}
+                {showValueLabels ? `${Math.round(value)}%` : ""}
               </SvgText>
               <SvgText
                 x={x + barWidth / 2}
                 y={144}
-                fontSize="9"
+                fontSize={String(xLabelFontSize)}
                 fontWeight="800"
-                fill={colors.muted}
+                fill={isSelected ? colors.text : colors.muted}
                 textAnchor="middle"
               >
-                {String(shortSubjectLabel(item.label))}
+                {index % labelStep !== 0
+                  ? ""
+                  : isUltraDense
+                    ? String(shortSubjectLabel(item.label)).slice(0, 1)
+                    : String(shortSubjectLabel(item.label))}
               </SvgText>
             </G>
           );
         })}
+
+        <AnalyticsChartTooltip
+          x={selectedX}
+          y={selectedY}
+          label={selectedItem?.label}
+          value={selectedItem?.value}
+          colors={colors}
+          plotStartX={plotStartX}
+          plotEndX={plotEndX}
+        />
       </Svg>
-    </ScrollView>
+    </View>
   );
 }
 
@@ -659,6 +803,7 @@ export default function ClassMarkScreen() {
   const tabBarHeight = useBottomTabBarHeight();
   const styles = useMemo(() => createStyles(colors), [colors]);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [courses, setCourses] = useState([]);
   const [expanded, setExpanded] = useState({});
   const [marksMap, setMarksMap] = useState({});
@@ -670,6 +815,10 @@ export default function ClassMarkScreen() {
   const [search, setSearch] = useState("");
   const [markFilter, setMarkFilter] = useState("all");
   const [isSearchFocused, setIsSearchFocused] = useState(false);
+  const [analyticsTerm, setAnalyticsTerm] = useState("average");
+  const [analyticsChartType, setAnalyticsChartType] = useState("bar");
+  const [analyticsGraphWidth, setAnalyticsGraphWidth] = useState(0);
+  const [analyticsActiveKey, setAnalyticsActiveKey] = useState(null);
 
   const [sheetVisible, setSheetVisible] = useState(false);
   const [sheetCourseKey, setSheetCourseKey] = useState(null);
@@ -677,8 +826,15 @@ export default function ClassMarkScreen() {
   const [selectedSemester, setSelectedSemester] = useState(null);
   const [teacherProfile, setTeacherProfile] = useState({ name: null, profileImage: null });
 
+  const isMountedRef = useRef(true);
   const innerScrollAtTopRef = useRef(true);
   const scrollBottomPadding = Math.max(68, Math.round((tabBarHeight + insets.bottom + 20) * 0.6));
+
+  useEffect(() => {
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
 
   // load student info; reads Students path under school bucket if schoolKey present
   const loadStudent = useCallback(async () => {
@@ -742,109 +898,141 @@ export default function ClassMarkScreen() {
     return null;
   }, []);
 
-  useEffect(() => {
-    let mounted = true;
-    (async () => {
+  const loadClassMarkData = useCallback(async ({ showLoading = true } = {}) => {
+    if (showLoading) {
       setLoading(true);
-      const ctx = await loadStudent();
-      if (!ctx) { if (mounted) setLoading(false); return; }
-      const grade = ctx.grade, section = ctx.section, sid = ctx.id;
+    }
 
-      try {
-        const schoolKey = await AsyncStorage.getItem("schoolKey");
-        const base = schoolBasePath(schoolKey);
+    const ctx = await loadStudent();
+    if (!ctx) {
+      if (isMountedRef.current) {
+        setCourses([]);
+        setMarksMap({});
+        setModeMap({});
+        setSubmittedMap({});
+        setLoading(false);
+        setRefreshing(false);
+      }
+      return;
+    }
 
-        // Fetch assessment templates for the student's grade first.
-        let gradeTemplates = null;
-        if (grade) {
-          if (base) {
-            try {
-              const tSnap = await get(ref(database, `${base}/AssesmentTemplates/${String(grade)}`));
-              if (tSnap.exists()) gradeTemplates = tSnap.val() || null;
-            } catch (e) {}
-          }
-          if (!gradeTemplates) {
-            try {
-              const tSnap2 = await get(ref(database, `AssesmentTemplates/${String(grade)}`));
-              if (tSnap2.exists()) gradeTemplates = tSnap2.val() || null;
-            } catch (e) {}
-          }
-        }
+    const grade = ctx.grade;
+    const section = ctx.section;
+    const sid = ctx.id;
 
-        // Try school-scoped Courses first, then root Courses
-        let snap = null;
+    try {
+      const schoolKey = await AsyncStorage.getItem("schoolKey");
+      const base = schoolBasePath(schoolKey);
+
+      let gradeTemplates = null;
+      if (grade) {
         if (base) {
-          try { snap = await get(ref(database, `${base}/Courses`)); } catch (e) { snap = null; }
-        }
-        if (!snap || !snap.exists()) {
-          try { snap = await get(ref(database, "Courses")); } catch (e) { snap = null; }
-        }
-
-        const list = [];
-        if (snap && snap.exists()) {
-          snap.forEach((child) => {
-            const val = child.val(), key = child.key;
-            if (String(val.grade ?? "") === String(grade) && String(val.section ?? "") === String(section)) {
-              list.push({ key, data: val });
-            }
-          });
-        }
-
-        list.sort((a, b) => (a.data.name || "").localeCompare(b.data.name || ""));
-        if (!mounted) return;
-        setCourses(list);
-
-        // ClassMarks: try school-scoped path then fallback to root path
-        const marks = {};
-        const modes = {};
-        const submitted = {};
-        await Promise.all(list.map(async (c) => {
           try {
-            let cm = null;
-            const sidStored = await AsyncStorage.getItem("studentId");
-            const sNodeStored = await AsyncStorage.getItem("studentNodeKey");
-            const uidStored = await AsyncStorage.getItem("userId");
-            const candidateStudentKeys = Array.from(new Set([sid, sidStored, sNodeStored, uidStored].filter(Boolean)));
+            const tSnap = await get(ref(database, `${base}/AssesmentTemplates/${String(grade)}`));
+            if (tSnap.exists()) gradeTemplates = tSnap.val() || null;
+          } catch (e) {}
+        }
+        if (!gradeTemplates) {
+          try {
+            const tSnap2 = await get(ref(database, `AssesmentTemplates/${String(grade)}`));
+            if (tSnap2.exists()) gradeTemplates = tSnap2.val() || null;
+          } catch (e) {}
+        }
+      }
 
-            for (const candidate of candidateStudentKeys) {
-              if (cm && cm.exists()) break;
-              if (base) {
-                try {
-                  const s = await get(ref(database, `${base}/ClassMarks/${c.key}/${candidate}`));
-                  if (s.exists()) { cm = s; break; }
-                } catch (e) {}
-              }
+      let snap = null;
+      if (base) {
+        try { snap = await get(ref(database, `${base}/Courses`)); } catch (e) { snap = null; }
+      }
+      if (!snap || !snap.exists()) {
+        try { snap = await get(ref(database, "Courses")); } catch (e) { snap = null; }
+      }
+
+      const list = [];
+      if (snap && snap.exists()) {
+        snap.forEach((child) => {
+          const val = child.val();
+          const key = child.key;
+          if (String(val.grade ?? "") === String(grade) && String(val.section ?? "") === String(section)) {
+            list.push({ key, data: val });
+          }
+        });
+      }
+
+      list.sort((a, b) => (a.data.name || "").localeCompare(b.data.name || ""));
+      if (!isMountedRef.current) return;
+      setCourses(list);
+
+      const marks = {};
+      const modes = {};
+      const submitted = {};
+      await Promise.all(list.map(async (c) => {
+        try {
+          let cm = null;
+          const sidStored = await AsyncStorage.getItem("studentId");
+          const sNodeStored = await AsyncStorage.getItem("studentNodeKey");
+          const uidStored = await AsyncStorage.getItem("userId");
+          const candidateStudentKeys = Array.from(new Set([sid, sidStored, sNodeStored, uidStored].filter(Boolean)));
+
+          for (const candidate of candidateStudentKeys) {
+            if (cm && cm.exists()) break;
+            if (base) {
               try {
-                const s2 = await get(ref(database, `ClassMarks/${c.key}/${candidate}`));
-                if (s2.exists()) { cm = s2; break; }
+                const s = await get(ref(database, `${base}/ClassMarks/${c.key}/${candidate}`));
+                if (s.exists()) { cm = s; break; }
               } catch (e) {}
             }
+            try {
+              const s2 = await get(ref(database, `ClassMarks/${c.key}/${candidate}`));
+              if (s2.exists()) { cm = s2; break; }
+            } catch (e) {}
+          }
 
-            const subjectRaw = c?.data?.subject || c?.data?.name || "";
-            const subjectKey = normalizeSubjectKey(subjectRaw);
-            const templateSubject = gradeTemplates
-              ? gradeTemplates[subjectRaw] || gradeTemplates[subjectRaw?.toLowerCase?.()] || gradeTemplates[subjectKey]
-              : null;
+          const subjectRaw = c?.data?.subject || c?.data?.name || "";
+          const subjectKey = normalizeSubjectKey(subjectRaw);
+          const templateSubject = gradeTemplates
+            ? gradeTemplates[subjectRaw] || gradeTemplates[subjectRaw?.toLowerCase?.()] || gradeTemplates[subjectKey]
+            : null;
 
-            const actualMarks = cm && cm.exists() ? (cm.val() || {}) : {};
-            marks[c.key] = mergeMarksWithTemplate(actualMarks, templateSubject || {});
-            modes[c.key] = detectTemplateMode(templateSubject || {}) || "semester";
-            submitted[c.key] = !!(cm && cm.exists() && hasSubmittedMarksInClassNode(actualMarks));
-          } catch (err) { console.warn("classmark fetch", err); marks[c.key] = null; }
-        }));
-        if (!mounted) return;
-        setMarksMap(marks);
-        setModeMap(modes);
-        setSubmittedMap(submitted);
-      } catch (err) {
-        console.warn(err);
-        if (mounted) { setCourses([]); setMarksMap({}); setModeMap({}); setSubmittedMap({}); }
-      } finally {
-        if (mounted) setLoading(false);
+          const actualMarks = cm && cm.exists() ? (cm.val() || {}) : {};
+          marks[c.key] = mergeMarksWithTemplate(actualMarks, templateSubject || {});
+          modes[c.key] = detectTemplateMode(templateSubject || {}) || "semester";
+          submitted[c.key] = !!(cm && cm.exists() && hasSubmittedMarksInClassNode(actualMarks));
+        } catch (err) {
+          console.warn("classmark fetch", err);
+          marks[c.key] = null;
+        }
+      }));
+
+      if (!isMountedRef.current) return;
+      setMarksMap(marks);
+      setModeMap(modes);
+      setSubmittedMap(submitted);
+    } catch (err) {
+      console.warn(err);
+      if (isMountedRef.current) {
+        setCourses([]);
+        setMarksMap({});
+        setModeMap({});
+        setSubmittedMap({});
       }
-    })();
-    return () => { mounted = false; };
+    } finally {
+      if (isMountedRef.current) {
+        setLoading(false);
+        setRefreshing(false);
+      }
+    }
   }, [loadStudent]);
+
+  useEffect(() => {
+    loadClassMarkData();
+  }, [loadClassMarkData]);
+
+  const handleRefresh = useCallback(async () => {
+    if (loading || refreshing) return;
+    setRefreshing(true);
+    await loadClassMarkData({ showLoading: false });
+  }, [loadClassMarkData, loading, refreshing]);
 
   const toggle = (k) => { LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut); setExpanded((p) => ({ ...p, [k]: !p[k] })); };
 
@@ -878,11 +1066,12 @@ export default function ClassMarkScreen() {
 
   const analyticsSummary = useMemo(() => {
     const subjectAnalytics = courses.map((course) => {
-      const metrics = getCourseAnalytics(marksMap[course.key] || {});
+      const selectedMarks = filterMarksBySemester(marksMap[course.key] || {}, analyticsTerm);
+      const metrics = getCourseAnalytics(selectedMarks);
       return {
         key: course.key,
         subjectName: course.data?.name || course.data?.subject || course.key,
-        submitted: !!submittedMap[course.key],
+        submitted: hasSubmittedMarksForSemesterFilter(marksMap[course.key] || {}, analyticsTerm),
         ...metrics,
       };
     });
@@ -911,7 +1100,35 @@ export default function ClassMarkScreen() {
       focusSubject: rankedSubjects.length > 1 ? rankedSubjects[rankedSubjects.length - 1] : rankedSubjects[0] || null,
       subjectAnalytics: subjectAnalytics.sort((a, b) => (a.subjectName || "").localeCompare(b.subjectName || "")),
     };
-  }, [courses, marksMap, submittedMap]);
+  }, [analyticsTerm, courses, marksMap]);
+
+  const analyticsChartData = useMemo(() => {
+    return analyticsSummary.subjectAnalytics
+      .filter((item) => item.percent != null)
+      .sort((a, b) => Number(b.percent || 0) - Number(a.percent || 0))
+      .slice(0, 6)
+      .map((item, index) => ({
+        key: item.key,
+        label: item.subjectName,
+        value: Math.round(Number(item.percent || 0)),
+        score: Number(item.score || 0),
+        max: Number(item.max || 0),
+        assessmentCount: Number(item.assessmentCount || 0),
+        completedCount: Number(item.completedCount || 0),
+        rank: index + 1,
+      }));
+  }, [analyticsSummary.subjectAnalytics]);
+
+  const selectedAnalyticsItem = useMemo(() => {
+    return analyticsChartData.find((item) => item.key === analyticsActiveKey) || null;
+  }, [analyticsActiveKey, analyticsChartData]);
+
+  useEffect(() => {
+    setAnalyticsActiveKey((currentKey) => {
+      if (!currentKey) return null;
+      return analyticsChartData.some((item) => item.key === currentKey) ? currentKey : null;
+    });
+  }, [analyticsChartData]);
 
   const parseAssessments = (node) => {
     if (!node) return [];
@@ -1261,21 +1478,21 @@ export default function ClassMarkScreen() {
           >
             <View style={styles.cardHeaderLeft}>
               <View style={[styles.subjectImage, styles.subjectIconContainer]}>
-              <MaterialCommunityIcons name={iconEntry.name} size={42} color={iconEntry.color} />
+              <MaterialCommunityIcons name={iconEntry.name} size={34} color={iconEntry.color} />
               </View>
 
-              <View style={{ flex: 1, marginLeft: 12 }}>
+              <View style={{ flex: 1, marginLeft: 10 }}>
                 <View style={styles.subjectTitleRow}>
                   <Text style={styles.subjectName}>{data.name || data.subject || courseKey}</Text>
                   <Text style={styles.gradeSection}>Grade {data.grade || ""}{data.section ? ` • ${data.section}` : ""}</Text>
                 </View>
 
-                <View style={{ marginTop: 10 }}>
+                <View style={{ marginTop: 8 }}>
                   <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
                     <Text style={styles.smallMuted}>Progress</Text>
                     <Text style={[styles.percentText, { color: percentColor(percent) }]}>{percent !== null ? `${percent}%` : "–"}</Text>
                   </View>
-                  <LinearProgress percent={percent || 0} style={{ marginTop: 8 }} />
+                  <LinearProgress percent={percent || 0} style={{ marginTop: 6 }} />
                 </View>
               </View>
             </View>
@@ -1325,22 +1542,42 @@ export default function ClassMarkScreen() {
 
   const AnalyticsView = () => {
     const summary = analyticsSummary;
-    const chartData = summary.subjectAnalytics
-      .filter((item) => item.percent != null)
-      .sort((a, b) => Number(b.percent || 0) - Number(a.percent || 0))
-      .slice(0, 6)
-      .map((item) => ({
-        key: item.key,
-        label: item.subjectName,
-        value: Math.round(Number(item.percent || 0)),
-      }));
+    const analyticsTermLabel =
+      ANALYTICS_TERM_OPTIONS.find((option) => option.key === analyticsTerm)?.label || "Average";
+    const activeChartItem = selectedAnalyticsItem;
+    const rankValue =
+      summary.overallPercent == null
+        ? "-"
+        : summary.overallPercent >= 85
+          ? "Top"
+          : summary.overallPercent >= 70
+            ? "High"
+            : summary.overallPercent >= 50
+              ? "Mid"
+              : "Low";
 
     return (
       <View style={styles.analyticsWrap}>
         <View style={styles.analyticsHero}>
           <View style={styles.analyticsHeroGlowPrimary} />
           <View style={styles.analyticsHeroGlowSecondary} />
-          <Text style={styles.analyticsEyebrow}>Student Performance Analytics</Text>
+          <View style={styles.analyticsTermRow}>
+            {ANALYTICS_TERM_OPTIONS.map((option) => {
+              const active = analyticsTerm === option.key;
+              return (
+                <TouchableOpacity
+                  key={option.key}
+                  activeOpacity={0.9}
+                  style={[styles.analyticsTermChip, active && styles.analyticsTermChipActive]}
+                  onPress={() => setAnalyticsTerm(option.key)}
+                >
+                  <Text style={[styles.analyticsTermChipText, active && styles.analyticsTermChipTextActive]}>
+                    {option.label}
+                  </Text>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
           <Text style={styles.analyticsHeroTitle}>Your marks overview</Text>
           <View style={styles.analyticsHeroScoreRow}>
             <View style={styles.analyticsHeroRingWrap}>
@@ -1354,20 +1591,76 @@ export default function ClassMarkScreen() {
             </View>
             <View style={styles.analyticsHeroMetaWrap}>
               <Text style={styles.analyticsHeroScore}>{summary.overallPercent != null ? `${summary.overallPercent}%` : "-"}</Text>
-              <Text style={styles.analyticsHeroScoreLabel}>Overall performance</Text>
-              <View style={styles.analyticsHeroBadge}>
-                <Text style={styles.analyticsHeroBadgeLabel}>Submitted</Text>
-                <Text style={styles.analyticsHeroBadgeValue}>{summary.submittedCount}/{summary.subjectCount}</Text>
+              <Text style={styles.analyticsHeroScoreLabel}>{analyticsTermLabel} performance</Text>
+              <View style={styles.analyticsHeroBadgesRow}>
+                <View style={[styles.analyticsHeroBadge, styles.analyticsHeroBadgeWide]}>
+                  <Text style={styles.analyticsHeroBadgeLabel}>Submitted</Text>
+                  <Text style={styles.analyticsHeroBadgeValue}>{summary.submittedCount}/{summary.subjectCount}</Text>
+                </View>
+                <View style={styles.analyticsHeroBadge}>
+                  <Text style={styles.analyticsHeroBadgeLabel}>Rank</Text>
+                  <Text style={styles.analyticsHeroBadgeValue}>{rankValue}</Text>
+                </View>
               </View>
             </View>
           </View>
         </View>
 
         <View style={styles.analyticsGraphCard}>
-          <Text style={styles.analyticsGraphTitle}>Performance Graph</Text>
-          <Text style={styles.analyticsGraphSubtitle}>Top subjects by submitted average</Text>
-          <View style={styles.analyticsGraphInner}>
-            <AnalyticsBarChart data={chartData} colors={colors} />
+          <View style={styles.analyticsGraphHeader}>
+            <View style={styles.analyticsGraphHeaderMain}>
+              <Text style={styles.analyticsGraphTitle}>
+                {analyticsChartType === "bar" ? "Compare subject performance" : "Track subject trend"}
+              </Text>
+              <Text style={styles.analyticsGraphSubtitle}>
+                {analyticsChartType === "bar"
+                  ? "Tap a bar to inspect subject performance"
+                  : "Tap a point to inspect subject performance"}
+              </Text>
+            </View>
+            <View style={styles.analyticsGraphHeaderActions}>
+              <TouchableOpacity
+                style={styles.analyticsGraphToggleBtn}
+                activeOpacity={0.88}
+                onPress={() => setAnalyticsChartType((prev) => (prev === "bar" ? "line" : "bar"))}
+              >
+                <MaterialCommunityIcons
+                  name={analyticsChartType === "bar" ? "chart-line" : "chart-bar"}
+                  size={17}
+                  color={colors.primary}
+                />
+              </TouchableOpacity>
+            </View>
+          </View>
+
+          <View style={styles.analyticsGraphShell}>
+            <View
+              style={styles.analyticsGraphInner}
+              onLayout={(event) => {
+                const width = Math.max(0, Math.floor(event?.nativeEvent?.layout?.width || 0));
+                if (width && width !== analyticsGraphWidth) {
+                  setAnalyticsGraphWidth(width);
+                }
+              }}
+            >
+              {analyticsChartType === "bar" ? (
+                <AnalyticsBarChart
+                  data={analyticsChartData}
+                  colors={colors}
+                  chartWidth={analyticsGraphWidth}
+                  selectedKey={activeChartItem?.key}
+                  onSelect={setAnalyticsActiveKey}
+                />
+              ) : (
+                <AnalyticsLineChart
+                  data={analyticsChartData}
+                  colors={colors}
+                  chartWidth={analyticsGraphWidth}
+                  selectedKey={activeChartItem?.key}
+                  onSelect={setAnalyticsActiveKey}
+                />
+              )}
+            </View>
           </View>
         </View>
 
@@ -1410,15 +1703,28 @@ export default function ClassMarkScreen() {
   // Empty state when no courses found (friendly message)
   if (!courses || courses.length === 0) {
     return (
-      <View style={styles.container}>
+      <ScrollView
+        style={styles.container}
+        contentContainerStyle={styles.emptyScrollContent}
+        refreshControl={(
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={handleRefresh}
+            tintColor={colors.primary || PRIMARY}
+            colors={[colors.primary || PRIMARY]}
+          />
+        )}
+        showsVerticalScrollIndicator={false}
+        showsHorizontalScrollIndicator={false}
+      >
         <View style={{ padding: 24, alignItems: "center", justifyContent: "center" }}>
           <Image source={require("../../assets/images/no_data_illustrator.jpg")} style={{ width: 220, height: 160, marginBottom: 18 }} resizeMode="contain" />
           <Text style={styles.emptyTitle}>No courses found</Text>
           <Text style={{ color: MUTED, marginTop: 8, textAlign: "center" }}>
-            We couldn't find any courses for your grade/section. If this looks incorrect, contact your school administrator.
+            We couldn&apos;t find any courses for your grade/section. If this looks incorrect, contact your school administrator.
           </Text>
         </View>
-      </View>
+      </ScrollView>
     );
   }
 
@@ -1426,6 +1732,14 @@ export default function ClassMarkScreen() {
     <View style={styles.container}>
       <ScrollView
         contentContainerStyle={{ paddingHorizontal: 12, paddingTop: 0, paddingBottom: scrollBottomPadding }}
+        refreshControl={(
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={handleRefresh}
+            tintColor={colors.primary || PRIMARY}
+            colors={[colors.primary || PRIMARY]}
+          />
+        )}
         showsVerticalScrollIndicator={false}
         showsHorizontalScrollIndicator={false}
       >
@@ -1467,7 +1781,12 @@ export default function ClassMarkScreen() {
                   onPress={() => setMarkFilter(opt.key)}
                   style={[styles.filterChip, active && styles.filterChipActive]}
                 >
-                  <Text style={[styles.filterChipText, active && styles.filterChipTextActive]}>{opt.label}</Text>
+                  <Text
+                    numberOfLines={1}
+                    style={[styles.filterChipText, active && styles.filterChipTextActive]}
+                  >
+                    {opt.label}
+                  </Text>
                 </TouchableOpacity>
               );
             })}
@@ -1716,6 +2035,7 @@ function CourseSheetInner({ courseKey, courseName, marks = {}, mode = "semester"
 function createStyles(colors) {
   return StyleSheet.create({
   container: { flex: 1, backgroundColor: colors.background },
+  emptyScrollContent: { flexGrow: 1, justifyContent: "center" },
   subtitle: { color: MUTED, paddingHorizontal: 12, marginTop: 8 },
   center: { flex: 1, alignItems: "center", justifyContent: "center" },
   emptyTitle: { fontWeight: "700", fontSize: 18, color: colors.text, textAlign: "center" },
@@ -1761,17 +2081,22 @@ function createStyles(colors) {
   filterRow: {
     flexDirection: "row",
     alignItems: "center",
+    justifyContent: "space-between",
     marginTop: 10,
     marginHorizontal: 12,
-    gap: 8,
+    gap: 4,
   },
   filterChip: {
-    paddingHorizontal: 12,
+    flex: 1,
+    minWidth: 0,
+    paddingHorizontal: 6,
     paddingVertical: 8,
     borderRadius: 999,
     borderWidth: 1,
     borderColor: colors.border,
     backgroundColor: colors.card,
+    alignItems: "center",
+    justifyContent: "center",
   },
   filterChipActive: {
     borderColor: colors.primary,
@@ -1779,8 +2104,10 @@ function createStyles(colors) {
   },
   filterChipText: {
     color: MUTED,
-    fontSize: 12,
+    fontSize: 10,
     fontWeight: "700",
+    textAlign: "center",
+    flexShrink: 1,
   },
   filterChipTextActive: {
     color: colors.primary,
@@ -1807,7 +2134,7 @@ function createStyles(colors) {
 
   analyticsWrap: {
     marginTop: 14,
-    marginHorizontal: 14,
+    marginHorizontal: -6,
     gap: 10,
   },
   analyticsHero: {
@@ -1856,6 +2183,32 @@ function createStyles(colors) {
     fontSize: 18,
     fontWeight: "900",
   },
+  analyticsTermRow: {
+    marginTop: 2,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  analyticsTermChip: {
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.card,
+  },
+  analyticsTermChipActive: {
+    borderColor: colors.primary,
+    backgroundColor: colors.soft,
+  },
+  analyticsTermChipText: {
+    color: colors.muted,
+    fontSize: 10,
+    fontWeight: "700",
+  },
+  analyticsTermChipTextActive: {
+    color: colors.primary,
+  },
   analyticsHeroText: {
     marginTop: 8,
     color: colors.muted,
@@ -1887,15 +2240,23 @@ function createStyles(colors) {
     fontSize: 10,
     fontWeight: "700",
   },
-  analyticsHeroBadge: {
-    minWidth: 74,
+  analyticsHeroBadgesRow: {
     marginTop: 4,
+    flexDirection: "row",
+    alignItems: "stretch",
+    gap: 8,
+  },
+  analyticsHeroBadge: {
+    flex: 1,
     paddingHorizontal: 9,
     paddingVertical: 6,
     borderRadius: 12,
     backgroundColor: colors.soft,
     borderWidth: 1,
     borderColor: colors.border,
+  },
+  analyticsHeroBadgeWide: {
+    flex: 2,
   },
   analyticsHeroBadgeLabel: {
     color: colors.muted,
@@ -1909,26 +2270,67 @@ function createStyles(colors) {
     fontWeight: "900",
   },
   analyticsGraphCard: {
+    position: "relative",
+    overflow: "hidden",
     backgroundColor: colors.card,
     borderWidth: 1,
     borderColor: colors.border,
-    borderRadius: 20,
-    paddingHorizontal: 11,
-    paddingTop: 10,
-    paddingBottom: 8,
+    borderRadius: 24,
+    paddingHorizontal: 14,
+    paddingTop: 14,
+    paddingBottom: 12,
+  },
+  analyticsGraphHeader: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
+    marginBottom: 12,
+  },
+  analyticsGraphHeaderMain: {
+    flex: 1,
+    paddingRight: 10,
+  },
+  analyticsGraphHeaderActions: {
+    alignItems: "flex-end",
   },
   analyticsGraphTitle: {
+    marginTop: 0,
     color: colors.text,
-    fontSize: 13,
+    fontSize: 17,
     fontWeight: "900",
   },
   analyticsGraphSubtitle: {
-    marginTop: 2,
+    marginTop: 4,
     color: colors.muted,
-    fontSize: 10,
+    fontSize: 12,
+    lineHeight: 18,
+  },
+  analyticsGraphShell: {
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 20,
+    backgroundColor: colors.elevatedSurface,
+    paddingHorizontal: 8,
+    paddingVertical: 12,
   },
   analyticsGraphInner: {
-    marginTop: 8,
+    width: "100%",
+    minHeight: 176,
+  },
+  analyticsGraphToggleBtn: {
+    width: 40,
+    height: 40,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.card,
+    alignItems: "center",
+    justifyContent: "center",
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.05,
+    shadowRadius: 12,
+    elevation: 2,
   },
   analyticsGrid: {
     flexDirection: "row",
@@ -2096,10 +2498,10 @@ function createStyles(colors) {
     fontWeight: "900",
   },
 
-  cardWrapper: { marginBottom: 12 },
+  cardWrapper: { marginBottom: 10 },
   cardView: {
     backgroundColor: colors.card,
-    borderRadius: 22,
+    borderRadius: 18,
     borderWidth: 1,
     borderColor: colors.border,
     overflow: "hidden",
@@ -2116,8 +2518,8 @@ function createStyles(colors) {
     elevation: 2,
   },
   cardInner: {
-    paddingHorizontal: 16,
-    paddingVertical: 15,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
@@ -2133,9 +2535,9 @@ function createStyles(colors) {
     flex: 1,
   },
   subjectImage: {
-    width: 56,
-    height: 74,
-    borderRadius: 14,
+    width: 48,
+    height: 62,
+    borderRadius: 12,
     backgroundColor: colors.surfaceMuted,
     borderWidth: 1,
     borderColor: colors.separator,
@@ -2147,14 +2549,14 @@ function createStyles(colors) {
     borderWidth: 1,
     borderColor: colors.separator,
   },
-  subjectName: { fontWeight: "900", fontSize: 17, color: colors.text },
+  subjectName: { fontWeight: "900", fontSize: 15, color: colors.text },
   subjectTitleRow: {
     flexDirection: "row",
     alignItems: "baseline",
     flexWrap: "wrap",
   },
-  gradeSection: { color: colors.muted, marginLeft: 8, fontSize: 12, fontWeight: "700" },
-  smallMuted: { color: MUTED, fontSize: 11, fontWeight: "700" },
+  gradeSection: { color: colors.muted, marginLeft: 6, fontSize: 11, fontWeight: "700" },
+  smallMuted: { color: MUTED, fontSize: 10, fontWeight: "700" },
   percentText: { fontWeight: "800" },
   cardHeaderToggle: {
     width: 34,
@@ -2258,4 +2660,151 @@ function createStyles(colors) {
   sheetBtnSecondary: { backgroundColor: colors.inputBackground },
   sheetBtnText: { fontWeight: "700", color: colors.text },
 });
+}
+
+function semesterKeyMatchesFilter(semKey = "", filter = "average") {
+  if (filter === "average") return true;
+  const compact = String(semKey || "").toLowerCase().replace(/[\s_-]+/g, "");
+
+  if (filter === "semester1") {
+    return compact === "1" || compact.includes("semester1") || compact.includes("sem1");
+  }
+  if (filter === "semester2") {
+    return compact === "2" || compact.includes("semester2") || compact.includes("sem2");
+  }
+  return false;
+}
+
+function filterMarksBySemester(marks = {}, filter = "average") {
+  if (!marks || typeof marks !== "object" || filter === "average") return marks || {};
+  const next = {};
+
+  Object.keys(marks || {}).forEach((semKey) => {
+    if (semesterKeyMatchesFilter(semKey, filter)) {
+      next[semKey] = marks[semKey];
+    }
+  });
+
+  return next;
+}
+
+function hasSubmittedMarksForSemesterFilter(marks = {}, filter = "average") {
+  return hasSubmittedMarksInClassNode(filterMarksBySemester(marks, filter));
+}
+
+function AnalyticsLineChart({ data = [], colors, chartWidth: chartWidthProp, selectedKey, onSelect }) {
+  if (!data.length) {
+    return <Text style={{ color: MUTED }}>No submitted marks yet for chart view.</Text>;
+  }
+
+  const chartWidth = Math.max(220, Number(chartWidthProp || 0) || SCREEN_W - 70);
+  const chartHeight = 164;
+  const baselineY = 124;
+  const axisLabelWidth = 26;
+  const axisGap = 8;
+  const chartPaddingRight = 8;
+  const availablePlotWidth = Math.max(40, chartWidth - axisLabelWidth - axisGap - chartPaddingRight);
+  const plotWidth = Math.max(40, availablePlotWidth * 0.9);
+  const plotStartX = axisLabelWidth + axisGap + (availablePlotWidth - plotWidth) / 2;
+  const plotEndX = plotStartX + plotWidth;
+  const subjectCount = data.length;
+  const isDense = subjectCount >= 8;
+  const isUltraDense = subjectCount >= 11;
+  const pointRadius = isUltraDense ? 2.8 : isDense ? 3.4 : 4.5;
+  const strokeWidth = isUltraDense ? 2 : 3;
+  const valueFontSize = isUltraDense ? 7 : isDense ? 8 : 9;
+  const xLabelFontSize = isUltraDense ? 7 : isDense ? 8 : 9;
+  const showValueLabels = subjectCount <= 6;
+  const labelStep = Math.max(1, Math.ceil(subjectCount / 6));
+  const maxValue = Math.max(100, ...data.map((item) => Number(item.value || 0)));
+  const stepX = data.length > 1 ? plotWidth / (data.length - 1) : plotWidth;
+  const points = data.map((item, index) => {
+    const value = Math.max(0, Number(item.value || 0));
+    const x = data.length > 1 ? plotStartX + stepX * index : plotStartX + plotWidth / 2;
+    const y = baselineY - ((baselineY - 18) * value) / maxValue;
+    return {
+      x,
+      y,
+      label: item.label,
+      value,
+      key: item.key || `${item.label}-${index}`,
+    };
+  });
+  const pathD = points.map((point, index) => `${index === 0 ? "M" : "L"}${point.x} ${point.y}`).join(" ");
+  const gridValues = [0, 25, 50, 75, 100];
+  const selectedPoint = points.find((point) => point.key === selectedKey) || null;
+
+  return (
+    <View style={{ width: "100%", alignItems: "center" }}>
+      <Svg width={chartWidth} height={chartHeight}>
+        {gridValues.map((tick) => {
+          const y = baselineY - ((baselineY - 18) * tick) / maxValue;
+          return (
+            <G key={`line-grid-${tick}`}>
+              <Line x1={plotStartX} y1={y} x2={plotEndX} y2={y} stroke="#E8EEF9" strokeWidth="1" />
+              <SvgText x={axisLabelWidth} y={Math.max(12, y - 4)} fontSize="10" fontWeight="700" fill={colors.muted} textAnchor="end">
+                {String(tick)}
+              </SvgText>
+            </G>
+          );
+        })}
+
+        <Path d={pathD} fill="none" stroke={colors.primary} strokeWidth={strokeWidth} strokeLinejoin="round" strokeLinecap="round" />
+
+        {points.map((point, index) => {
+          const isSelected = point.key === selectedPoint?.key;
+          return (
+            <G key={point.key} onPress={() => onSelect?.(point.key)}>
+              <Circle cx={point.x} cy={point.y} r={Math.max(14, pointRadius * 3.4)} fill={SVG_HITBOX_FILL} />
+              {isSelected ? (
+                <Circle cx={point.x} cy={point.y} r={pointRadius + 5} fill={colors.primary} opacity={0.14} />
+              ) : null}
+              <Circle
+                cx={point.x}
+                cy={point.y}
+                r={isSelected ? pointRadius + 1.2 : pointRadius}
+                fill={isSelected ? colors.primary : "#FFFFFF"}
+                stroke={colors.primary}
+                strokeWidth={isSelected ? "2.5" : "2"}
+              />
+              <SvgText
+                x={point.x}
+                y={Math.max(14, point.y - 8)}
+                fontSize={String(valueFontSize)}
+                fontWeight="800"
+                fill={isSelected ? colors.primary : colors.text}
+                textAnchor="middle"
+              >
+                {showValueLabels ? `${Math.round(point.value)}%` : ""}
+              </SvgText>
+              <SvgText
+                x={point.x}
+                y={144}
+                fontSize={String(xLabelFontSize)}
+                fontWeight="800"
+                fill={isSelected ? colors.text : colors.muted}
+                textAnchor="middle"
+              >
+                {index % labelStep !== 0
+                  ? ""
+                  : isUltraDense
+                    ? String(shortSubjectLabel(point.label)).slice(0, 1)
+                    : String(shortSubjectLabel(point.label))}
+              </SvgText>
+            </G>
+          );
+        })}
+
+        <AnalyticsChartTooltip
+          x={selectedPoint?.x}
+          y={selectedPoint?.y}
+          label={selectedPoint?.label}
+          value={selectedPoint?.value}
+          colors={colors}
+          plotStartX={plotStartX}
+          plotEndX={plotEndX}
+        />
+      </Svg>
+    </View>
+  );
 }

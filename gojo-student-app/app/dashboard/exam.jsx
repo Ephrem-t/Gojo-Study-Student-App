@@ -1,9 +1,8 @@
-import React, { useEffect, useMemo, useState, useCallback } from "react";
+import React, { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import {
   View,
   Text,
   StyleSheet,
-  SafeAreaView,
   TouchableOpacity,
   FlatList,
   ActivityIndicator,
@@ -11,10 +10,13 @@ import {
   RefreshControl,
   Dimensions,
   Modal,
+  Animated,
 } from "react-native";
+import { useBottomTabBarHeight } from "@react-navigation/bottom-tabs";
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { useRouter, useLocalSearchParams } from "expo-router";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import { SafeAreaView } from "react-native-safe-area-context";
 import { ref, get } from "firebase/database";
 import { database } from "../../constants/firebaseConfig";
 import { useAppTheme } from "../../hooks/use-app-theme";
@@ -31,7 +33,13 @@ const BRONZE = "#D08A3A";
 
 const CARD_W = Math.round(SCREEN_W * 0.78);
 const STORY_AVATAR_SIZE = 54;
-const SUBJECT_CARD_W = Math.round(SCREEN_W * 0.46);
+const PROMO_CARD_W = SCREEN_W - 32;
+const PROMO_PEEK_CARD_W = SCREEN_W - 56;
+const PROMO_CARD_GAP = 16;
+const STICKY_TOP_AVATAR_SIZE = 38;
+const STICKY_TOP_DEFAULT_STEP = 20;
+const STICKY_TOP_MIN_STEP = 10;
+const STICKY_TOP_MAX_WIDTH = 110;
 const EXAM_FILTERS = [
   { key: "online", label: "Online Exam" },
   { key: "gojo", label: "Practice Exams" },
@@ -79,6 +87,60 @@ function prettyLabelFromCourseId(courseId) {
     .filter(Boolean)
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
     .join(" ") || "Subject";
+}
+
+function toMsTimestamp(value) {
+  const num = Number(value || 0);
+  if (!Number.isFinite(num) || num <= 0) return 0;
+  return num < 1e12 ? num * 1000 : num;
+}
+
+function formatPromoDate(ts) {
+  if (!ts) return "Soon";
+  const date = new Date(ts);
+  if (Number.isNaN(date.getTime())) return "Soon";
+
+  return date.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+function formatCountdownParts(ms) {
+  const totalSeconds = Math.max(0, Math.ceil(ms / 1000));
+  const days = Math.floor(totalSeconds / 86400);
+  const hours = Math.floor((totalSeconds % 86400) / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  return [
+    { label: "D", value: String(days).padStart(2, "0") },
+    { label: "H", value: String(hours).padStart(2, "0") },
+    { label: "M", value: String(minutes).padStart(2, "0") },
+    { label: "S", value: String(seconds).padStart(2, "0") },
+  ];
+}
+
+function formatInlineCountdown(ms) {
+  return formatCountdownParts(ms)
+    .map((part) => `${part.value}${part.label}`)
+    .join(" ");
+}
+
+function getPromoVisual(type, colors) {
+  const t = String(type || "").toLowerCase();
+  if (t === "new_round") {
+    return { icon: "layers-outline", accent: "#7C3AED", badgeBg: colors.soft, surface: colors.elevatedSurface };
+  }
+  if (t === "new_package") {
+    return { icon: "megaphone-outline", accent: colors.primary, badgeBg: colors.infoSurface, surface: colors.elevatedSurface };
+  }
+  if (t === "live") {
+    return { icon: "flash-outline", accent: colors.warningText, badgeBg: colors.warningSurface, surface: colors.elevatedSurface };
+  }
+  return { icon: "alarm-outline", accent: colors.primary, badgeBg: colors.infoSurface, surface: colors.elevatedSurface };
 }
 
 function getSubjectVisual(subjectName = "") {
@@ -303,10 +365,12 @@ function formatGradeLabel(student) {
 
 export default function ExamScreen() {
   const router = useRouter();
+  const tabBarHeight = useBottomTabBarHeight();
   const routeParams = useLocalSearchParams();
   const { colors } = useAppTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
   const MUTED = colors.muted;
+  const scrollBottomPadding = Math.max(72, tabBarHeight + 12);
 
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -319,11 +383,21 @@ export default function ExamScreen() {
   const [profileModalVisible, setProfileModalVisible] = useState(false);
   const [profileLoading, setProfileLoading] = useState(false);
   const [selectedProfile, setSelectedProfile] = useState(null);
+  const [upcomingExamModalVisible, setUpcomingExamModalVisible] = useState(false);
+  const [selectedUpcomingExam, setSelectedUpcomingExam] = useState(null);
   const [topTiePickerVisible, setTopTiePickerVisible] = useState(false);
   const [topTieCandidates, setTopTieCandidates] = useState([]);
   const [topTieRank, setTopTieRank] = useState(null);
   const [activeFilter, setActiveFilter] = useState("online");
   const [expandedOnlineSubjectId, setExpandedOnlineSubjectId] = useState(null);
+  const [promoNowTs, setPromoNowTs] = useState(Date.now());
+  const [promoCardIndex, setPromoCardIndex] = useState(0);
+  const loadLeadersRef = useRef(null);
+  const loadPackagesRef = useRef(null);
+  const loadSubjectsFastRef = useRef(null);
+  const promoListRef = useRef(null);
+  const scrollY = useRef(new Animated.Value(0)).current;
+  const screenData = useMemo(() => [{ id: "exam-content" }], []);
 
   useEffect(() => {
     const nextFilter = String(routeParams?.activeFilter || "").toLowerCase();
@@ -331,6 +405,14 @@ export default function ExamScreen() {
       setActiveFilter(nextFilter);
     }
   }, [routeParams?.activeFilter]);
+
+  useEffect(() => {
+    if (activeFilter !== "online") return;
+
+    setPromoNowTs(Date.now());
+    const id = setInterval(() => setPromoNowTs(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [activeFilter]);
 
   const fetchAll = useCallback(async () => {
     setLoading(true);
@@ -364,9 +446,9 @@ export default function ExamScreen() {
       setStudentGrade(effectiveGrade || null);
 
       await Promise.all([
-        loadLeaders(effectiveGrade),
-        loadPackages(effectiveGrade),
-        loadSubjectsFast({ studentId: sid, schoolKey }),
+        loadLeadersRef.current?.(effectiveGrade),
+        loadPackagesRef.current?.(effectiveGrade),
+        loadSubjectsFastRef.current?.({ studentId: sid, schoolKey }),
       ]);
     } finally {
       setLoading(false);
@@ -420,7 +502,18 @@ export default function ExamScreen() {
       );
 
       const sameGrade = enriched.filter((e) => normalizeGrade(e.resolvedGrade) === targetGrade);
-      setLeaders(sameGrade.slice(0, 4));
+      const visibleRanks = [...new Set(
+        sameGrade.map((entry, index) => Number(entry?.rank || index + 1))
+      )].slice(0, 4);
+
+      if (!visibleRanks.length) {
+        setLeaders(sameGrade.slice(0, 4));
+        return;
+      }
+
+      setLeaders(
+        sameGrade.filter((entry, index) => visibleRanks.includes(Number(entry?.rank || index + 1)))
+      );
     } catch {
       setLeaderCountry("Ethiopia");
       setLeaders([]);
@@ -557,23 +650,50 @@ export default function ExamScreen() {
       });
 
       let assessmentsObj = {};
+      let scopedSubmissionIndex = {};
+      let globalSubmissionIndex = {};
+
       const assessmentsSnap = await get(
         ref(database, `Platform1/Schools/${schoolKey}/SchoolExams/Assessments`)
       );
       if (assessmentsSnap.exists()) assessmentsObj = assessmentsSnap.val() || {};
 
+      if (!Object.keys(assessmentsObj).length) {
+        const globalAssessmentsSnap = await get(ref(database, `SchoolExams/Assessments`));
+        if (globalAssessmentsSnap.exists()) assessmentsObj = globalAssessmentsSnap.val() || {};
+      }
+
+      const scopedSubmissionSnap = await get(
+        ref(database, `Platform1/Schools/${schoolKey}/SchoolExams/SubmissionIndex`)
+      );
+      if (scopedSubmissionSnap.exists()) scopedSubmissionIndex = scopedSubmissionSnap.val() || {};
+
+      const globalSubmissionSnap = await get(ref(database, `SchoolExams/SubmissionIndex`));
+      if (globalSubmissionSnap.exists()) globalSubmissionIndex = globalSubmissionSnap.val() || {};
+
       const countByCourse = {};
+      const pendingCountByCourse = {};
       Object.keys(assessmentsObj).forEach((aid) => {
         const item = assessmentsObj[aid] || {};
         const cid = item.courseId;
         if (!cid) return;
         if (item.status === "removed") return;
+
         countByCourse[cid] = (countByCourse[cid] || 0) + 1;
+
+        const scopedSubmission = scopedSubmissionIndex?.[aid]?.[studentId] || null;
+        const globalSubmission = globalSubmissionIndex?.[aid]?.[studentId] || null;
+        const submitted = !!(scopedSubmission || globalSubmission);
+
+        if (!submitted) {
+          pendingCountByCourse[cid] = (pendingCountByCourse[cid] || 0) + 1;
+        }
       });
 
       const out = baseSubjects.map((c) => ({
         ...c,
         assessmentCount: countByCourse[c.courseId] || 0,
+        pendingAssessmentCount: pendingCountByCourse[c.courseId] || 0,
       }));
 
       setSubjects(out);
@@ -581,6 +701,10 @@ export default function ExamScreen() {
       setSubjects([]);
     }
   }, []);
+
+  loadLeadersRef.current = loadLeaders;
+  loadPackagesRef.current = loadPackages;
+  loadSubjectsFastRef.current = loadSubjectsFast;
 
   const onlineExamPackages = useMemo(
     () => packages.filter((p) => p.type === "competitive"),
@@ -601,7 +725,7 @@ export default function ExamScreen() {
         }
         map[normalized].packageCount += 1;
 
-        const pushExam = ({ examName, roundId, examId, questionBankId }) => {
+        const pushExam = ({ examName, roundId, examId, questionBankId, startTs, endTs }) => {
           const e = String(examName || "").trim();
           if (!e) return;
           const existing = map[normalized].exams.find((x) => x.name === e);
@@ -609,12 +733,26 @@ export default function ExamScreen() {
             if (!existing.roundId) existing.roundId = roundId || null;
             if (!existing.examId) existing.examId = examId || null;
             if (!existing.questionBankId) existing.questionBankId = questionBankId || "";
+
+            const shouldPreferThisRound =
+              (!existing.startTs && !!startTs) ||
+              (!!startTs && !!existing.startTs && startTs < existing.startTs);
+
+            if (shouldPreferThisRound) {
+              existing.startTs = startTs || existing.startTs || 0;
+              existing.endTs = endTs || existing.endTs || 0;
+              if (roundId) existing.roundId = roundId;
+              if (examId) existing.examId = examId;
+              if (questionBankId) existing.questionBankId = questionBankId;
+            }
           } else {
             map[normalized].exams.push({
               name: e,
               roundId: roundId || null,
               examId: examId || null,
               questionBankId: questionBankId || "",
+              startTs: startTs || 0,
+              endTs: endTs || 0,
             });
           }
         };
@@ -622,23 +760,236 @@ export default function ExamScreen() {
         const rounds = row?.rounds || {};
         Object.keys(rounds).forEach((rid) => {
           const r = rounds[rid] || {};
+          const startTs = toMsTimestamp(
+            r?.startTimestamp ||
+            r?.releaseTimestamp ||
+            r?.startAt ||
+            r?.startsAt ||
+            0
+          );
+          const endTs = toMsTimestamp(r?.endTimestamp || r?.endAt || 0);
+
           pushExam({
             examName: r?.name || r?.examName || rid,
             roundId: rid,
             examId: r?.examId,
             questionBankId: r?.questionBankId,
+            startTs,
+            endTs,
           });
         });
       });
     });
 
-    return Object.values(map).sort((a, b) => a.name.localeCompare(b.name));
+    return Object.values(map)
+      .map((subject) => ({
+        ...subject,
+        exams: [...subject.exams].sort((a, b) => {
+          const aTs = Number(a?.startTs || 0);
+          const bTs = Number(b?.startTs || 0);
+
+          if (aTs && bTs && aTs !== bTs) return aTs - bTs;
+          if (aTs && !bTs) return -1;
+          if (!aTs && bTs) return 1;
+          return String(a?.name || "").localeCompare(String(b?.name || ""));
+        }),
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
   }, [onlineExamPackages]);
 
   const practiceExamPackages = useMemo(
     () => packages.filter((p) => p.type === "practice"),
     [packages]
   );
+
+  const onlineRoundTimeline = useMemo(() => {
+    const rows = [];
+
+    onlineExamPackages.forEach((pkg) => {
+      const subjectsData = pkg?.subjectsData || {};
+      Object.keys(subjectsData).forEach((subjectKey) => {
+        const subjectRow = subjectsData[subjectKey] || {};
+        const subjectName = String(subjectRow?.name || subjectRow?.title || subjectKey || "Subject").trim();
+        const rounds = subjectRow?.rounds || {};
+
+        Object.keys(rounds).forEach((roundId) => {
+          const round = rounds[roundId] || {};
+          const startTs = toMsTimestamp(
+            round?.startTimestamp ||
+            round?.releaseTimestamp ||
+            round?.startAt ||
+            round?.startsAt ||
+            0
+          );
+          if (!startTs) return;
+
+          rows.push({
+            id: `${pkg.id}-${subjectKey}-${roundId}`,
+            packageId: pkg.id,
+            packageName: pkg.name || "Competitive Package",
+            subjectName,
+            roundId,
+            roundName: String(round?.name || roundId || "Upcoming Round"),
+            examId: round?.examId || "",
+            questionBankId: round?.questionBankId || "",
+            status: String(round?.status || "").toLowerCase(),
+            startTs,
+            endTs: toMsTimestamp(round?.endTimestamp || round?.endAt || 0),
+          });
+        });
+      });
+    });
+
+    return rows.sort((a, b) => a.startTs - b.startTs);
+  }, [onlineExamPackages]);
+
+  const upcomingOnlineReleases = useMemo(
+    () => onlineRoundTimeline.filter((item) => item.startTs > promoNowTs),
+    [onlineRoundTimeline, promoNowTs]
+  );
+
+  const liveOnlineRoundsCount = useMemo(
+    () => onlineRoundTimeline.filter((item) => item.startTs <= promoNowTs && (!item.endTs || item.endTs >= promoNowTs)).length,
+    [onlineRoundTimeline, promoNowTs]
+  );
+
+  const onlinePromoCards = useMemo(() => {
+    const gradeLabel = studentGrade ? `Grade ${studentGrade}` : "your grade";
+
+    if (upcomingOnlineReleases.length > 0) {
+      const visual = getPromoVisual("countdown", colors);
+      return upcomingOnlineReleases.slice(0, 5).map((release, index) => ({
+        id: `countdown-${release.id}`,
+        icon: visual.icon,
+        accent: visual.accent,
+        badgeBg: visual.badgeBg,
+        surface: visual.surface,
+        badge: index === 0 ? "Upcoming exam" : "Also upcoming",
+        stamp: formatPromoDate(release.startTs),
+        title: release.roundName,
+        subtitle: `${release.subjectName} • ${release.packageName}`,
+        countdownParts: formatCountdownParts(release.startTs - promoNowTs),
+        body: "Countdown for the next national online exam release.",
+        footer: "",
+        route: null,
+      }));
+    }
+
+    const visual = getPromoVisual(liveOnlineRoundsCount > 0 ? "live" : "countdown", colors);
+    return [{
+      id: "competitive-release-overview",
+      icon: visual.icon,
+      accent: visual.accent,
+      badgeBg: visual.badgeBg,
+      surface: visual.surface,
+      badge: liveOnlineRoundsCount > 0 ? "Live now" : "Upcoming exam",
+      stamp: leaderCountry,
+      title: liveOnlineRoundsCount > 0
+        ? `${liveOnlineRoundsCount} round${liveOnlineRoundsCount === 1 ? "" : "s"} live now`
+        : "Countdown will appear here",
+      subtitle: liveOnlineRoundsCount > 0
+        ? `Students across ${leaderCountry} are already competing in national exams.`
+        : `The next premium online exam release for ${gradeLabel} will show a live countdown here.`,
+      countdownParts: null,
+      body: liveOnlineRoundsCount > 0
+        ? `${onlineExamSubjects.length} subjects are already open in National Competitive Exams.`
+        : `${onlineExamPackages.length} competitive package${onlineExamPackages.length === 1 ? "" : "s"} ready for the next release.`,
+      footer: liveOnlineRoundsCount > 0 ? "Open a subject below to join now" : "Waiting for the next scheduled release",
+      route: null,
+    }];
+  }, [
+    upcomingOnlineReleases,
+    liveOnlineRoundsCount,
+    onlineExamPackages,
+    onlineExamSubjects.length,
+    leaderCountry,
+    studentGrade,
+    promoNowTs,
+    colors,
+  ]);
+
+  const promoCarouselCardWidth = onlinePromoCards.length > 1 ? PROMO_PEEK_CARD_W : PROMO_CARD_W;
+
+  const handlePromoScrollEnd = useCallback((event) => {
+    const nextIndex = Math.round(
+      event.nativeEvent.contentOffset.x / (promoCarouselCardWidth + PROMO_CARD_GAP)
+    );
+    const clampedIndex = Math.max(0, Math.min(nextIndex, Math.max(onlinePromoCards.length - 1, 0)));
+    setPromoCardIndex(clampedIndex);
+  }, [onlinePromoCards.length, promoCarouselCardWidth]);
+
+  useEffect(() => {
+    if (promoCardIndex < onlinePromoCards.length) return;
+    setPromoCardIndex(0);
+  }, [promoCardIndex, onlinePromoCards.length]);
+
+  useEffect(() => {
+    if (activeFilter !== "online" || onlinePromoCards.length <= 1) return;
+    promoListRef.current?.scrollToOffset({
+      offset: promoCardIndex * (promoCarouselCardWidth + PROMO_CARD_GAP),
+      animated: true,
+    });
+  }, [activeFilter, promoCardIndex, onlinePromoCards.length, promoCarouselCardWidth]);
+
+  useEffect(() => {
+    if (activeFilter !== "online" || onlinePromoCards.length <= 1) return;
+
+    const id = setInterval(() => {
+      setPromoCardIndex((prev) => (prev + 1) % onlinePromoCards.length);
+    }, 4500);
+
+    return () => clearInterval(id);
+  }, [activeFilter, onlinePromoCards.length]);
+
+  const renderOnlinePromoCard = useCallback((card, cardWidth = null) => (
+    <View
+      style={[
+        styles.promoCard,
+        cardWidth ? { width: cardWidth } : null,
+        {
+          backgroundColor: card.surface,
+          borderColor: card.badgeBg,
+        },
+      ]}
+    >
+      <View style={[styles.promoGlowOrb, { backgroundColor: card.badgeBg }]} />
+
+      <View style={styles.promoCardTopRow}>
+        <View style={[styles.promoBadge, { backgroundColor: card.badgeBg }]}> 
+          <Ionicons name={card.icon} size={14} color={card.accent} />
+          <Text style={[styles.promoBadgeText, { color: card.accent }]}>{card.badge}</Text>
+        </View>
+        <Text style={styles.promoStampText}>{card.stamp}</Text>
+      </View>
+
+      <Text numberOfLines={1} style={styles.promoTitle}>{card.title}</Text>
+      <Text numberOfLines={1} style={styles.promoSubtitle}>{card.subtitle}</Text>
+
+      {card.countdownParts ? (
+        <View style={styles.promoCountdownRow}>
+          {card.countdownParts.map((part) => (
+            <View key={`${card.id}-${part.label}`} style={styles.promoCountdownBlock}>
+              <Text style={styles.promoCountdownValue}>{part.value}</Text>
+              <Text style={styles.promoCountdownLabel}>{part.label}</Text>
+            </View>
+          ))}
+        </View>
+      ) : null}
+
+      <Text numberOfLines={1} style={styles.promoBody}>{card.body}</Text>
+
+      {card.footer ? (
+        <View style={styles.promoFooter}>
+          <Text numberOfLines={1} style={styles.promoFooterText}>{card.footer}</Text>
+          <Ionicons
+            name={card.route ? "arrow-forward" : "sparkles-outline"}
+            size={16}
+            color={card.accent}
+          />
+        </View>
+      ) : null}
+    </View>
+  ), [styles]);
 
   const openTopProfile = useCallback(async (item) => {
     if (!item?.userId) return;
@@ -689,6 +1040,20 @@ export default function ExamScreen() {
     setProfileLoading(false);
   }, []);
 
+  const openUpcomingExamPreview = useCallback((subjectName, exam) => {
+    if (!exam) return;
+
+    setSelectedUpcomingExam({
+      subjectName: subjectName || "Subject",
+      name: exam?.name || "Upcoming Exam",
+      startTs: Number(exam?.startTs || 0),
+      endTs: Number(exam?.endTs || 0),
+      roundId: exam?.roundId || "",
+      examId: exam?.examId || "",
+    });
+    setUpcomingExamModalVisible(true);
+  }, []);
+
   const topRankGroups = useMemo(() => {
     const grouped = [];
     const seen = new Set();
@@ -716,9 +1081,157 @@ export default function ExamScreen() {
     setTopTiePickerVisible(true);
   }, [openTopProfile]);
 
+  const stickyTopProfiles = useMemo(
+    () => topRankGroups
+      .flatMap((group) => {
+        const tiedItems = Array.isArray(group?.tiedItems) ? group.tiedItems : [];
+        if (tiedItems.length) return tiedItems;
+        return group?.representative ? [group.representative] : [];
+      })
+      .slice(0, 6),
+    [topRankGroups]
+  );
+
+  const stickyAvatarStep = useMemo(() => {
+    if (stickyTopProfiles.length <= 1) return STICKY_TOP_AVATAR_SIZE;
+
+    const availableWidth = STICKY_TOP_MAX_WIDTH - STICKY_TOP_AVATAR_SIZE;
+    const compressedStep = Math.floor(availableWidth / (stickyTopProfiles.length - 1));
+
+    return Math.max(
+      STICKY_TOP_MIN_STEP,
+      Math.min(STICKY_TOP_DEFAULT_STEP, compressedStep)
+    );
+  }, [stickyTopProfiles.length]);
+
+  const stickyAvatarOverlap = STICKY_TOP_AVATAR_SIZE - stickyAvatarStep;
+
+  const stickyProfilesTargetWidth = useMemo(() => {
+    if (!stickyTopProfiles.length) return 0;
+    return Math.min(
+      STICKY_TOP_MAX_WIDTH,
+      STICKY_TOP_AVATAR_SIZE + Math.max(0, stickyTopProfiles.length - 1) * stickyAvatarStep
+    );
+  }, [stickyAvatarStep, stickyTopProfiles.length]);
+
+  const stickyProfilesProgress = scrollY.interpolate({
+    inputRange: [24, 92],
+    outputRange: [0, 1],
+    extrapolate: "clamp",
+  });
+
+  const stickyProfilesWidth = scrollY.interpolate({
+    inputRange: [24, 92],
+    outputRange: [0, stickyProfilesTargetWidth],
+    extrapolate: "clamp",
+  });
+
+  const stickyProfilesTranslateX = scrollY.interpolate({
+    inputRange: [24, 92],
+    outputRange: [-20, 0],
+    extrapolate: "clamp",
+  });
+
+  const stickyProfilesTranslateY = scrollY.interpolate({
+    inputRange: [24, 92],
+    outputRange: [7, 0],
+    extrapolate: "clamp",
+  });
+
+  const stickyProfilesScale = scrollY.interpolate({
+    inputRange: [24, 92],
+    outputRange: [0.82, 1],
+    extrapolate: "clamp",
+  });
+
+  const leftTitleOpacity = scrollY.interpolate({
+    inputRange: [0, 20, 64],
+    outputRange: [1, 0.55, 0],
+    extrapolate: "clamp",
+  });
+
+  const leftTitleTranslateY = scrollY.interpolate({
+    inputRange: [0, 64],
+    outputRange: [0, -4],
+    extrapolate: "clamp",
+  });
+
+  const centeredTitleOpacity = scrollY.interpolate({
+    inputRange: [18, 70],
+    outputRange: [0, 1],
+    extrapolate: "clamp",
+  });
+
+  const centeredTitleTranslateY = scrollY.interpolate({
+    inputRange: [18, 70],
+    outputRange: [8, 0],
+    extrapolate: "clamp",
+  });
+
+  const centeredTitleScale = scrollY.interpolate({
+    inputRange: [18, 70],
+    outputRange: [0.96, 1],
+    extrapolate: "clamp",
+  });
+
+  const headerVerticalPadding = scrollY.interpolate({
+    inputRange: [0, 88],
+    outputRange: [8, 5],
+    extrapolate: "clamp",
+  });
+
+  const topBarSurfaceOpacity = scrollY.interpolate({
+    inputRange: [0, 14, 72],
+    outputRange: [0, 0.18, 1],
+    extrapolate: "clamp",
+  });
+
+  const topBarSurfaceScale = scrollY.interpolate({
+    inputRange: [0, 72],
+    outputRange: [0.985, 1],
+    extrapolate: "clamp",
+  });
+
+  const heroProfilesTranslateY = scrollY.interpolate({
+    inputRange: [0, 48, 108],
+    outputRange: [0, -18, -42],
+    extrapolate: "clamp",
+  });
+
+  const heroProfilesTranslateX = scrollY.interpolate({
+    inputRange: [0, 108],
+    outputRange: [0, -10],
+    extrapolate: "clamp",
+  });
+
+  const heroProfilesScale = scrollY.interpolate({
+    inputRange: [0, 44, 108],
+    outputRange: [1, 0.97, 0.88],
+    extrapolate: "clamp",
+  });
+
+  const heroProfilesOpacity = scrollY.interpolate({
+    inputRange: [0, 38, 96, 118],
+    outputRange: [1, 0.88, 0.22, 0],
+    extrapolate: "clamp",
+  });
+
   const topSection = useMemo(() => (
     <View>
-      <View style={styles.storyListWrap}>
+      <Animated.View
+        style={[
+          styles.storyListMotionWrap,
+          {
+            opacity: heroProfilesOpacity,
+            transform: [
+              { translateY: heroProfilesTranslateY },
+              { translateX: heroProfilesTranslateX },
+              { scale: heroProfilesScale },
+            ],
+          },
+        ]}
+      >
+        <View style={styles.storyListWrap}>
         <FlatList
           data={topRankGroups}
           horizontal
@@ -825,7 +1338,8 @@ export default function ExamScreen() {
         >
           <Ionicons name="chevron-forward" size={22} color={PRIMARY} />
         </TouchableOpacity>
-      </View>
+        </View>
+      </Animated.View>
 
       <View style={styles.topFiltersWrap}>
         {EXAM_FILTERS.map((filter) => {
@@ -837,7 +1351,12 @@ export default function ExamScreen() {
               onPress={() => setActiveFilter(filter.key)}
               style={[styles.topFilterBtn, active && styles.topFilterBtnActive]}
             >
-              <Text style={[styles.topFilterText, active && styles.topFilterTextActive]}>{filter.label}</Text>
+              <Text
+                numberOfLines={1}
+                style={[styles.topFilterText, active && styles.topFilterTextActive]}
+              >
+                {filter.label}
+              </Text>
             </TouchableOpacity>
           );
         })}
@@ -847,8 +1366,52 @@ export default function ExamScreen() {
         <>
           <View style={styles.sectionHeader}>
             <Text style={styles.sectionTitle}>National Competitive Exams</Text>
-            <Text style={styles.sectionSubtitle}>Top national exam packages available for your grade</Text>
           </View>
+
+          {onlinePromoCards.length ? (
+            <View style={styles.onlinePromoSection}>
+              {onlinePromoCards.length > 1 ? (
+                <>
+                  <FlatList
+                    ref={promoListRef}
+                    data={onlinePromoCards}
+                    horizontal
+                    keyExtractor={(item) => item.id}
+                    showsHorizontalScrollIndicator={false}
+                    contentContainerStyle={styles.onlinePromoContent}
+                    ItemSeparatorComponent={() => <View style={{ width: PROMO_CARD_GAP }} />}
+                    renderItem={({ item }) => renderOnlinePromoCard(item, promoCarouselCardWidth)}
+                    snapToInterval={promoCarouselCardWidth + PROMO_CARD_GAP}
+                    snapToAlignment="start"
+                    decelerationRate="fast"
+                    disableIntervalMomentum
+                    onMomentumScrollEnd={handlePromoScrollEnd}
+                    getItemLayout={(_, index) => ({
+                      length: promoCarouselCardWidth + PROMO_CARD_GAP,
+                      offset: index * (promoCarouselCardWidth + PROMO_CARD_GAP),
+                      index,
+                    })}
+                  />
+
+                  <View style={styles.promoDotsRow}>
+                    {onlinePromoCards.map((card, index) => (
+                      <View
+                        key={`${card.id}-dot`}
+                        style={[
+                          styles.promoDot,
+                          index === promoCardIndex ? styles.promoDotActive : null,
+                        ]}
+                      />
+                    ))}
+                  </View>
+                </>
+              ) : (
+                <View style={styles.onlinePromoSingleWrap}>
+                  {renderOnlinePromoCard(onlinePromoCards[0])}
+                </View>
+              )}
+            </View>
+          ) : null}
 
           {onlineExamSubjects.length === 0 ? (
             <View style={styles.emptyAssessments}>
@@ -857,7 +1420,10 @@ export default function ExamScreen() {
             </View>
           ) : (
             <View style={styles.onlineListWrap}>
-              {onlineExamSubjects.map((item) => (
+              {onlineExamSubjects.map((item) => {
+                const upcomingExamCount = item.exams.filter((exam) => Number(exam?.startTs || 0) > promoNowTs).length;
+
+                return (
                 <View key={item.id} style={styles.onlineListItemWrap}>
                   <TouchableOpacity
                     style={[styles.onlineListItem, expandedOnlineSubjectId === item.id && styles.onlineListItemExpanded]}
@@ -875,58 +1441,80 @@ export default function ExamScreen() {
                         <Text numberOfLines={1} style={styles.onlineListTitle}>{item.name}</Text>
                         <View style={styles.onlineListMetaChip}>
                           <Text numberOfLines={1} style={styles.onlineListMeta}>
-                            In {item.packageCount} national exam{item.packageCount === 1 ? "" : "s"}
+                            Grade {studentGrade || "--"} • {item.exams.length} exam{item.exams.length === 1 ? "" : "s"}
                           </Text>
                         </View>
                       </View>
                     </View>
 
-                    <View style={styles.onlineListChevronWrap}>
-                      <Ionicons
-                        name={expandedOnlineSubjectId === item.id ? "chevron-up" : "chevron-forward"}
-                        size={16}
-                        color={PRIMARY}
-                      />
-                    </View>
+                    {upcomingExamCount > 0 ? (
+                      <View style={styles.onlineListCountBadge}>
+                        <Text style={styles.onlineListCountText}>{upcomingExamCount > 99 ? "99+" : upcomingExamCount}</Text>
+                      </View>
+                    ) : null}
                   </TouchableOpacity>
 
                   {expandedOnlineSubjectId === item.id ? (
                     <View style={styles.onlineExamDropWrap}>
                       {item.exams.length ? (
-                        item.exams.map((exam, idx) => (
-                          <TouchableOpacity
-                            key={`${item.id}-exam-${idx}`}
-                            style={[styles.onlineExamDropItem, (!exam?.roundId || !exam?.examId) && styles.onlineExamDropItemDisabled]}
-                            activeOpacity={0.9}
-                            onPress={() => {
-                              if (!exam?.roundId || !exam?.examId) return;
-                              router.push({
-                                pathname: "/examCenter",
-                                params: {
-                                  roundId: exam.roundId,
-                                  examId: exam.examId,
-                                  questionBankId: exam.questionBankId || "",
-                                  mode: "start",
-                                  returnTo: "exam",
-                                  returnExamFilter: "online",
-                                },
-                              });
-                            }}
-                            disabled={!exam?.roundId || !exam?.examId}
-                          >
-                            <View style={styles.onlineExamDropMain}>
-                              <View style={styles.onlineExamOrderBadge}>
-                                <Text style={styles.onlineExamOrderText}>{idx + 1}</Text>
+                        item.exams.map((exam, idx) => {
+                          const isUpcoming = Number(exam?.startTs || 0) > promoNowTs;
+                          const canOpenExam = !!exam?.roundId && !!exam?.examId && !isUpcoming;
+                          const metaText = isUpcoming
+                            ? `Opens in ${formatInlineCountdown(Number(exam.startTs || 0) - promoNowTs)}`
+                            : !exam?.roundId || !exam?.examId
+                            ? "Exam setup unavailable"
+                            : "Tap to start exam";
+
+                          return (
+                            <TouchableOpacity
+                              key={`${item.id}-exam-${idx}`}
+                              style={[
+                                styles.onlineExamDropItem,
+                                (!exam?.roundId || !exam?.examId) && !isUpcoming && styles.onlineExamDropItemDisabled,
+                                isUpcoming && styles.onlineExamDropItemUpcoming,
+                              ]}
+                              activeOpacity={0.9}
+                              onPress={() => {
+                                if (isUpcoming) {
+                                  openUpcomingExamPreview(item.name, exam);
+                                  return;
+                                }
+                                if (!canOpenExam) return;
+                                router.push({
+                                  pathname: "/examCenter",
+                                  params: {
+                                    roundId: exam.roundId,
+                                    examId: exam.examId,
+                                    questionBankId: exam.questionBankId || "",
+                                    mode: "start",
+                                    returnTo: "exam",
+                                    returnExamFilter: "online",
+                                  },
+                                });
+                              }}
+                              disabled={!canOpenExam && !isUpcoming}
+                            >
+                              <View style={styles.onlineExamDropMain}>
+                                <View style={styles.onlineExamOrderBadge}>
+                                  <Text style={styles.onlineExamOrderText}>{idx + 1}</Text>
+                                </View>
+                                <View style={styles.onlineExamDropTextWrap}>
+                                  <Text numberOfLines={1} style={styles.onlineExamDropTitle}>{exam.name}</Text>
+                                  <Text
+                                    numberOfLines={1}
+                                    style={[
+                                      styles.onlineExamDropMeta,
+                                      isUpcoming && styles.onlineExamDropMetaUpcoming,
+                                    ]}
+                                  >
+                                    {metaText}
+                                  </Text>
+                                </View>
                               </View>
-                              <View style={styles.onlineExamDropTextWrap}>
-                                <Text numberOfLines={1} style={styles.onlineExamDropTitle}>{exam.name}</Text>
-                                <Text numberOfLines={1} style={styles.onlineExamDropMeta}>
-                                  {exam?.roundId && exam?.examId ? "Tap to start exam" : "Exam setup unavailable"}
-                                </Text>
-                              </View>
-                            </View>
-                          </TouchableOpacity>
-                        ))
+                            </TouchableOpacity>
+                          );
+                        })
                       ) : (
                         <View style={styles.onlineExamDropEmptyRow}>
                           <Text style={styles.onlineExamDropEmptyText}>No exams available yet for this subject.</Text>
@@ -935,7 +1523,8 @@ export default function ExamScreen() {
                     </View>
                   ) : null}
                 </View>
-              ))}
+                );
+              })}
             </View>
           )}
         </>
@@ -1058,9 +1647,13 @@ export default function ExamScreen() {
                         </View>
                       </View>
 
-                      <View style={styles.schoolBookChevronWrap}>
-                        <Ionicons name="chevron-forward" size={18} color={MUTED} />
-                      </View>
+                      {item.pendingAssessmentCount > 0 ? (
+                        <View style={styles.schoolBookCountBadge}>
+                          <Text style={styles.schoolBookCountText}>
+                            {item.pendingAssessmentCount > 99 ? "99+" : item.pendingAssessmentCount}
+                          </Text>
+                        </View>
+                      ) : null}
                     </View>
                   </TouchableOpacity>
                 );
@@ -1069,6 +1662,65 @@ export default function ExamScreen() {
           )}
         </>
       ) : null}
+
+      <Modal
+        visible={upcomingExamModalVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setUpcomingExamModalVisible(false)}
+      >
+        <View style={styles.profileModalOverlay}>
+          <View style={styles.upcomingExamModalCard}>
+            <View style={styles.upcomingExamModalGlow} />
+
+            <View style={styles.upcomingExamModalBadge}>
+              <Ionicons name="alarm-outline" size={14} color={PRIMARY} />
+              <Text style={styles.upcomingExamModalBadgeText}>Upcoming exam</Text>
+            </View>
+
+            <Text style={styles.upcomingExamModalTitle}>
+              {selectedUpcomingExam?.name || "Upcoming Exam"}
+            </Text>
+            <Text style={styles.upcomingExamModalSubtitleText}>
+              {(selectedUpcomingExam?.subjectName || "General Subject")} • National Competitive Exam
+            </Text>
+
+            <View style={styles.upcomingExamModalInfoRow}>
+              <Ionicons name="calendar-outline" size={14} color={PRIMARY} />
+              <Text style={styles.upcomingExamModalInfoText}>
+                Opens {formatPromoDate(selectedUpcomingExam?.startTs || 0)}
+              </Text>
+            </View>
+
+            {selectedUpcomingExam?.startTs ? (
+              <View style={styles.upcomingExamModalCountdownRow}>
+                {formatCountdownParts(
+                  Math.max(0, Number(selectedUpcomingExam?.startTs || 0) - promoNowTs)
+                ).map((part) => (
+                  <View
+                    key={`${selectedUpcomingExam?.examId || selectedUpcomingExam?.roundId || part.label}-${part.label}`}
+                    style={styles.upcomingExamModalCountdownBlock}
+                  >
+                    <Text style={styles.upcomingExamModalCountdownValue}>{part.value}</Text>
+                    <Text style={styles.upcomingExamModalCountdownLabel}>{part.label}</Text>
+                  </View>
+                ))}
+              </View>
+            ) : null}
+
+            <View style={styles.upcomingExamModalNote}>
+              <Ionicons name="sparkles-outline" size={15} color={PRIMARY} />
+              <Text style={styles.upcomingExamModalNoteText}>
+                This exam will open soon. When the countdown ends, come back here and start it from the subject list.
+              </Text>
+            </View>
+
+            <TouchableOpacity style={styles.closeBtn} onPress={() => setUpcomingExamModalVisible(false)}>
+              <Text style={styles.closeBtnText}>Close</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
 
       <Modal
         visible={topTiePickerVisible}
@@ -1171,38 +1823,161 @@ export default function ExamScreen() {
   ), [
     activeFilter,
     expandedOnlineSubjectId,
-    leaders,
+    MUTED,
     onlineExamSubjects,
+    onlinePromoCards,
     practiceExamPackages,
+    promoCardIndex,
+    promoNowTs,
     profileLoading,
     profileModalVisible,
+    handlePromoScrollEnd,
+    renderOnlinePromoCard,
     router,
     selectedProfile,
     studentGrade,
+    styles,
     subjects,
     topTieCandidates,
     topTiePickerVisible,
     topTieRank,
     topRankGroups,
+    upcomingExamModalVisible,
+    selectedUpcomingExam,
+    heroProfilesOpacity,
+    heroProfilesScale,
+    heroProfilesTranslateX,
+    heroProfilesTranslateY,
     handleTopRankPress,
     openTopProfile,
+    openUpcomingExamPreview,
   ]);
 
   if (loading) {
     return (
-      <SafeAreaView style={[styles.screen, styles.center]}>
+      <SafeAreaView edges={["top", "left", "right"]} style={[styles.screen, styles.center]}>
         <ActivityIndicator color={PRIMARY} />
       </SafeAreaView>
     );
   }
 
   return (
-    <SafeAreaView style={styles.screen}>
-      <FlatList
-        data={[]}
-        renderItem={null}
-        ListHeaderComponent={topSection}
+    <SafeAreaView edges={["top", "left", "right"]} style={styles.screen}>
+      <Animated.FlatList
+        data={screenData}
+        keyExtractor={(item) => item.id}
+        renderItem={() => topSection}
+        ListHeaderComponent={
+          <Animated.View
+            style={[
+              styles.examTopBar,
+              {
+                paddingTop: headerVerticalPadding,
+                paddingBottom: headerVerticalPadding,
+              },
+            ]}
+          >
+            <Animated.View
+              pointerEvents="none"
+              style={[
+                styles.examTopBarSurface,
+                {
+                  opacity: topBarSurfaceOpacity,
+                  transform: [
+                    { scaleX: topBarSurfaceScale },
+                    { scaleY: topBarSurfaceScale },
+                  ],
+                },
+              ]}
+            />
+
+            <View style={styles.examTopBarHeaderRow}>
+              <Animated.View
+                style={[
+                  styles.examTopBarStickyProfilesWrap,
+                  {
+                    width: stickyProfilesWidth,
+                    opacity: stickyProfilesProgress,
+                    transform: [
+                      { translateX: stickyProfilesTranslateX },
+                      { translateY: stickyProfilesTranslateY },
+                      { scale: stickyProfilesScale },
+                    ],
+                  },
+                ]}
+              >
+                <TouchableOpacity
+                  activeOpacity={0.88}
+                  style={styles.examTopBarStickyProfilesButton}
+                  onPress={() => router.push("../leaderboard")}
+                >
+                  <View style={styles.examTopBarStickyProfilesRow}>
+                    <View style={styles.examTopBarStickyAvatarStack}>
+                      {stickyTopProfiles.map((person, index) => {
+                        const name = person?.profile?.name || person?.profile?.username || person?.userId || "U";
+                        const avatar = extractProfileImage(person?.profile || null);
+
+                        return (
+                          <View
+                            key={`sticky-top-${person?.userId || index}-${index}`}
+                            style={[
+                              styles.examTopBarStickyAvatarWrap,
+                              index > 0 ? { marginLeft: -stickyAvatarOverlap } : null,
+                            ]}
+                          >
+                            {avatar ? (
+                              <Image source={{ uri: avatar }} style={styles.examTopBarStickyAvatar} />
+                            ) : (
+                              <View style={styles.examTopBarStickyAvatarFallback}>
+                                <Text style={styles.examTopBarStickyAvatarLetter}>{name[0]}</Text>
+                              </View>
+                            )}
+                          </View>
+                        );
+                      })}
+                    </View>
+                  </View>
+                </TouchableOpacity>
+              </Animated.View>
+
+              <Animated.View
+                style={[
+                  styles.examTopBarTextWrap,
+                  {
+                    opacity: leftTitleOpacity,
+                    transform: [{ translateY: leftTitleTranslateY }],
+                  },
+                ]}
+              >
+                <Text style={styles.examTopBarTitle}>Exams</Text>
+              </Animated.View>
+
+              <Animated.View
+                pointerEvents="none"
+                style={[
+                  styles.examTopBarCenteredTitleWrap,
+                  {
+                    opacity: centeredTitleOpacity,
+                    transform: [
+                      { translateY: centeredTitleTranslateY },
+                      { scale: centeredTitleScale },
+                    ],
+                  },
+                ]}
+              >
+                <Text style={styles.examTopBarCenteredTitle}>Exams</Text>
+              </Animated.View>
+            </View>
+          </Animated.View>
+        }
+        stickyHeaderIndices={[0]}
+        contentContainerStyle={{ paddingBottom: scrollBottomPadding }}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={PRIMARY} />}
+        onScroll={Animated.event(
+          [{ nativeEvent: { contentOffset: { y: scrollY } } }],
+          { useNativeDriver: false }
+        )}
+        scrollEventThrottle={16}
       />
     </SafeAreaView>
   );
@@ -1222,20 +1997,137 @@ function createStyles(colors) {
   screen: { flex: 1, backgroundColor: colors.background },
   center: { alignItems: "center", justifyContent: "center" },
 
+  examTopBar: {
+    position: "relative",
+    paddingHorizontal: 16,
+    paddingTop: 8,
+    paddingBottom: 8,
+    backgroundColor: colors.background,
+  },
+  examTopBarSurface: {
+    position: "absolute",
+    left: 8,
+    right: 8,
+    top: 2,
+    bottom: 2,
+    borderRadius: 18,
+    backgroundColor: colors.card,
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.08,
+    shadowRadius: 14,
+    elevation: 3,
+  },
+  examTopBarHeaderRow: {
+    position: "relative",
+    justifyContent: "center",
+    minHeight: 42,
+    zIndex: 1,
+  },
+  examTopBarTextWrap: {
+    width: "100%",
+    minHeight: 42,
+    justifyContent: "center",
+    paddingRight: 18,
+  },
+  examTopBarTitle: {
+    color: colors.text,
+    fontSize: 22,
+    fontWeight: "500",
+  },
+  examTopBarCenteredTitleWrap: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    top: 0,
+    bottom: 0,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  examTopBarCenteredTitle: {
+    color: colors.text,
+    fontSize: 22,
+    fontWeight: "500",
+  },
+  examTopBarStickyProfilesWrap: {
+    position: "absolute",
+    left: 0,
+    top: 0,
+    bottom: 0,
+    overflow: "hidden",
+    justifyContent: "center",
+    zIndex: 1,
+  },
+  examTopBarStickyProfilesButton: {
+    alignSelf: "flex-start",
+  },
+  examTopBarStickyProfilesRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingRight: 6,
+    paddingVertical: 2,
+  },
+  examTopBarStickyAvatarStack: {
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  examTopBarStickyAvatarWrap: {
+    width: STICKY_TOP_AVATAR_SIZE,
+    height: STICKY_TOP_AVATAR_SIZE,
+    borderRadius: STICKY_TOP_AVATAR_SIZE / 2,
+    borderWidth: 2,
+    borderColor: colors.background,
+    overflow: "hidden",
+    backgroundColor: colors.card,
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.08,
+    shadowRadius: 8,
+    elevation: 2,
+  },
+  examTopBarStickyAvatar: {
+    width: "100%",
+    height: "100%",
+    borderRadius: STICKY_TOP_AVATAR_SIZE / 2,
+  },
+  examTopBarStickyAvatarFallback: {
+    width: "100%",
+    height: "100%",
+    borderRadius: STICKY_TOP_AVATAR_SIZE / 2,
+    backgroundColor: PRIMARY,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  examTopBarStickyAvatarLetter: {
+    color: "#fff",
+    fontSize: 12,
+    fontWeight: "900",
+  },
+
+  storyListMotionWrap: {
+    zIndex: 2,
+  },
+
   topFiltersWrap: {
     flexDirection: "row",
-    paddingHorizontal: 16,
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginHorizontal: 16,
     paddingTop: 6,
     paddingBottom: 6,
-    gap: 8,
+    gap: 4,
   },
   topFilterBtn: {
-    paddingHorizontal: 12,
+    flex: 1,
+    minWidth: 0,
+    paddingHorizontal: 6,
     paddingVertical: 8,
     borderRadius: 999,
     borderWidth: 1,
     borderColor: colors.border,
     backgroundColor: colors.card,
+    alignItems: "center",
+    justifyContent: "center",
   },
   topFilterBtnActive: {
     backgroundColor: colors.soft,
@@ -1243,8 +2135,10 @@ function createStyles(colors) {
   },
   topFilterText: {
     color: colors.muted,
-    fontSize: 12,
+    fontSize: 10,
     fontWeight: "700",
+    textAlign: "center",
+    flexShrink: 1,
   },
   topFilterTextActive: {
     color: PRIMARY,
@@ -1611,6 +2505,158 @@ function createStyles(colors) {
     paddingHorizontal: 16,
     paddingBottom: 14,
   },
+  onlinePromoSection: {
+    marginTop: 4,
+    marginBottom: 14,
+  },
+  onlinePromoContent: {
+    paddingHorizontal: 16,
+    paddingRight: 16,
+  },
+  onlinePromoSingleWrap: {
+    paddingHorizontal: 16,
+  },
+  promoDotsRow: {
+    flexDirection: "row",
+    justifyContent: "center",
+    alignItems: "center",
+    gap: 6,
+    marginTop: 10,
+  },
+  promoDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 999,
+    backgroundColor: colors.border,
+  },
+  promoDotActive: {
+    width: 22,
+    backgroundColor: colors.primary,
+  },
+  promoCard: {
+    minHeight: 184,
+    borderRadius: 22,
+    paddingHorizontal: 18,
+    paddingVertical: 12,
+    borderWidth: 1,
+    overflow: "hidden",
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.07,
+    shadowRadius: 16,
+    elevation: 4,
+  },
+  promoAccentBar: {
+    position: "absolute",
+    left: 0,
+    top: 12,
+    bottom: 12,
+    width: 4,
+    borderRadius: 999,
+  },
+  promoGlowOrb: {
+    position: "absolute",
+    right: -28,
+    top: -28,
+    width: 116,
+    height: 116,
+    borderRadius: 58,
+    opacity: 0.85,
+  },
+  promoCardTopRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 7,
+  },
+  promoBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+    borderRadius: 999,
+    gap: 5,
+  },
+  promoBadgeText: {
+    fontSize: 10,
+    fontWeight: "800",
+  },
+  promoStampText: {
+    fontSize: 10,
+    fontWeight: "700",
+    color: colors.muted,
+    marginLeft: 10,
+    flexShrink: 1,
+    textAlign: "right",
+  },
+  promoTitle: {
+    color: colors.text,
+    fontSize: 18,
+    lineHeight: 22,
+    fontWeight: "900",
+    paddingRight: 24,
+  },
+  promoSubtitle: {
+    marginTop: 3,
+    color: colors.text,
+    fontSize: 10,
+    lineHeight: 13,
+    fontWeight: "700",
+    paddingRight: 24,
+  },
+  promoCountdownRow: {
+    marginTop: 8,
+    flexDirection: "row",
+    gap: 6,
+  },
+  promoCountdownBlock: {
+    flex: 1,
+    borderRadius: 14,
+    paddingVertical: 8,
+    backgroundColor: colors.card,
+    borderWidth: 1,
+    borderColor: colors.border,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  promoCountdownValue: {
+    color: colors.text,
+    fontSize: 18,
+    fontWeight: "900",
+  },
+  promoCountdownLabel: {
+    marginTop: 2,
+    color: colors.muted,
+    fontSize: 8,
+    fontWeight: "800",
+    letterSpacing: 0.5,
+  },
+  promoBody: {
+    marginTop: 5,
+    color: colors.muted,
+    fontSize: 9,
+    lineHeight: 12,
+    fontWeight: "600",
+  },
+  promoFooter: {
+    marginTop: 6,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderRadius: 14,
+    backgroundColor: colors.card,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  promoFooterText: {
+    flex: 1,
+    color: colors.text,
+    fontSize: 10,
+    fontWeight: "800",
+  },
   onlineListItemWrap: {
     marginBottom: 16,
     backgroundColor: colors.card,
@@ -1721,6 +2767,21 @@ function createStyles(colors) {
     justifyContent: "center",
     marginLeft: 10,
   },
+  onlineListCountBadge: {
+    minWidth: 28,
+    height: 28,
+    paddingHorizontal: 8,
+    borderRadius: 14,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#EF4444",
+    marginLeft: 10,
+  },
+  onlineListCountText: {
+    color: "#fff",
+    fontSize: 11,
+    fontWeight: "900",
+  },
   onlineExamDropWrap: {
     paddingHorizontal: 14,
     paddingTop: 12,
@@ -1746,6 +2807,10 @@ function createStyles(colors) {
   },
   onlineExamDropItemDisabled: {
     opacity: 0.55,
+  },
+  onlineExamDropItemUpcoming: {
+    borderColor: colors.primary,
+    backgroundColor: colors.soft,
   },
   onlineExamDropMain: {
     flex: 1,
@@ -1783,6 +2848,10 @@ function createStyles(colors) {
     color: colors.muted,
     fontSize: 11,
     fontWeight: "600",
+  },
+  onlineExamDropMetaUpcoming: {
+    color: PRIMARY,
+    fontWeight: "800",
   },
   onlineExamDropEmptyRow: {
     paddingVertical: 10,
@@ -1956,16 +3025,20 @@ function createStyles(colors) {
     fontWeight: "700",
     overflow: "hidden",
   },
-  schoolBookChevronWrap: {
-    width: 34,
-    height: 34,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: colors.border,
-    backgroundColor: colors.inputBackground,
+  schoolBookCountBadge: {
+    minWidth: 28,
+    height: 28,
+    paddingHorizontal: 8,
+    borderRadius: 14,
     alignItems: "center",
     justifyContent: "center",
+    backgroundColor: "#EF4444",
     marginLeft: 10,
+  },
+  schoolBookCountText: {
+    color: "#fff",
+    fontSize: 11,
+    fontWeight: "900",
   },
 
   profileModalOverlay: {
@@ -2065,8 +3138,121 @@ function createStyles(colors) {
     fontSize: 11,
     fontWeight: "700",
   },
+  upcomingExamModalCard: {
+    width: "100%",
+    maxWidth: 420,
+    backgroundColor: colors.card,
+    borderRadius: 24,
+    padding: 18,
+    borderWidth: 1,
+    borderColor: colors.border,
+    overflow: "hidden",
+  },
+  upcomingExamModalGlow: {
+    position: "absolute",
+    top: -28,
+    right: -26,
+    width: 120,
+    height: 120,
+    borderRadius: 60,
+    backgroundColor: "rgba(11,114,255,0.10)",
+  },
+  upcomingExamModalBadge: {
+    alignSelf: "flex-start",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+    backgroundColor: colors.soft,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  upcomingExamModalBadgeText: {
+    color: PRIMARY,
+    fontSize: 11,
+    fontWeight: "800",
+  },
+  upcomingExamModalTitle: {
+    marginTop: 14,
+    color: colors.text,
+    fontSize: 20,
+    fontWeight: "900",
+  },
+  upcomingExamModalSubtitleText: {
+    marginTop: 5,
+    color: colors.muted,
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  upcomingExamModalInfoRow: {
+    marginTop: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    alignSelf: "flex-start",
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    borderRadius: 999,
+    backgroundColor: colors.inputBackground,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  upcomingExamModalInfoText: {
+    marginLeft: 6,
+    color: PRIMARY,
+    fontSize: 11,
+    fontWeight: "800",
+  },
+  upcomingExamModalCountdownRow: {
+    marginTop: 14,
+    flexDirection: "row",
+    gap: 8,
+  },
+  upcomingExamModalCountdownBlock: {
+    flex: 1,
+    borderRadius: 14,
+    paddingVertical: 9,
+    backgroundColor: colors.inputBackground,
+    borderWidth: 1,
+    borderColor: colors.border,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  upcomingExamModalCountdownValue: {
+    color: colors.text,
+    fontSize: 18,
+    fontWeight: "900",
+  },
+  upcomingExamModalCountdownLabel: {
+    marginTop: 2,
+    color: colors.muted,
+    fontSize: 8,
+    fontWeight: "800",
+    letterSpacing: 0.5,
+  },
+  upcomingExamModalNote: {
+    marginTop: 14,
+    flexDirection: "row",
+    alignItems: "flex-start",
+    padding: 12,
+    borderRadius: 14,
+    backgroundColor: colors.inputBackground,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  upcomingExamModalNoteText: {
+    flex: 1,
+    marginLeft: 8,
+    color: colors.text,
+    fontSize: 12,
+    lineHeight: 18,
+    fontWeight: "700",
+  },
   closeBtn: {
     marginTop: 12,
+    width: "100%",
+    alignSelf: "stretch",
     height: 42,
     borderRadius: 12,
     backgroundColor: PRIMARY,

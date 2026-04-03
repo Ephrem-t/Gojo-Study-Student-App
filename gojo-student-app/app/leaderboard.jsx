@@ -9,7 +9,6 @@ import {
   ActivityIndicator,
   Image,
   RefreshControl,
-  Platform,
   StatusBar,
   Modal,
   Animated,
@@ -41,17 +40,6 @@ function normalizeGrade(g) {
   const s = String(g).trim().toLowerCase();
   const m = s.match(/(\d{1,2})/);
   return m ? String(m[1]) : s.replace(/^grade\s*/i, "");
-}
-
-function yearsFromDob(dob) {
-  if (!dob) return "";
-  const d = new Date(dob);
-  if (Number.isNaN(d.getTime())) return "";
-  const now = new Date();
-  let age = now.getFullYear() - d.getFullYear();
-  const m = now.getMonth() - d.getMonth();
-  if (m < 0 || (m === 0 && now.getDate() < d.getDate())) age--;
-  return age >= 0 ? String(age) : "";
 }
 
 async function resolveUserProfile(userId) {
@@ -181,16 +169,21 @@ function PodiumItem({ item, place, rankColor, animatedStyle, onPress, styles }) 
             { borderColor: medalColor },
           ]}
         >
-          <Ionicons name="person-outline" size={isFirst ? 28 : 24} color={medalColor} />
+          <Ionicons name="sparkles-outline" size={isFirst ? 28 : 24} color={medalColor} />
           <View style={[styles.medalBadge, { backgroundColor: medalColor }]}>
             <Text style={styles.medalText}>{place}</Text>
           </View>
         </View>
 
         <Text numberOfLines={1} style={styles.podiumNameEmpty}>
-          Open Spot
+          Rank #{place} Open
         </Text>
-        <Text style={styles.podiumPtsEmpty}>Not taken yet</Text>
+        <Text style={styles.podiumPtsEmpty}>No student yet</Text>
+
+        <View style={styles.emptyPodiumHint}>
+          <Ionicons name="flash-outline" size={12} color={medalColor} />
+          <Text style={[styles.emptyPodiumHintText, { color: medalColor }]}>Be the first here</Text>
+        </View>
 
         <View
           style={[
@@ -300,8 +293,6 @@ export default function LeaderboardScreen() {
     if (raw.includes("country")) return "country";
     return null;
   }, [params?.filter, params?.level, params?.scope]);
-
-  const safeTop = Platform.OS === "android" ? (StatusBar.currentHeight || 0) : 0;
 
   const firstAnim = useRef(new Animated.Value(0)).current;
   const secondAnim = useRef(new Animated.Value(0)).current;
@@ -433,7 +424,6 @@ export default function LeaderboardScreen() {
     byRank[3].sort((a, b) => b.totalPoints - a.totalPoints);
     return byRank;
   }, [rows]);
-  const myRow = useMemo(() => rows.find((r) => r.userId === myUserId) || null, [rows, myUserId]);
 
   const podium = useMemo(() => {
     const second = podiumGroups[2]?.[0] ? { ...podiumGroups[2][0], tiedItems: podiumGroups[2] } : null;
@@ -445,11 +435,16 @@ export default function LeaderboardScreen() {
   const hasPodium = !!((podiumGroups[1] && podiumGroups[1].length) || (podiumGroups[2] && podiumGroups[2].length) || (podiumGroups[3] && podiumGroups[3].length));
 
   useEffect(() => {
+    if (!hasPodium) {
+      firstAnim.setValue(1);
+      secondAnim.setValue(1);
+      thirdAnim.setValue(1);
+      return;
+    }
+
     firstAnim.setValue(0);
     secondAnim.setValue(0);
     thirdAnim.setValue(0);
-
-    if (!hasPodium) return;
 
     Animated.stagger(120, [
       Animated.timing(secondAnim, {
@@ -592,7 +587,7 @@ export default function LeaderboardScreen() {
 
   if (loading) {
     return (
-      <SafeAreaView style={[styles.screen, { paddingTop: safeTop }]}>
+      <SafeAreaView style={styles.screen}>
         <StatusBar barStyle={statusBarStyle} backgroundColor={colors.background} />
         <View style={styles.center}>
           <ActivityIndicator color={C.primary} />
@@ -602,7 +597,7 @@ export default function LeaderboardScreen() {
   }
 
   return (
-    <SafeAreaView style={[styles.screen, { paddingTop: safeTop }]}>
+    <SafeAreaView style={styles.screen}>
       <StatusBar barStyle={statusBarStyle} backgroundColor={colors.background} />
 
       <View style={styles.header}>
@@ -640,40 +635,32 @@ export default function LeaderboardScreen() {
         </TouchableOpacity>
       </View>
 
-      {hasPodium ? (
-        <View style={styles.podiumWrap}>
-          {podium.second ? (
-            <PodiumItem
-              item={podium.second}
-              place={2}
-              rankColor={rankColor}
-              animatedStyle={secondAnimatedStyle}
-              onPress={() => handlePodiumPress(2, podiumGroups[2])}
-              styles={styles}
-            />
-          ) : null}
-          {podium.first ? (
-            <PodiumItem
-              item={podium.first}
-              place={1}
-              rankColor={rankColor}
-              animatedStyle={firstAnimatedStyle}
-              onPress={() => handlePodiumPress(1, podiumGroups[1])}
-              styles={styles}
-            />
-          ) : null}
-          {podium.third ? (
-            <PodiumItem
-              item={podium.third}
-              place={3}
-              rankColor={rankColor}
-              animatedStyle={thirdAnimatedStyle}
-              onPress={() => handlePodiumPress(3, podiumGroups[3])}
-              styles={styles}
-            />
-          ) : null}
-        </View>
-      ) : null}
+      <View style={styles.podiumWrap}>
+        <PodiumItem
+          item={podium.second}
+          place={2}
+          rankColor={rankColor}
+          animatedStyle={secondAnimatedStyle}
+          onPress={() => handlePodiumPress(2, podiumGroups[2])}
+          styles={styles}
+        />
+        <PodiumItem
+          item={podium.first}
+          place={1}
+          rankColor={rankColor}
+          animatedStyle={firstAnimatedStyle}
+          onPress={() => handlePodiumPress(1, podiumGroups[1])}
+          styles={styles}
+        />
+        <PodiumItem
+          item={podium.third}
+          place={3}
+          rankColor={rankColor}
+          animatedStyle={thirdAnimatedStyle}
+          onPress={() => handlePodiumPress(3, podiumGroups[3])}
+          styles={styles}
+        />
+      </View>
 
       <FlatList
         data={rows}
@@ -827,8 +814,8 @@ function createStyles(colors) {
     flexDirection: "row",
     alignItems: "center",
     paddingHorizontal: 16,
-    paddingTop: 10,
-    paddingBottom: 8,
+    paddingTop: 2,
+    paddingBottom: 6,
   },
   backBtn: {
     width: 36,
@@ -847,8 +834,8 @@ function createStyles(colors) {
     marginTop: 8,
     borderRadius: 22,
     borderWidth: 1,
-    borderColor: "#DDE9FF",
-    backgroundColor: "#F8FBFF",
+    borderColor: colors.infoBorder,
+    backgroundColor: colors.elevatedSurface,
     padding: 14,
     overflow: "hidden",
   },
@@ -878,21 +865,21 @@ function createStyles(colors) {
   heroChip: {
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "#EDF4FF",
+    backgroundColor: colors.soft,
     borderWidth: 1,
-    borderColor: "#D8E7FF",
+    borderColor: colors.infoBorder,
     paddingHorizontal: 10,
     paddingVertical: 6,
     borderRadius: 999,
   },
   heroChipText: {
     marginLeft: 6,
-    color: C.primary,
+    color: colors.primary,
     fontSize: 11,
     fontWeight: "800",
   },
   heroMeta: {
-    color: C.muted,
+    color: colors.muted,
     fontSize: 12,
     fontWeight: "700",
   },
@@ -918,7 +905,7 @@ function createStyles(colors) {
   toggleOn: { backgroundColor: colors.soft, borderColor: colors.primary },
   toggleOff: { backgroundColor: colors.card, borderColor: colors.border },
   toggleDisabled: { opacity: 0.55 },
-  toggleTextOn: { color: C.primary, fontSize: 12, fontWeight: "700" },
+  toggleTextOn: { color: colors.primary, fontSize: 12, fontWeight: "700" },
   toggleTextOff: { color: colors.muted, fontSize: 12, fontWeight: "700" },
 
   searchWrap: {
@@ -926,13 +913,13 @@ function createStyles(colors) {
     flexDirection: "row",
     alignItems: "center",
     borderWidth: 1,
-    borderColor: C.border,
+    borderColor: colors.border,
     borderRadius: 12,
     paddingHorizontal: 10,
     paddingVertical: 8,
-    backgroundColor: "#fff",
+    backgroundColor: colors.card,
   },
-  searchInput: { marginLeft: 8, flex: 1, color: C.text, fontWeight: "600" },
+  searchInput: { marginLeft: 8, flex: 1, color: colors.text, fontWeight: "600" },
 
   heroStatsRow: {
     marginTop: 10,
@@ -941,21 +928,21 @@ function createStyles(colors) {
   },
   heroStatCard: {
     flex: 1,
-    backgroundColor: "#FFFFFF",
+    backgroundColor: colors.card,
     borderWidth: 1,
-    borderColor: "#E6EEFD",
+    borderColor: colors.border,
     borderRadius: 14,
     paddingVertical: 8,
     alignItems: "center",
   },
   heroStatValue: {
-    color: C.primary,
+    color: colors.primary,
     fontSize: 16,
     fontWeight: "900",
   },
   heroStatLabel: {
     marginTop: 2,
-    color: C.muted,
+    color: colors.muted,
     fontSize: 11,
     fontWeight: "700",
   },
@@ -965,10 +952,10 @@ function createStyles(colors) {
     marginTop: 10,
     marginBottom: 8,
     borderWidth: 1,
-    borderColor: C.border,
+    borderColor: colors.border,
     borderRadius: 14,
     padding: 12,
-    backgroundColor: "#F8FAFF",
+    backgroundColor: colors.elevatedSurface,
     shadowColor: "#0F172A",
     shadowOffset: { width: 0, height: 4 },
     shadowOpacity: 0.03,
@@ -977,9 +964,9 @@ function createStyles(colors) {
     alignItems: "center",
     justifyContent: "space-between",
   },
-  meText: { color: C.muted, fontWeight: "700" },
-  meRank: { color: C.primary, fontWeight: "900", fontSize: 20 },
-  mePts: { color: C.text, fontWeight: "800" },
+  meText: { color: colors.muted, fontWeight: "700" },
+  meRank: { color: colors.primary, fontWeight: "900", fontSize: 20 },
+  mePts: { color: colors.text, fontWeight: "800" },
 
   podiumWrap: {
     flexDirection: "row",
@@ -1239,25 +1226,39 @@ function createStyles(colors) {
 
 
   emptyPodiumAvatarWrap: {
-  backgroundColor: colors.inputBackground,
-  borderStyle: "dashed",
-},
-
-podiumNameEmpty: {
-  marginTop: 8,
-  fontWeight: "800",
-  color: colors.muted,
-  fontSize: 12,
-  width: 90,
-  textAlign: "center",
-},
-
-podiumPtsEmpty: {
-  marginTop: 2,
-  color: colors.muted,
-  fontSize: 11,
-  fontWeight: "700",
-},
+    backgroundColor: colors.inputBackground,
+    borderStyle: "dashed",
+  },
+  podiumNameEmpty: {
+    marginTop: 10,
+    fontWeight: "900",
+    color: colors.text,
+    fontSize: 12,
+    width: 98,
+    textAlign: "center",
+  },
+  podiumPtsEmpty: {
+    marginTop: 3,
+    color: colors.muted,
+    fontSize: 11,
+    fontWeight: "700",
+  },
+  emptyPodiumHint: {
+    marginTop: 7,
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 999,
+    backgroundColor: colors.inputBackground,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  emptyPodiumHintText: {
+    marginLeft: 4,
+    fontSize: 10,
+    fontWeight: "800",
+  },
   infoGrid: { marginTop: 16, gap: 8 },
   infoRow: {
     borderWidth: 1,
@@ -1273,6 +1274,8 @@ podiumPtsEmpty: {
 
   closeBtn: {
     marginTop: 16,
+    width: "100%",
+    alignSelf: "stretch",
     backgroundColor: C.primary,
     borderRadius: 12,
     alignItems: "center",
@@ -1280,4 +1283,4 @@ podiumPtsEmpty: {
   },
   closeBtnText: { color: "#fff", fontWeight: "900" },
 });
-}
+} 

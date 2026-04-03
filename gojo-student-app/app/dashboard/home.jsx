@@ -822,7 +822,7 @@ export default function HomeScreen() {
 
   if (!combinedPosts || combinedPosts.length === 0) {
     return (
-      <View style={{ flex: 1, backgroundColor: "#FFFFFF" }}>
+      <View style={{ flex: 1, backgroundColor: colors.feedBackground }}>
         <EmptyState />
       </View>
     );
@@ -896,17 +896,17 @@ export default function HomeScreen() {
 
 function createStyles(colors) {
   return StyleSheet.create({
-  list: { paddingVertical: 0, backgroundColor: "#FFFFFF" },
-  center: { flex: 1, alignItems: "center", justifyContent: "center", padding: 20, backgroundColor: "#FFFFFF" },
+  list: { paddingVertical: 0, backgroundColor: colors.feedBackground },
+  center: { flex: 1, alignItems: "center", justifyContent: "center", padding: 20, backgroundColor: colors.feedBackground },
   card: {
-    backgroundColor: "#FFFFFF",
+    backgroundColor: colors.card,
     marginBottom: 6,
     marginHorizontal: 0,
     overflow: "hidden",
     borderRadius: 0,
     borderTopWidth: StyleSheet.hairlineWidth,
     borderBottomWidth: StyleSheet.hairlineWidth,
-    borderColor: "#DBDBDB",
+    borderColor: colors.border,
   },
   cardHeader: {
     flexDirection: "row",
@@ -952,7 +952,7 @@ function createStyles(colors) {
 
   postImage: {
     width: "100%",
-    backgroundColor: "#DDD",
+    backgroundColor: colors.surfaceMuted,
   },
   reactionsSummary: {
     flexDirection: "row",
@@ -986,7 +986,7 @@ function createStyles(colors) {
   },
   menuOverlay: {
     flex: 1,
-    backgroundColor: "rgba(0,0,0,0.18)",
+    backgroundColor: colors.overlay,
   },
   menuBackdrop: {
     flex: 1,
@@ -1000,7 +1000,7 @@ function createStyles(colors) {
     width: 38,
     height: 4,
     borderRadius: 999,
-    backgroundColor: "rgba(255,255,255,0.7)",
+    backgroundColor: colors.tabGlassHighlight,
     marginBottom: 10,
   },
   menuSheet: {
@@ -1034,10 +1034,10 @@ function createStyles(colors) {
     marginHorizontal: 18,
   },
 
-  emptyContainer: { flex: 1, backgroundColor: "#FFFFFF", alignItems: "center", justifyContent: "center", padding: 28 },
+  emptyContainer: { flex: 1, backgroundColor: colors.feedBackground, alignItems: "center", justifyContent: "center", padding: 28 },
   emptyImage: { width: 220, height: 160, marginBottom: 18 },
   emptyFallbackIcon: { width: 120, height: 120, borderRadius: 60, backgroundColor: colors.soft, alignItems: "center", justifyContent: "center", marginBottom: 12 },
-  emptyTitle: { fontSize: 20, fontWeight: "700", color: "#222", marginBottom: 6 },
+  emptyTitle: { fontSize: 20, fontWeight: "700", color: colors.text, marginBottom: 6 },
   emptySubtitle: { fontSize: 14, color: colors.muted, textAlign: "center" },
 
   viewerBg: {
@@ -1056,7 +1056,7 @@ function createStyles(colors) {
     width: 40,
     height: 40,
     borderRadius: 20,
-    backgroundColor: "rgba(255,255,255,0.18)",
+    backgroundColor: colors.tabGlassHighlight,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -1066,7 +1066,7 @@ function createStyles(colors) {
   },
   profileModalOverlay: {
     flex: 1,
-    backgroundColor: "rgba(7,17,34,0.44)",
+    backgroundColor: colors.modalBackdrop,
     alignItems: "center",
     justifyContent: "center",
     paddingHorizontal: 18,
@@ -1081,7 +1081,7 @@ function createStyles(colors) {
     paddingBottom: 14,
     overflow: "hidden",
     borderWidth: 1,
-    borderColor: "rgba(0,122,251,0.12)",
+    borderColor: colors.tabGlassActive,
     shadowColor: "#001845",
     shadowOffset: { width: 0, height: 14 },
     shadowOpacity: 0.16,
@@ -1148,7 +1148,7 @@ function createStyles(colors) {
     paddingHorizontal: 14,
     paddingVertical: 10,
     borderRadius: 14,
-    backgroundColor: "#F8FBFF",
+    backgroundColor: colors.elevatedSurface,
     borderWidth: 1,
     borderColor: colors.border,
   },
@@ -1193,7 +1193,7 @@ function createStyles(colors) {
     flex: 1,
     minHeight: 40,
     borderRadius: 12,
-    backgroundColor: "#F4F7FB",
+    backgroundColor: colors.subduedButton,
     alignItems: "center",
     justifyContent: "center",
     borderWidth: 1,

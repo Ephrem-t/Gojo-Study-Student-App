@@ -1,4 +1,4 @@
-import React, { useRef, useState } from "react";
+import React, { useMemo, useRef, useState } from "react";
 import {
   SafeAreaView,
   ScrollView,
@@ -22,15 +22,14 @@ import { useRouter } from "expo-router";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { ref, query, orderByChild, equalTo, get } from "firebase/database";
 import { database } from "../constants/firebaseConfig";
+import { useAppTheme } from "../hooks/use-app-theme";
 
 export const options = { headerShown: false };
 
-const PRIMARY = "#007AFB";
-const BACKGROUND = "#FFFFFF";
-const MUTED = "#6B78A8";
-
 export default function LoginScreen() {
   const router = useRouter();
+  const { colors, statusBarStyle } = useAppTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
   const passwordRef = useRef(null);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -209,7 +208,7 @@ export default function LoginScreen() {
 
   return (
     <SafeAreaView style={styles.safe} edges={["top", "left", "right", "bottom"]}>
-      <StatusBar style="dark" />
+      <StatusBar style={statusBarStyle} />
       <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
         <KeyboardAvoidingView
           behavior={Platform.OS === "ios" ? "padding" : "height"}
@@ -231,11 +230,11 @@ export default function LoginScreen() {
               {error ? <Text style={styles.error}>{error}</Text> : null}
 
               <View style={styles.inputRow}>
-                <Ionicons name="person-outline" size={22} color={MUTED} style={styles.inputIcon} />
+                <Ionicons name="person-outline" size={22} color={colors.muted} style={styles.inputIcon} />
                 <TextInput
                   style={styles.input}
                   placeholder="Username"
-                  placeholderTextColor="#B8C6FF"
+                  placeholderTextColor={colors.muted}
                   value={username}
                   onChangeText={setUsername}
                   autoCapitalize="none"
@@ -246,12 +245,12 @@ export default function LoginScreen() {
               </View>
 
               <View style={styles.inputRow}>
-                <Ionicons name="key-outline" size={22} color={MUTED} style={styles.inputIcon} />
+                <Ionicons name="key-outline" size={22} color={colors.muted} style={styles.inputIcon} />
                 <TextInput
                   ref={passwordRef}
                   style={[styles.input, { paddingRight: 44 }]}
                   placeholder="Password"
-                  placeholderTextColor="#B8C6FF"
+                  placeholderTextColor={colors.muted}
                   value={password}
                   onChangeText={setPassword}
                   secureTextEntry={!showPassword}
@@ -259,12 +258,12 @@ export default function LoginScreen() {
                   onSubmitEditing={handleSignIn}
                 />
                 <TouchableOpacity activeOpacity={0.7} onPress={() => setShowPassword((v) => !v)} style={styles.eyeButton}>
-                  <Ionicons name={showPassword ? "eye" : "eye-off"} size={20} color={MUTED} />
+                  <Ionicons name={showPassword ? "eye" : "eye-off"} size={20} color={colors.muted} />
                 </TouchableOpacity>
               </View>
 
               <TouchableOpacity style={[styles.button, loading && styles.buttonDisabled]} onPress={handleSignIn} disabled={loading}>
-                {loading ? <ActivityIndicator color="#fff" /> : <Text style={styles.buttonText}>Login</Text>}
+                {loading ? <ActivityIndicator color={colors.white} /> : <Text style={styles.buttonText}>Login</Text>}
               </TouchableOpacity>
 
               <TouchableOpacity style={styles.linkRow} onPress={handleNeedHelp}>
@@ -282,54 +281,56 @@ export default function LoginScreen() {
   );
 }
 
-const styles = StyleSheet.create({
-  flex: { flex: 1 },
-  safe: { flex: 1, backgroundColor: BACKGROUND },
-  scrollContent: { flexGrow: 1, justifyContent: "space-between", paddingTop: 12, paddingBottom: 20 },
-  top: { alignItems: "center", marginTop: 8 },
-  logo: { width: 200, height: 200, borderRadius: 14, marginTop: 16 },
-  title: { marginTop: -12, fontSize: 36, color: "#111", fontWeight: "800" },
-  subtitle: { marginTop: 8, fontSize: 14, color: MUTED, textAlign: "center" },
+function createStyles(colors) {
+  return StyleSheet.create({
+    flex: { flex: 1 },
+    safe: { flex: 1, backgroundColor: colors.screen },
+    scrollContent: { flexGrow: 1, justifyContent: "space-between", paddingTop: 12, paddingBottom: 20 },
+    top: { alignItems: "center", marginTop: 8 },
+    logo: { width: 200, height: 200, borderRadius: 14, marginTop: 16 },
+    title: { marginTop: -12, fontSize: 36, color: colors.text, fontWeight: "800" },
+    subtitle: { marginTop: 8, fontSize: 14, color: colors.muted, textAlign: "center" },
 
-  form: { paddingHorizontal: 28, marginTop: 8 },
-  error: { color: "#B00020", marginBottom: 8, textAlign: "center" },
+    form: { paddingHorizontal: 28, marginTop: 8 },
+    error: { color: colors.danger, marginBottom: 8, textAlign: "center" },
 
-  inputRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    backgroundColor: "#FFFFFF",
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: "#E7EDFF",
-    paddingHorizontal: 12,
-    height: 56,
-    marginTop: 12,
-  },
-  inputIcon: { marginRight: 8 },
-  input: { flex: 1, fontSize: 16, color: "#222" },
+    inputRow: {
+      flexDirection: "row",
+      alignItems: "center",
+      backgroundColor: colors.card,
+      borderRadius: 12,
+      borderWidth: 1,
+      borderColor: colors.border,
+      paddingHorizontal: 12,
+      height: 56,
+      marginTop: 12,
+    },
+    inputIcon: { marginRight: 8 },
+    input: { flex: 1, fontSize: 16, color: colors.text },
 
-  eyeButton: {
-    position: "absolute",
-    right: 18,
-    height: 56,
-    alignItems: "center",
-    justifyContent: "center",
-  },
+    eyeButton: {
+      position: "absolute",
+      right: 18,
+      height: 56,
+      alignItems: "center",
+      justifyContent: "center",
+    },
 
-  button: {
-    height: 56,
-    borderRadius: 12,
-    backgroundColor: PRIMARY,
-    alignItems: "center",
-    justifyContent: "center",
-    marginTop: 20,
-  },
-  buttonDisabled: { opacity: 0.75 },
-  buttonText: { color: "#fff", fontWeight: "800", fontSize: 18 },
+    button: {
+      height: 56,
+      borderRadius: 12,
+      backgroundColor: colors.primary,
+      alignItems: "center",
+      justifyContent: "center",
+      marginTop: 20,
+    },
+    buttonDisabled: { opacity: 0.75 },
+    buttonText: { color: colors.white, fontWeight: "800", fontSize: 18 },
 
-  linkRow: { marginTop: 12, alignItems: "center" },
-  linkText: { color: PRIMARY, fontWeight: "600" },
+    linkRow: { marginTop: 12, alignItems: "center" },
+    linkText: { color: colors.primary, fontWeight: "600" },
 
-  footer: { alignItems: "center", marginTop: 28, paddingBottom: 8 },
-  copyright: { color: "#9AA0A6", fontSize: 12 },
-});
+    footer: { alignItems: "center", marginTop: 28, paddingBottom: 8 },
+    copyright: { color: colors.muted, fontSize: 12 },
+  });
+}

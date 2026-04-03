@@ -19,15 +19,6 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import * as EthiopianDate from "ethiopian-date";
 import { useAppTheme } from "../hooks/use-app-theme";
 
-const PRIMARY = "#2563EB";
-const PRIMARY_DARK = "#1D4ED8";
-const PRIMARY_SOFT = "#EFF6FF";
-const BG = "#FFFFFF";
-const CARD = "#FFFFFF";
-const TEXT = "#0F172A";
-const MUTED = "#64748B";
-const BORDER = "#E2E8F0";
-
 const CAT_COLORS = {
   academic: "#16A34A",
   class: "#DC2626",
@@ -936,7 +927,7 @@ export default function CalendarTab() {
   if (loading) {
     return (
       <SafeAreaView style={styles.loadingWrap} edges={["top"]}>
-        <ActivityIndicator size="large" color={PRIMARY} />
+        <ActivityIndicator size="large" color={colors.primary} />
         <Text style={styles.loadingText}>Loading calendar...</Text>
       </SafeAreaView>
     );
@@ -961,7 +952,7 @@ export default function CalendarTab() {
             <View style={styles.pickerHeader}>
               <Text style={styles.pickerTitle}>{amharic ? "ወር እና ዓመት" : "Month & Year"}</Text>
               <TouchableOpacity onPress={() => setPickerVisible(false)} activeOpacity={0.86}>
-                <Ionicons name="close" size={20} color={TEXT} />
+                <Ionicons name="close" size={20} color={colors.text} />
               </TouchableOpacity>
             </View>
 
@@ -1059,7 +1050,7 @@ export default function CalendarTab() {
           >
             <View style={styles.settingRowLeft}>
               <View style={styles.settingRowIconWrap}>
-                <Ionicons name="language-outline" size={18} color={PRIMARY} />
+                <Ionicons name="language-outline" size={18} color={colors.primary} />
               </View>
               <View style={styles.settingRowTextWrap}>
                 <Text style={styles.settingRowTitle}>{amharic ? "ቋንቋ" : "Language"}</Text>
@@ -1082,14 +1073,14 @@ export default function CalendarTab() {
           >
             <View style={styles.settingRowLeft}>
               <View style={styles.settingRowIconWrap}>
-                <Ionicons name="today-outline" size={18} color={PRIMARY} />
+                <Ionicons name="today-outline" size={18} color={colors.primary} />
               </View>
               <View style={styles.settingRowTextWrap}>
                 <Text style={styles.settingRowTitle}>{amharic ? "ወደ ዛሬ" : "Go to Today"}</Text>
                 <Text style={styles.settingRowSubtitle}>{amharic ? "የዛሬን ቀን በፍጥነት ክፈት" : "Jump back to the current date"}</Text>
               </View>
             </View>
-            <Ionicons name="chevron-forward" size={18} color="#94A3B8" />
+            <Ionicons name="chevron-forward" size={18} color={colors.muted} />
           </TouchableOpacity>
 
           <TouchableOpacity
@@ -1102,14 +1093,14 @@ export default function CalendarTab() {
           >
             <View style={styles.settingRowLeft}>
               <View style={styles.settingRowIconWrap}>
-                <Ionicons name="calendar-outline" size={18} color={PRIMARY} />
+                <Ionicons name="calendar-outline" size={18} color={colors.primary} />
               </View>
               <View style={styles.settingRowTextWrap}>
                 <Text style={styles.settingRowTitle}>{amharic ? "ወር እና ዓመት ምረጥ" : "Choose Month & Year"}</Text>
                 <Text style={styles.settingRowSubtitle}>{amharic ? "ወደ ተፈለገው ጊዜ በፍጥነት ይሂዱ" : "Open the month and year picker"}</Text>
               </View>
             </View>
-            <Ionicons name="chevron-forward" size={18} color="#94A3B8" />
+            <Ionicons name="chevron-forward" size={18} color={colors.muted} />
           </TouchableOpacity>
         </View>
       </Modal>
@@ -1123,7 +1114,7 @@ export default function CalendarTab() {
             else router.replace("/dashboard/home");
           }}
         >
-          <Ionicons name="chevron-back" size={18} color={PRIMARY} />
+          <Ionicons name="chevron-back" size={18} color={colors.primary} />
         </TouchableOpacity>
 
         <View style={styles.topBarTitleWrap}>
@@ -1136,11 +1127,11 @@ export default function CalendarTab() {
             activeOpacity={0.86}
             onPress={() => setAmharic((v) => !v)}
           >
-            <Ionicons name="sparkles-outline" size={13} color={PRIMARY} />
+            <Ionicons name="sparkles-outline" size={13} color={colors.primary} />
             <Text style={styles.heroModeText}>{labels.lang}</Text>
           </TouchableOpacity>
           <TouchableOpacity style={styles.heroSettingsBtn} activeOpacity={0.86} onPress={() => setSettingsVisible(true)}>
-            <Ionicons name="options-outline" size={14} color={PRIMARY} />
+            <Ionicons name="options-outline" size={14} color={colors.primary} />
           </TouchableOpacity>
         </View>
       </View>
@@ -1185,15 +1176,15 @@ export default function CalendarTab() {
           <RefreshControl
             refreshing={refreshing}
             onRefresh={onRefresh}
-            colors={[PRIMARY]}
-            tintColor={PRIMARY}
+            colors={[colors.primary]}
+            tintColor={colors.primary}
           />
         }
       >
         <View style={styles.cardWide}>
           <View style={styles.navRow}>
             <TouchableOpacity onPress={prevMonth} style={styles.navBtn} activeOpacity={0.86}>
-              <Ionicons name="chevron-back" size={18} color={PRIMARY} />
+              <Ionicons name="chevron-back" size={18} color={colors.primary} />
             </TouchableOpacity>
 
             <TouchableOpacity
@@ -1210,7 +1201,7 @@ export default function CalendarTab() {
             </TouchableOpacity>
 
             <TouchableOpacity onPress={nextMonth} style={styles.navBtn} activeOpacity={0.86}>
-              <Ionicons name="chevron-forward" size={18} color={PRIMARY} />
+              <Ionicons name="chevron-forward" size={18} color={colors.primary} />
             </TouchableOpacity>
           </View>
 
@@ -1406,6 +1397,9 @@ export default function CalendarTab() {
 }
 
 function createStyles(colors) {
+  const PRIMARY = colors.primary;
+  const PRIMARY_DARK = colors.primary;
+  const PRIMARY_SOFT = colors.soft;
   const BG = colors.background;
   const CARD = colors.card;
   const TEXT = colors.text;
@@ -1636,8 +1630,8 @@ function createStyles(colors) {
     paddingVertical: 9,
   },
   heroMetaChipActive: {
-    backgroundColor: "#EAF3FF",
-    borderColor: "#BFDBFE",
+    backgroundColor: PRIMARY_SOFT,
+    borderColor: colors.infoBorder,
   },
   heroMetaLabel: {
     color: MUTED,

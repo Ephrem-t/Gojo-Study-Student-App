@@ -14,6 +14,7 @@ import {
   Dimensions,
   PanResponder,
   Platform,
+  RefreshControl,
 } from "react-native";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
@@ -289,7 +290,7 @@ async function getGroupedStudentNotes(schoolCode, grade, candidateStudentIds) {
                 text: preview,
                 preview,
                 pinned: !!note?.pinned,
-                colorTag: note?.colorTag || "#F8FBFF",
+                colorTag: note?.colorTag || null,
                 updatedAt: note?.updatedAt || note?.createdAt || 0,
               });
             });
@@ -396,6 +397,7 @@ export default function ProfileScreen() {
   const sheetAnim = useRef(new Animated.Value(0)).current;
 
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [savingPhoto, setSavingPhoto] = useState(false);
 
   const [schoolKey, setSchoolKey] = useState(null);
@@ -415,6 +417,7 @@ export default function ProfileScreen() {
   const [calendarEvents, setCalendarEvents] = useState([]);
   const [scheduleMap, setScheduleMap] = useState({});
   const [scheduleVisible, setScheduleVisible] = useState(false);
+  const [expandedScheduleDays, setExpandedScheduleDays] = useState({});
   const [countryRank, setCountryRank] = useState(null);
   const [schoolRank, setSchoolRank] = useState(null);
 
@@ -502,8 +505,8 @@ export default function ProfileScreen() {
         ]);
         setNoteSections(groupedNotes);
         setExpandedNoteSubjects(
-          groupedNotes.reduce((acc, section, index) => {
-            acc[section.subjectKey] = index === 0;
+          groupedNotes.reduce((acc, section) => {
+            acc[section.subjectKey] = false;
             return acc;
           }, {})
         );
@@ -601,8 +604,8 @@ export default function ProfileScreen() {
       setNoteSections(groupedNotes);
       setExpandedNoteSubjects((prev) => {
         const next = {};
-        groupedNotes.forEach((section, index) => {
-          next[section.subjectKey] = prev[section.subjectKey] ?? index === 0;
+        groupedNotes.forEach((section) => {
+          next[section.subjectKey] = prev[section.subjectKey] ?? false;
         });
         return next;
       });
@@ -658,6 +661,15 @@ export default function ProfileScreen() {
     fetchAll();
   }, [fetchAll]);
 
+  const onRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await fetchAll();
+    } finally {
+      setRefreshing(false);
+    }
+  }, [fetchAll]);
+
   const upcoming = useMemo(() => upcomingWithinDays(calendarEvents, 30), [calendarEvents]);
   const todayDay = getTodayDayName();
   const todaySchedule = scheduleMap[todayDay] || [];
@@ -686,6 +698,14 @@ export default function ProfileScreen() {
   }, [router]);
 
   const openScheduleSheet = useCallback(() => {
+    setExpandedScheduleDays((prev) => {
+      if (Object.keys(prev).length) return prev;
+      return DAY_ORDER.reduce((acc, day) => {
+        acc[day] = day === todayDay;
+        return acc;
+      }, {});
+    });
+
     setScheduleVisible(true);
     requestAnimationFrame(() => {
       Animated.spring(sheetAnim, {
@@ -696,7 +716,7 @@ export default function ProfileScreen() {
         mass: 0.9,
       }).start();
     });
-  }, [sheetAnim]);
+  }, [sheetAnim, todayDay]);
 
   const closeScheduleSheet = useCallback(() => {
     Animated.timing(sheetAnim, {
@@ -707,6 +727,13 @@ export default function ProfileScreen() {
       if (finished) setScheduleVisible(false);
     });
   }, [sheetAnim]);
+
+  const toggleScheduleDay = useCallback((day) => {
+    setExpandedScheduleDays((prev) => ({
+      ...prev,
+      [day]: !prev[day],
+    }));
+  }, []);
 
   const pickAndSavePhoto = useCallback(async () => {
     try {
@@ -850,6 +877,14 @@ export default function ProfileScreen() {
         scrollEventThrottle={16}
         bounces
         showsVerticalScrollIndicator={false}
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={onRefresh}
+            tintColor={PRIMARY}
+            colors={[PRIMARY]}
+          />
+        }
       >
         <View style={styles.heroCard}>
           <View style={styles.heroBanner}>
@@ -967,34 +1002,30 @@ export default function ProfileScreen() {
               </View>
               <View style={{ flex: 1 }}>
                 <Text style={styles.scheduleTitle}>{todayDay} Schedule</Text>
-                <Text style={styles.scheduleSub}>
+                <Text numberOfLines={1} style={styles.scheduleSub}>
                   {todaySchedule.length
                     ? `${todaySchedule.length} period${todaySchedule.length === 1 ? "" : "s"} today`
-                    : "No scheduled periods for today"}
+                    : "No classes scheduled today"}
                 </Text>
               </View>
               <Ionicons name="chevron-forward" size={18} color={MUTED} />
             </View>
-
-            {todaySchedule.length ? (
-              <View style={styles.schedulePreviewWrap}>
-                {todaySchedule.slice(0, 3).map((item) => (
-                  <View key={item.period} style={styles.previewRow}>
-                    <Text style={styles.previewPeriod}>{item.period}</Text>
-                    <Text numberOfLines={1} style={styles.previewSubject}>
-                      {item.subject || "Free Period"}
-                    </Text>
-                  </View>
-                ))}
-              </View>
-            ) : null}
           </TouchableOpacity>
 
           <ActionRow
             icon="calendar-outline"
             title="School calendar"
             subtitle="See upcoming events in a cleaner view"
-            onPress={() => router.push("./calendar")}
+            onPress={() => router.push("/calendar")}
+            styles={styles}
+            colors={colors}
+          />
+
+          <ActionRow
+            icon="book-outline"
+            title="What you learn"
+            subtitle="Daily teacher-submitted topics"
+            onPress={() => router.push("/whatYouLearn")}
             styles={styles}
             colors={colors}
           />
@@ -1191,7 +1222,7 @@ export default function ProfileScreen() {
               </Text>
             </View>
 
-            <View style={[styles.noteReaderBodyCard, { backgroundColor: noteReader.note?.colorTag || "#F8FBFF" }]}>
+            <View style={[styles.noteReaderBodyCard, { backgroundColor: noteReader.note?.colorTag || colors.elevatedSurface }]}>
               <View style={styles.noteReaderBodyHeader}>
                 <Ionicons name="create-outline" size={15} color={PRIMARY} />
                 <Text style={styles.noteReaderBodyLabel}>Note Content</Text>
@@ -1226,7 +1257,7 @@ export default function ProfileScreen() {
             <View style={styles.sheetHandle} />
 
             <View style={styles.sheetHeader}>
-              <View>
+              <View style={styles.sheetHeaderInfo}>
                 <Text style={styles.sheetTitle}>Class Schedule</Text>
                 <Text style={styles.sheetSub}>
                   Grade {profile.grade || "--"} • Section {profile.section || "--"}
@@ -1241,35 +1272,77 @@ export default function ProfileScreen() {
               {DAY_ORDER.map((day) => {
                 const entries = scheduleMap[day] || [];
                 const isToday = day === todayDay;
+                const isExpanded = !!expandedScheduleDays[day];
 
                 return (
                   <View key={day} style={[styles.daySection, isToday && styles.daySectionToday]}>
-                    <View style={styles.daySectionHeader}>
-                      <Text style={styles.daySectionTitle}>{day}</Text>
-                      {isToday ? (
-                        <View style={styles.todayPill}>
-                          <Text style={styles.todayPillText}>Today</Text>
+                    <TouchableOpacity
+                      activeOpacity={0.9}
+                      style={[styles.daySectionHeader, isExpanded && styles.daySectionHeaderExpanded]}
+                      onPress={() => toggleScheduleDay(day)}
+                    >
+                      <View style={styles.daySectionHeaderLeft}>
+                        <View style={styles.dayHeaderIconWrap}>
+                          <Ionicons name="calendar-clear-outline" size={14} color={PRIMARY} />
                         </View>
-                      ) : null}
-                    </View>
-
-                    {entries.length ? (
-                      entries.map((item) => (
-                        <View key={`${day}-${item.period}`} style={styles.periodRow}>
-                          <View style={styles.periodBadge}>
-                            <Text style={styles.periodBadgeText}>{item.period}</Text>
+                        <Text style={styles.daySectionTitle}>{day}</Text>
+                        {isToday ? (
+                          <View style={styles.todayPill}>
+                            <Text style={styles.todayPillText}>Today</Text>
                           </View>
+                        ) : null}
+                      </View>
 
-                          <View style={{ flex: 1 }}>
-                            <Text style={styles.periodSubject}>{item.subject || "Free Period"}</Text>
-                            <Text style={styles.periodTeacher}>
-                              {item.teacherName || "Unassigned"}
-                            </Text>
-                          </View>
+                      <View style={styles.daySectionHeaderRight}>
+                        <View style={styles.dayCountPill}>
+                          <Text style={styles.dayCountPillText}>
+                            {entries.length} {entries.length === 1 ? "class" : "classes"}
+                          </Text>
                         </View>
-                      ))
+                        <View style={[styles.dayChevronWrap, isExpanded && styles.dayChevronWrapActive]}>
+                          <Ionicons
+                            name={isExpanded ? "chevron-up" : "chevron-down"}
+                            size={16}
+                            color={PRIMARY}
+                          />
+                        </View>
+                      </View>
+                    </TouchableOpacity>
+
+                    {isExpanded ? (
+                      entries.length ? (
+                        <View style={styles.daySectionBody}>
+                          {entries.map((item) => (
+                            <View key={`${day}-${item.period}`} style={styles.periodRow}>
+                              <View style={styles.periodBadge}>
+                                <Text style={styles.periodBadgeText}>{item.period}</Text>
+                              </View>
+
+                              <View style={styles.periodContent}>
+                                <Text style={styles.periodSubject}>{item.subject || "Free Period"}</Text>
+                                <View style={styles.periodTeacherRow}>
+                                  <Ionicons name="person-outline" size={12} color={MUTED} />
+                                  <Text numberOfLines={1} ellipsizeMode="tail" style={styles.periodTeacher}>
+                                    {item.teacherName || "Unassigned"}
+                                  </Text>
+                                </View>
+                              </View>
+
+                              <View style={styles.periodArrowWrap}>
+                                <Ionicons name="chevron-forward" size={14} color={PRIMARY} />
+                              </View>
+                            </View>
+                          ))}
+                        </View>
+                      ) : (
+                        <Text style={styles.dayEmptyText}>No periods scheduled.</Text>
+                      )
                     ) : (
-                      <Text style={styles.dayEmptyText}>No periods scheduled.</Text>
+                      <Text style={styles.dayCollapsedHint}>
+                        {entries.length
+                          ? `Tap to view ${entries.length} period${entries.length === 1 ? "" : "s"}`
+                          : "Tap to view this day"}
+                      </Text>
                     )}
                   </View>
                 );
@@ -1420,7 +1493,7 @@ function ActionRow({ icon, title, subtitle, onPress, styles, colors }) {
       </View>
       <View style={{ flex: 1 }}>
         <Text style={styles.actionTitle}>{title}</Text>
-        <Text style={styles.actionSub}>{subtitle}</Text>
+        <Text numberOfLines={1} style={styles.actionSub}>{subtitle}</Text>
       </View>
       <Ionicons name="chevron-forward" size={18} color={colors.muted} />
     </TouchableOpacity>
@@ -1733,7 +1806,17 @@ function createStyles(colors) {
     fontWeight: "600",
   },
 
-  actionRow: { flexDirection: "row", alignItems: "center", paddingVertical: 11 },
+  actionRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 16,
+    backgroundColor: colors.card,
+    marginBottom: 10,
+  },
   iconWrap: {
     width: 34,
     height: 34,
@@ -2230,14 +2313,23 @@ function createStyles(colors) {
   },
   sheetContainer: {
     backgroundColor: colors.card,
-    borderTopLeftRadius: 24,
-    borderTopRightRadius: 24,
+    borderTopLeftRadius: 28,
+    borderTopRightRadius: 28,
     paddingHorizontal: 16,
     paddingTop: 10,
-    maxHeight: "82%",
+    maxHeight: "84%",
+    borderTopWidth: 1,
+    borderLeftWidth: 1,
+    borderRightWidth: 1,
+    borderColor: colors.border,
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: -10 },
+    shadowOpacity: 0.07,
+    shadowRadius: 16,
+    elevation: 6,
   },
   sheetHandle: {
-    width: 42,
+    width: 46,
     height: 5,
     borderRadius: 999,
     backgroundColor: colors.border,
@@ -2247,8 +2339,12 @@ function createStyles(colors) {
   sheetHeader: {
     flexDirection: "row",
     justifyContent: "space-between",
-    alignItems: "center",
-    marginBottom: 14,
+    alignItems: "flex-start",
+    marginBottom: 10,
+  },
+  sheetHeaderInfo: {
+    flex: 1,
+    paddingRight: 12,
   },
   sheetTitle: {
     fontSize: 18,
@@ -2288,7 +2384,33 @@ function createStyles(colors) {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    marginBottom: 10,
+    borderRadius: 14,
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+  },
+  daySectionHeaderExpanded: {
+    backgroundColor: colors.inputBackground,
+  },
+  daySectionHeaderLeft: {
+    flexDirection: "row",
+    alignItems: "center",
+    flex: 1,
+  },
+  dayHeaderIconWrap: {
+    width: 28,
+    height: 28,
+    borderRadius: 9,
+    backgroundColor: colors.soft,
+    borderWidth: 1,
+    borderColor: colors.border,
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 8,
+  },
+  daySectionHeaderRight: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginLeft: 10,
   },
   daySectionTitle: {
     fontSize: 15,
@@ -2296,6 +2418,7 @@ function createStyles(colors) {
     color: TEXT,
   },
   todayPill: {
+    marginLeft: 8,
     backgroundColor: SOFT,
     borderRadius: 999,
     paddingHorizontal: 10,
@@ -2306,36 +2429,99 @@ function createStyles(colors) {
     fontSize: 11,
     fontWeight: "800",
   },
+  dayCountPill: {
+    backgroundColor: colors.soft,
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    marginRight: 8,
+  },
+  dayCountPillText: {
+    color: PRIMARY,
+    fontSize: 10,
+    fontWeight: "800",
+  },
+  dayChevronWrap: {
+    width: 28,
+    height: 28,
+    borderRadius: 9,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.card,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  dayChevronWrapActive: {
+    backgroundColor: colors.soft,
+    borderColor: colors.primary,
+  },
+  daySectionBody: {
+    marginTop: 10,
+  },
+  dayCollapsedHint: {
+    marginTop: 8,
+    color: MUTED,
+    fontSize: 12,
+    fontWeight: "600",
+  },
   periodRow: {
     flexDirection: "row",
     alignItems: "center",
-    paddingVertical: 8,
-    borderTopWidth: 1,
-    borderTopColor: colors.separator,
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+    marginTop: 8,
+    borderWidth: 1,
+    borderColor: colors.separator,
+    borderRadius: 14,
+    backgroundColor: colors.card,
   },
   periodBadge: {
-    minWidth: 64,
+    minWidth: 66,
     backgroundColor: colors.soft,
     borderRadius: 10,
     paddingHorizontal: 8,
     paddingVertical: 7,
     marginRight: 10,
     alignItems: "center",
+    borderWidth: 1,
+    borderColor: colors.border,
   },
   periodBadgeText: {
     color: PRIMARY,
     fontSize: 11,
     fontWeight: "800",
   },
+  periodContent: {
+    flex: 1,
+  },
   periodSubject: {
     fontSize: 14,
-    fontWeight: "700",
+    fontWeight: "800",
     color: TEXT,
   },
+  periodTeacherRow: {
+    marginTop: 4,
+    flexDirection: "row",
+    alignItems: "center",
+    flex: 1,
+  },
   periodTeacher: {
-    marginTop: 2,
-    fontSize: 12,
+    marginLeft: 5,
+    flex: 1,
+    fontSize: 10,
     color: MUTED,
+    fontWeight: "500",
+  },
+  periodArrowWrap: {
+    width: 26,
+    height: 26,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.inputBackground,
+    alignItems: "center",
+    justifyContent: "center",
+    marginLeft: 8,
   },
   dayEmptyText: {
     color: MUTED,
