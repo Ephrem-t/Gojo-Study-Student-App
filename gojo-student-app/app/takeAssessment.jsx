@@ -29,7 +29,6 @@ const PRIMARY = "#0B72FF";
 const MUTED = "#6B78A8";
 const TEXT = "#0B2540";
 const BORDER = "#EAF0FF";
-const BG = "#FFFFFF";
 const SUCCESS = "#12B76A";
 const WARNING = "#F59E0B";
 const DANGER = "#EF4444";
@@ -1074,9 +1073,9 @@ function createStyles(colors) {
   },
 
   infoBox: {
-    backgroundColor: "#EEF4FF",
+    backgroundColor: colors.infoSurface,
     borderWidth: 1,
-    borderColor: "#BFDBFE",
+    borderColor: colors.infoBorder,
     borderRadius: 12,
     padding: 12,
     marginBottom: 12,
@@ -1105,7 +1104,7 @@ function createStyles(colors) {
     alignItems: "center",
   },
   qNumber: {
-    backgroundColor: "#EEF4FF",
+    backgroundColor: colors.infoSurface,
     color: PRIMARY,
     fontWeight: "900",
     fontSize: 11,

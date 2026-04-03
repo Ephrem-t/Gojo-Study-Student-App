@@ -1003,7 +1003,7 @@ function createStyles(colors) {
   messageRowLeft: { justifyContent: "flex-start" },
   messageRowRight: { justifyContent: "flex-end" },
 
-  msgAvatar: { width: 36, height: 36, borderRadius: 18, marginRight: 8, backgroundColor: "#F1F3F8" },
+  msgAvatar: { width: 36, height: 36, borderRadius: 18, marginRight: 8, backgroundColor: colors.surfaceMuted },
 
   bubbleWrap: { maxWidth: "78%", position: "relative" },
   bubble: {

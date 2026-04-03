@@ -26,12 +26,11 @@ import { database, storage } from "../constants/firebaseConfig";
 import { ref, get, update, remove } from "firebase/database";
 import { ref as stRef, uploadBytes, getDownloadURL } from "firebase/storage";
 import { useAppTheme } from "../hooks/use-app-theme";
+import { resolveNoteColorTag } from "./lib/noteColors";
 
 const { width: SCREEN_WIDTH } = Dimensions.get("window");
 
 const PRIMARY = "#007AFB";
-const BG = "#FFFFFF";
-const CARD = "#FFFFFF";
 const TEXT = "#0B2540";
 const MUTED = "#6B78A8";
 const BORDER = "#E7EEFF";
@@ -1222,7 +1221,16 @@ export default function ProfileScreen() {
               </Text>
             </View>
 
-            <View style={[styles.noteReaderBodyCard, { backgroundColor: noteReader.note?.colorTag || colors.elevatedSurface }]}>
+            <View
+              style={[
+                styles.noteReaderBodyCard,
+                {
+                  backgroundColor: noteReader.note?.colorTag
+                    ? resolveNoteColorTag(noteReader.note.colorTag, colors, colors.elevatedSurface)
+                    : colors.elevatedSurface,
+                },
+              ]}
+            >
               <View style={styles.noteReaderBodyHeader}>
                 <Ionicons name="create-outline" size={15} color={PRIMARY} />
                 <Text style={styles.noteReaderBodyLabel}>Note Content</Text>
@@ -1544,7 +1552,7 @@ function createStyles(colors) {
   },
   heroBanner: {
     height: 110,
-    backgroundColor: colors.white,
+    backgroundColor: colors.background === "#fff" ? colors.white : colors.elevatedSurface,
     position: "relative",
     overflow: "hidden",
     borderTopLeftRadius: 0,
@@ -1559,7 +1567,7 @@ function createStyles(colors) {
   },
   heroBannerFallback: {
     flex: 1,
-    backgroundColor: colors.white,
+    backgroundColor: colors.background === "#fff" ? colors.white : colors.elevatedSurface,
     overflow: "hidden",
   },
   heroBannerOrbPrimary: {
@@ -1567,7 +1575,7 @@ function createStyles(colors) {
     width: 180,
     height: 180,
     borderRadius: 90,
-    backgroundColor: "rgba(0,0,0,0.04)",
+    backgroundColor: colors.background === "#fff" ? "rgba(0,0,0,0.04)" : "rgba(255,255,255,0.08)",
     top: -40,
     right: -20,
   },
@@ -1576,7 +1584,7 @@ function createStyles(colors) {
     width: 160,
     height: 160,
     borderRadius: 80,
-    backgroundColor: "rgba(0,0,0,0.02)",
+    backgroundColor: colors.background === "#fff" ? "rgba(0,0,0,0.02)" : "rgba(255,255,255,0.04)",
     bottom: -60,
     left: -20,
   },

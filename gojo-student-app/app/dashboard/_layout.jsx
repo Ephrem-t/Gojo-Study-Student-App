@@ -9,12 +9,14 @@ import { database } from "../../constants/firebaseConfig";
 import { StatusBar } from "expo-status-bar";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useAppTheme } from "../../hooks/use-app-theme";
+import { useAppLock } from "../../hooks/use-app-lock";
 import { extractProfileImage, normalizeProfileImageUri } from "../lib/profileImage";
 
 export default function DashboardLayout() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const { colors, statusBarStyle } = useAppTheme();
+  const { appLockEnabled, lockAppNow } = useAppLock();
   const styles = useMemo(() => createStyles(colors), [colors]);
   const [profileImage, setProfileImage] = useState(null);
   const [totalUnread, setTotalUnread] = useState(0);
@@ -259,22 +261,30 @@ export default function DashboardLayout() {
   );
 
   const HomeHeaderLeft = () => (
-    <TouchableOpacity style={[styles.iconButton, styles.homeHeaderMessageButton]} onPress={() => router.push("/chats")}>
-      <View style={styles.chatIconWrap}>
-        <Ionicons name="paper-plane-outline" size={19} color={colors.text} />
-        {totalUnread > 0 && (
-          <View style={styles.unreadBadge}>
-            <Text style={styles.unreadText}>
-              {totalUnread > 99 ? "99+" : totalUnread}
-            </Text>
-          </View>
-        )}
-      </View>
-    </TouchableOpacity>
+    <View style={styles.headerRightRow}>
+      {appLockEnabled ? (
+        <TouchableOpacity style={[styles.iconButton, styles.homeHeaderLockButton]} onPress={lockAppNow}>
+          <Ionicons name="lock-closed-outline" size={18} color={colors.text} />
+        </TouchableOpacity>
+      ) : null}
+
+      <TouchableOpacity style={styles.iconButton} onPress={() => router.push("/chats")}>
+        <View style={styles.chatIconWrap}>
+          <Ionicons name="paper-plane-outline" size={19} color={colors.text} />
+          {totalUnread > 0 && (
+            <View style={styles.unreadBadge}>
+              <Text style={styles.unreadText}>
+                {totalUnread > 99 ? "99+" : totalUnread}
+              </Text>
+            </View>
+          )}
+        </View>
+      </TouchableOpacity>
+    </View>
   );
 
   const HomeHeaderRight = () => (
-    <View style={styles.headerRightRow} />
+    <View style={styles.headerLeftSpacer} />
   );
 
   const ExamTabIcon = ({ color, size }) => (
@@ -571,6 +581,10 @@ function createStyles(colors) {
     marginRight: 12,
   },
 
+  headerLeftSpacer: {
+    width: 46,
+  },
+
   profileImage: {
     width: 38,
     height: 38,
@@ -604,7 +618,7 @@ function createStyles(colors) {
     justifyContent: "center",
   },
 
-  homeHeaderMessageButton: {
+  homeHeaderLockButton: {
     marginRight: 8,
   },
 

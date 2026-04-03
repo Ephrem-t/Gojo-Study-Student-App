@@ -22,6 +22,7 @@ import { ref, get, remove, update } from "firebase/database";
 import { database } from "../../constants/firebaseConfig";
 import { Ionicons } from "@expo/vector-icons";
 import * as FileSystem from "expo-file-system/legacy";
+import { resolveNoteColorTag } from "../lib/noteColors";
 import { useRouter, useFocusEffect } from "expo-router";
 import NativePdfView, { nativePdfUnavailableMessage } from "../../components/native-pdf-view";
 import { useAppTheme } from "../../hooks/use-app-theme";
@@ -1400,7 +1401,16 @@ export default function BooksScreen() {
               </Text>
             </View>
 
-            <View style={[styles.noteReaderBodyCard, { backgroundColor: noteReader.note?.colorTag || colors.inputBackground }]}>
+            <View
+              style={[
+                styles.noteReaderBodyCard,
+                {
+                  backgroundColor: noteReader.note?.colorTag
+                    ? resolveNoteColorTag(noteReader.note.colorTag, colors, colors.inputBackground)
+                    : colors.inputBackground,
+                },
+              ]}
+            >
               <View style={styles.noteReaderBodyHeader}>
                 <Ionicons name="create-outline" size={15} color={PRIMARY} />
                 <Text style={styles.noteReaderBodyLabel}>Note Content</Text>

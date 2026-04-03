@@ -17,19 +17,19 @@ import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context"
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { ref, get, set } from "firebase/database";
+import { ref, get, set, remove } from "firebase/database";
 import { database } from "../constants/firebaseConfig";
 import { useAppTheme } from "../hooks/use-app-theme";
 
 const PRIMARY = "#0B72FF";
 const SUBJECT_ICON_MAP = [
-  { keys: ["english", "literature"], icon: "book-open-page-variant", color: "#6C5CE7", bg: "#F3F0FF" },
-  { keys: ["math", "mathematics", "algebra", "geometry", "maths"], icon: "calculator-variant", color: "#00A8FF", bg: "#EEF8FF" },
-  { keys: ["science", "general science", "biology", "chemistry", "physics"], icon: "flask", color: "#00B894", bg: "#ECFFF8" },
-  { keys: ["history", "social"], icon: "history", color: "#F39C12", bg: "#FFF8EC" },
-  { keys: ["geography"], icon: "map", color: "#0984E3", bg: "#EEF6FF" },
-  { keys: ["computer", "ict", "computing"], icon: "laptop", color: "#8E44AD", bg: "#F7F0FF" },
-  { keys: ["art"], icon: "palette", color: "#FF7675", bg: "#FFF2F2" },
+  { keys: ["english", "literature"], icon: "book-open-page-variant", color: "#6C5CE7", bg: "#F3F0FF", darkBg: "#241738" },
+  { keys: ["math", "mathematics", "algebra", "geometry", "maths"], icon: "calculator-variant", color: "#00A8FF", bg: "#EEF8FF", darkBg: "#10203A" },
+  { keys: ["science", "general science", "biology", "chemistry", "physics"], icon: "flask", color: "#00B894", bg: "#ECFFF8", darkBg: "#10261F" },
+  { keys: ["history", "social"], icon: "history", color: "#F39C12", bg: "#FFF8EC", darkBg: "#2B1A0B" },
+  { keys: ["geography"], icon: "map", color: "#0984E3", bg: "#EEF6FF", darkBg: "#10203A" },
+  { keys: ["computer", "ict", "computing"], icon: "laptop", color: "#8E44AD", bg: "#F7F0FF", darkBg: "#241738" },
+  { keys: ["art"], icon: "palette", color: "#FF7675", bg: "#FFF2F2", darkBg: "#33181C" },
 ];
 const TOPIC_UNDERSTANDING_OPTIONS = [
   {
@@ -39,6 +39,7 @@ const TOPIC_UNDERSTANDING_OPTIONS = [
     icon: "sparkles-outline",
     tint: "#0284C7",
     bg: "#F0F9FF",
+    darkBg: "#10203A",
   },
   {
     key: "good",
@@ -47,6 +48,7 @@ const TOPIC_UNDERSTANDING_OPTIONS = [
     icon: "thumbs-up-outline",
     tint: "#059669",
     bg: "#ECFDF5",
+    darkBg: "#10261F",
   },
   {
     key: "dont_understand",
@@ -55,6 +57,7 @@ const TOPIC_UNDERSTANDING_OPTIONS = [
     icon: "help-circle-outline",
     tint: "#D97706",
     bg: "#FFFBEB",
+    darkBg: "#2B1A0B",
   },
   {
     key: "not_learned",
@@ -63,14 +66,28 @@ const TOPIC_UNDERSTANDING_OPTIONS = [
     icon: "alert-circle-outline",
     tint: "#DC2626",
     bg: "#FEF2F2",
+    darkBg: "#33181C",
   },
 ];
-const UNDERSTANDING_SCORE_MAP = {
-  excellent: 4,
-  good: 3,
-  dont_understand: 2,
-  not_learned: 1,
-};
+const VALID_TOPIC_UNDERSTANDING_LEVELS = new Set(
+  TOPIC_UNDERSTANDING_OPTIONS.map((item) => item.key)
+);
+
+function resolveAdaptiveSurface(lightBg, darkBg, colors) {
+  if (!colors || colors.background === "#fff") return lightBg;
+  return darkBg || colors.elevatedSurface || lightBg;
+}
+
+function normalizeTopicUnderstandingLevel(value = "") {
+  const normalized = String(value || "").trim();
+  return VALID_TOPIC_UNDERSTANDING_LEVELS.has(normalized) ? normalized : "";
+}
+
+function normalizeTeacherRatingValue(value = 0) {
+  const numericValue = Number(value || 0);
+  if (!Number.isFinite(numericValue)) return 0;
+  return Math.max(0, Math.min(5, Math.round(numericValue)));
+}
 
 function normalizeGrade(value) {
   if (!value) return null;
@@ -337,16 +354,22 @@ function buildTemplateTermConfig(templateSubjectNode) {
   };
 }
 
-function getSubjectVisual(subjectName = "") {
+function getSubjectVisual(subjectName = "", colors) {
   const lower = String(subjectName).toLowerCase();
   const matched = SUBJECT_ICON_MAP.find((item) =>
     item.keys.some((key) => lower.includes(key))
   );
 
-  return matched || {
+  const visual = matched || {
     icon: "book-education-outline",
     color: PRIMARY,
     bg: "#EEF4FF",
+    darkBg: "#10203A",
+  };
+
+  return {
+    ...visual,
+    bg: resolveAdaptiveSurface(visual.bg, visual.darkBg, colors),
   };
 }
 
@@ -494,40 +517,175 @@ function buildTopicFeedbackKey(courseId = "", topic = {}) {
   return encodeURIComponent(raw);
 }
 
+function decodeStudentWhatLearnKey(value = "") {
+  const raw = String(value || "");
+
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
+function inferCourseIdFromFeedbackKey(feedbackKey = "") {
+  const decoded = decodeStudentWhatLearnKey(feedbackKey);
+  const separatorIndex = decoded.indexOf("__");
+  return separatorIndex > 0 ? decoded.slice(0, separatorIndex) : "";
+}
+
+function isStudentWhatLearnEntry(value = null) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+
+  return ["courseId", "teacherId", "understandingLevel", "teacherRating", "createdAt", "updatedAt"].some(
+    (key) => Object.prototype.hasOwnProperty.call(value, key)
+  );
+}
+
+function normalizeStudentWhatLearnEntry(entry = {}, feedbackKey = "", fallbackCourseId = "") {
+  if (!isStudentWhatLearnEntry(entry)) return null;
+
+  const fallbackTimestamp = Date.now();
+  const createdAt = toMsTimestamp(entry?.createdAt || entry?.updatedAt || 0);
+  const updatedAt = toMsTimestamp(entry?.updatedAt || entry?.createdAt || 0);
+
+  return {
+    courseId:
+      String(entry?.courseId || fallbackCourseId || inferCourseIdFromFeedbackKey(feedbackKey)).trim() || "",
+    teacherId: String(entry?.teacherId || "").trim(),
+    understandingLevel: normalizeTopicUnderstandingLevel(entry?.understandingLevel),
+    teacherRating: normalizeTeacherRatingValue(entry?.teacherRating),
+    createdAt: createdAt || updatedAt || fallbackTimestamp,
+    updatedAt: updatedAt || createdAt || fallbackTimestamp,
+  };
+}
+
+function enrichStudentWhatLearnTeacherIds(feedbackMap = {}, subjects = []) {
+  const nextFeedbackMap = {};
+  const courseTeacherIds = {};
+  const topicTeacherIds = {};
+  let changed = false;
+
+  subjects.forEach((subject) => {
+    const subjectTeacherId = String(subject?.teacherId || "").trim();
+    if (subject?.courseId && subjectTeacherId) {
+      courseTeacherIds[subject.courseId] = subjectTeacherId;
+    }
+
+    (subject?.topics || []).forEach((topic) => {
+      const topicTeacherId = String(topic?.teacherId || subjectTeacherId || "").trim();
+      if (topic?.feedbackKey && topicTeacherId) {
+        topicTeacherIds[topic.feedbackKey] = topicTeacherId;
+      }
+    });
+  });
+
+  Object.keys(feedbackMap || {}).forEach((feedbackKey) => {
+    const entry = normalizeStudentWhatLearnEntry(feedbackMap?.[feedbackKey], feedbackKey);
+    if (!entry) return;
+
+    const teacherId =
+      String(entry?.teacherId || topicTeacherIds?.[feedbackKey] || courseTeacherIds?.[entry?.courseId] || "").trim();
+
+    if (teacherId !== String(entry?.teacherId || "").trim()) {
+      changed = true;
+    }
+
+    nextFeedbackMap[feedbackKey] = {
+      ...entry,
+      teacherId,
+    };
+  });
+
+  return {
+    feedbackMap: nextFeedbackMap,
+    changed,
+  };
+}
+
+function mergeStudentWhatLearnEntry(target = {}, feedbackKey = "", nextEntry = null, fallbackCourseId = "") {
+  const normalizedNextEntry = normalizeStudentWhatLearnEntry(nextEntry, feedbackKey, fallbackCourseId);
+  if (!normalizedNextEntry) return target;
+
+  const currentEntry = target?.[feedbackKey];
+  if (!currentEntry) {
+    target[feedbackKey] = normalizedNextEntry;
+    return target;
+  }
+
+  const currentUpdatedAt = toMsTimestamp(currentEntry?.updatedAt || currentEntry?.createdAt || 0);
+  const nextUpdatedAt = toMsTimestamp(normalizedNextEntry?.updatedAt || normalizedNextEntry?.createdAt || 0);
+
+  if (nextUpdatedAt >= currentUpdatedAt) {
+    target[feedbackKey] = normalizedNextEntry;
+  }
+
+  return target;
+}
+
 function flattenStudentWhatLearnNode(node = {}) {
   const flattened = {};
 
-  Object.keys(node || {}).forEach((courseId) => {
-    const courseNode = node?.[courseId] || {};
+  Object.keys(node || {}).forEach((topLevelKey) => {
+    const topLevelValue = node?.[topLevelKey];
+    if (!topLevelValue || typeof topLevelValue !== "object" || Array.isArray(topLevelValue)) return;
 
-    Object.keys(courseNode || {}).forEach((feedbackKey) => {
-      const value = courseNode?.[feedbackKey];
-      if (!value || typeof value !== "object") return;
+    if (isStudentWhatLearnEntry(topLevelValue)) {
+      mergeStudentWhatLearnEntry(flattened, topLevelKey, topLevelValue);
+      return;
+    }
 
-      flattened[feedbackKey] = {
-        courseId,
-        ...value,
-      };
+    Object.keys(topLevelValue || {}).forEach((feedbackKey) => {
+      mergeStudentWhatLearnEntry(flattened, feedbackKey, topLevelValue?.[feedbackKey], topLevelKey);
     });
   });
 
   return flattened;
 }
 
-function stripLegacyTopicFeedbackFields(entry = {}) {
-  const {
-    taughtStatus,
-    wasTaughtInClass,
-    reportedSubmittedWithoutTeaching,
-    teacherNeedsReview,
-    ...rest
-  } = entry || {};
-
-  return rest;
+function buildStudentWhatLearnPath(schoolKey = "", studentId = "", feedbackKey = "") {
+  const basePath = `Platform1/Schools/${schoolKey}/LessonPlans/StudentWhatLearn/${studentId}`;
+  if (!feedbackKey) return basePath;
+  return `${basePath}/${feedbackKey}`;
 }
 
-function getUnderstandingOption(value = "") {
-  return TOPIC_UNDERSTANDING_OPTIONS.find((item) => item.key === value) || null;
+function buildLegacyStudentWhatLearnPath(schoolKey = "", studentId = "") {
+  return `Platform1/Schools/${schoolKey}/StudentWhatLearn/${studentId}`;
+}
+
+function mergeStudentWhatLearnNodes(...nodes) {
+  return nodes.reduce((merged, node) => {
+    const flattenedNode = flattenStudentWhatLearnNode(node);
+
+    Object.keys(flattenedNode).forEach((feedbackKey) => {
+      mergeStudentWhatLearnEntry(merged, feedbackKey, flattenedNode?.[feedbackKey]);
+    });
+
+    return merged;
+  }, {});
+}
+
+function serializeStudentWhatLearnNode(node = {}) {
+  const flattenedNode = flattenStudentWhatLearnNode(node);
+  const stableNode = {};
+
+  Object.keys(flattenedNode)
+    .sort()
+    .forEach((feedbackKey) => {
+      stableNode[feedbackKey] = flattenedNode[feedbackKey];
+    });
+
+  return JSON.stringify(stableNode);
+}
+
+function getUnderstandingOptions(colors) {
+  return TOPIC_UNDERSTANDING_OPTIONS.map((item) => ({
+    ...item,
+    bg: resolveAdaptiveSurface(item.bg, item.darkBg, colors),
+  }));
+}
+
+function getUnderstandingOption(value = "", colors) {
+  return getUnderstandingOptions(colors).find((item) => item.key === value) || null;
 }
 
 function getTeacherRatingLabel(value = 0) {
@@ -580,6 +738,11 @@ export default function WhatYouLearnScreen() {
   const [selectedTeacherRating, setSelectedTeacherRating] = useState(0);
   const [savingTopicFeedback, setSavingTopicFeedback] = useState(false);
   const sheetAnim = useRef(new Animated.Value(0)).current;
+  const understandingOptions = useMemo(() => getUnderstandingOptions(colors), [colors]);
+  const selectedSubjectVisual = useMemo(
+    () => (selectedSubject ? getSubjectVisual(selectedSubject.subject, colors) : null),
+    [selectedSubject, colors]
+  );
 
   const handleBackNavigation = useCallback(() => {
     if (router.canGoBack()) {
@@ -646,8 +809,8 @@ export default function WhatYouLearnScreen() {
       teacherName: topic.teacherName || subject.teacherName || "",
       visual: subject.visual,
     });
-    setSelectedUnderstandingLevel(existingFeedback?.understandingLevel || "");
-    setSelectedTeacherRating(Number(existingFeedback?.teacherRating || 0));
+    setSelectedUnderstandingLevel(normalizeTopicUnderstandingLevel(existingFeedback?.understandingLevel));
+    setSelectedTeacherRating(normalizeTeacherRatingValue(existingFeedback?.teacherRating));
     setTopicFeedbackVisible(true);
   }, [topicFeedbackMap]);
 
@@ -663,33 +826,12 @@ export default function WhatYouLearnScreen() {
     }
 
     const existingFeedback = topicFeedbackMap?.[selectedTopicEntry.feedbackKey] || {};
-    const selectedOption = getUnderstandingOption(selectedUnderstandingLevel);
     const now = Date.now();
-    const effectiveTeacherName =
-      String(selectedTopicEntry.teacherName || "").trim() || String(selectedTopicEntry.teacherId || "").trim();
     const payload = {
-      id: selectedTopicEntry.feedbackKey,
-      studentId: resolvedStudentId,
       courseId: selectedTopicEntry.courseId,
-      subject: selectedTopicEntry.subjectLabel || "",
-      teacherId: selectedTopicEntry.teacherId || "",
-      teacherName: effectiveTeacherName,
-      topicId: selectedTopicEntry.id,
-      topic: selectedTopicEntry.topic,
-      dateKey: selectedTopicEntry.dateKey,
-      dayName: selectedTopicEntry.dayName || "",
-      semesterKey: selectedTopicEntry.semesterKey || "",
-      normalizedSemesterKey:
-        selectedTopicEntry.normalizedSemesterKey || normalizeSemesterKey(selectedTopicEntry.semesterKey) || "",
-      quarterKey: selectedTopicEntry.normalizedQuarterKey || "",
-      monthKey: selectedTopicEntry.monthKey || "",
-      weekKey: selectedTopicEntry.weekKey || "",
-      understandingLevel: selectedUnderstandingLevel,
-      understandingLabel: selectedOption?.label || "",
-      understandingScore: UNDERSTANDING_SCORE_MAP[selectedUnderstandingLevel] || 0,
-      teacherRating: Number(selectedTeacherRating || 0),
-      teacherRatingLabel: getTeacherRatingLabel(selectedTeacherRating),
-      teacherRankingEligible: Number(selectedTeacherRating || 0) > 0,
+      teacherId: String(selectedTopicEntry.teacherId || "").trim(),
+      understandingLevel: normalizeTopicUnderstandingLevel(selectedUnderstandingLevel),
+      teacherRating: normalizeTeacherRatingValue(selectedTeacherRating),
       createdAt: existingFeedback?.createdAt || now,
       updatedAt: now,
     };
@@ -697,11 +839,14 @@ export default function WhatYouLearnScreen() {
     setSavingTopicFeedback(true);
 
     try {
+      const feedbackPath = buildStudentWhatLearnPath(
+        resolvedSchoolKey,
+        resolvedStudentId,
+        selectedTopicEntry.feedbackKey
+      );
+
       await set(
-        ref(
-          database,
-          `Platform1/Schools/${resolvedSchoolKey}/StudentWhatLearn/${resolvedStudentId}/${selectedTopicEntry.courseId}/${selectedTopicEntry.feedbackKey}`
-        ),
+        ref(database, feedbackPath),
         payload
       );
 
@@ -790,48 +935,31 @@ export default function WhatYouLearnScreen() {
 
       let existingTopicFeedback = {};
       if (effectiveStudentId) {
-        const feedbackSnap = await get(
-          ref(database, `Platform1/Schools/${schoolKey}/StudentWhatLearn/${effectiveStudentId}`)
-        );
-        if (feedbackSnap?.exists()) {
-          const rawFeedbackNode = feedbackSnap.val() || {};
-          const sanitizedFeedbackNode = {};
-          let hasLegacyFeedbackFields = false;
+        const feedbackPath = buildStudentWhatLearnPath(schoolKey, effectiveStudentId);
+        const legacyFeedbackPath = buildLegacyStudentWhatLearnPath(schoolKey, effectiveStudentId);
+        const feedbackSnap = await get(ref(database, feedbackPath));
+        const legacyFeedbackSnap = await get(ref(database, legacyFeedbackPath));
 
-          Object.keys(rawFeedbackNode || {}).forEach((courseId) => {
-            const courseNode = rawFeedbackNode?.[courseId] || {};
-            const sanitizedCourseNode = {};
+        const lessonPlansFeedbackNode = feedbackSnap?.exists() ? feedbackSnap.val() || {} : {};
+        const legacyFeedbackNode = legacyFeedbackSnap?.exists() ? legacyFeedbackSnap.val() || {} : {};
+        const shouldRemoveLegacyFeedback = legacyFeedbackSnap?.exists();
+        const mergedFeedbackNode = mergeStudentWhatLearnNodes(lessonPlansFeedbackNode, legacyFeedbackNode);
+        const shouldWriteFeedbackToLessonPlans =
+          shouldRemoveLegacyFeedback ||
+          serializeStudentWhatLearnNode(lessonPlansFeedbackNode) !== serializeStudentWhatLearnNode(mergedFeedbackNode);
 
-            Object.keys(courseNode || {}).forEach((feedbackKey) => {
-              const entry = courseNode?.[feedbackKey];
-              if (!entry || typeof entry !== "object") return;
+        existingTopicFeedback = mergedFeedbackNode;
 
-              const sanitizedEntry = stripLegacyTopicFeedbackFields(entry);
-              sanitizedCourseNode[feedbackKey] = sanitizedEntry;
-
-              if (
-                Object.prototype.hasOwnProperty.call(entry, "taughtStatus") ||
-                Object.prototype.hasOwnProperty.call(entry, "wasTaughtInClass") ||
-                Object.prototype.hasOwnProperty.call(entry, "reportedSubmittedWithoutTeaching") ||
-                Object.prototype.hasOwnProperty.call(entry, "teacherNeedsReview")
-              ) {
-                hasLegacyFeedbackFields = true;
-              }
-            });
-
-            if (Object.keys(sanitizedCourseNode).length) {
-              sanitizedFeedbackNode[courseId] = sanitizedCourseNode;
-            }
-          });
-
-          existingTopicFeedback = flattenStudentWhatLearnNode(sanitizedFeedbackNode);
-
-          if (hasLegacyFeedbackFields) {
-            await set(
-              ref(database, `Platform1/Schools/${schoolKey}/StudentWhatLearn/${effectiveStudentId}`),
-              sanitizedFeedbackNode
-            );
+        if (shouldWriteFeedbackToLessonPlans) {
+          if (Object.keys(mergedFeedbackNode).length) {
+            await set(ref(database, feedbackPath), mergedFeedbackNode);
+          } else if (feedbackSnap?.exists()) {
+            await remove(ref(database, feedbackPath));
           }
+        }
+
+        if (shouldRemoveLegacyFeedback) {
+          await remove(ref(database, legacyFeedbackPath));
         }
       }
       setTopicFeedbackMap(existingTopicFeedback);
@@ -1085,6 +1213,17 @@ export default function WhatYouLearnScreen() {
         .filter((item) => item.topicCount > 0)
         .sort((left, right) => right.latestTimestamp - left.latestTimestamp || left.subject.localeCompare(right.subject));
 
+      const { feedbackMap: hydratedTopicFeedback, changed: teacherIdsHydrated } =
+        enrichStudentWhatLearnTeacherIds(existingTopicFeedback, nextSubjects);
+
+      if (teacherIdsHydrated && effectiveStudentId) {
+        await set(ref(database, buildStudentWhatLearnPath(schoolKey, effectiveStudentId)), hydratedTopicFeedback);
+      }
+
+      if (teacherIdsHydrated) {
+        setTopicFeedbackMap(hydratedTopicFeedback);
+      }
+
       setSubjects(nextSubjects);
     } catch (error) {
       console.warn("What you learn load error:", error);
@@ -1284,6 +1423,7 @@ export default function WhatYouLearnScreen() {
         renderItem={({ item }) => {
           const latestTopic = item.latestTopic;
           const isActive = subjectSheetVisible && selectedSubject?.courseId === item.courseId;
+          const itemVisual = getSubjectVisual(item.subject, colors);
 
           return (
             <View style={[styles.subjectCard, isActive && styles.subjectCardExpanded]}>
@@ -1293,8 +1433,8 @@ export default function WhatYouLearnScreen() {
                 onPress={() => openSubjectSheet(item)}
               >
                 <View style={styles.subjectHeaderLeft}>
-                  <View style={[styles.subjectIconWrap, { backgroundColor: item.visual.bg }] }>
-                    <MaterialCommunityIcons name={item.visual.icon} size={24} color={item.visual.color} />
+                  <View style={[styles.subjectIconWrap, { backgroundColor: itemVisual.bg }] }>
+                    <MaterialCommunityIcons name={itemVisual.icon} size={24} color={itemVisual.color} />
                   </View>
 
                   <View style={styles.subjectTextWrap}>
@@ -1341,11 +1481,11 @@ export default function WhatYouLearnScreen() {
               <>
                 <View style={styles.subjectSheetHeader}>
                   <View style={styles.subjectSheetHeaderLeft}>
-                    <View style={[styles.subjectSheetIconWrap, { backgroundColor: selectedSubject.visual.bg }] }>
+                    <View style={[styles.subjectSheetIconWrap, { backgroundColor: selectedSubjectVisual?.bg || colors.soft }] }>
                       <MaterialCommunityIcons
-                        name={selectedSubject.visual.icon}
+                        name={selectedSubjectVisual?.icon || "book-education-outline"}
                         size={24}
-                        color={selectedSubject.visual.color}
+                        color={selectedSubjectVisual?.color || PRIMARY}
                       />
                     </View>
 
@@ -1481,6 +1621,7 @@ export default function WhatYouLearnScreen() {
         onSave={saveTopicFeedback}
         topicEntry={selectedTopicEntry}
         understandingLevel={selectedUnderstandingLevel}
+        understandingOptions={understandingOptions}
         onSelectUnderstandingLevel={setSelectedUnderstandingLevel}
         teacherRating={selectedTeacherRating}
         onSelectTeacherRating={setSelectedTeacherRating}
@@ -1522,6 +1663,7 @@ function TopicEvaluationModal({
   onSave,
   topicEntry,
   understandingLevel,
+  understandingOptions,
   onSelectUnderstandingLevel,
   teacherRating,
   onSelectTeacherRating,
@@ -1568,7 +1710,17 @@ function TopicEvaluationModal({
                     </View>
 
                     <View style={styles.topicEvalHeaderTextWrap}>
-                      <Text style={styles.topicEvalTitle}>{topicEntry.topic}</Text>
+                      <View style={styles.topicEvalTitleRow}>
+                        <Text style={styles.topicEvalTitle}>{topicEntry.topic}</Text>
+                        {updatedLabel ? (
+                          <View style={styles.topicEvalTitleSavedWrap}>
+                            <View style={styles.topicEvalTitleSavedBadge}>
+                              <Ionicons name="checkmark-circle" size={14} color={colors.success} />
+                            </View>
+                            <Text style={styles.topicEvalTitleSavedText}>Saved {updatedLabel}</Text>
+                          </View>
+                        ) : null}
+                      </View>
                       <Text style={styles.topicEvalSubtitle}>
                         {topicEntry.subjectLabel} • {topicEntry.teacherName || "Teacher submitted topics"}
                       </Text>
@@ -1602,12 +1754,6 @@ function TopicEvaluationModal({
                       {formatSemesterLabel(topicEntry.semesterKey)} • {topicEntry.monthKey} • {topicEntry.weekKey}
                     </Text>
                   </View>
-
-                  {updatedLabel ? (
-                    <View style={styles.topicEvalSavedRow}>
-                      <Ionicons name="checkmark-circle" size={14} color="#059669" />
-                    </View>
-                  ) : null}
                 </View>
 
                 <View style={styles.topicEvalInfoCard}>
@@ -1620,7 +1766,7 @@ function TopicEvaluationModal({
 
               <Text style={styles.topicEvalSectionTitle}>How well did you learn this topic?</Text>
               <View style={styles.topicEvalSectionCard}>
-                {TOPIC_UNDERSTANDING_OPTIONS.map((option) => {
+                {understandingOptions.map((option) => {
                   const isActive = understandingLevel === option.key;
                   return (
                     <TouchableOpacity
@@ -1773,7 +1919,7 @@ function SubjectTopicsList({ topics, subject, colors, styles, feedbackMap, onTop
       {topics.map((topic, index) => {
         const isLatest = index === 0;
         const feedback = feedbackMap?.[topic.feedbackKey] || null;
-        const understanding = getUnderstandingOption(feedback?.understandingLevel || "");
+        const understanding = getUnderstandingOption(feedback?.understandingLevel || "", colors);
 
         return (
         <TouchableOpacity
@@ -2271,11 +2417,11 @@ function createStyles(colors) {
       fontWeight: "800",
     },
     topicFeedbackChipAlert: {
-      backgroundColor: "#FEF2F2",
-      borderColor: "#FECACA",
+      backgroundColor: colors.dangerSurface,
+      borderColor: colors.dangerBorder,
     },
     topicFeedbackChipAlertText: {
-      color: "#DC2626",
+      color: colors.danger,
     },
     topicTapHintRow: {
       flexDirection: "row",
@@ -2462,11 +2608,37 @@ function createStyles(colors) {
       flex: 1,
       marginLeft: 10,
     },
+    topicEvalTitleRow: {
+      flexDirection: "row",
+      alignItems: "center",
+    },
     topicEvalTitle: {
+      flexShrink: 1,
       color: colors.text,
       fontSize: 17,
       lineHeight: 23,
       fontWeight: "900",
+    },
+    topicEvalTitleSavedWrap: {
+      flexDirection: "row",
+      alignItems: "center",
+      marginLeft: 6,
+    },
+    topicEvalTitleSavedBadge: {
+      width: 24,
+      height: 24,
+      borderRadius: 999,
+      borderWidth: 1,
+      borderColor: colors.successBorder,
+      backgroundColor: colors.successSurface,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    topicEvalTitleSavedText: {
+      marginLeft: 5,
+      color: colors.success,
+      fontSize: 10,
+      fontWeight: "800",
     },
     topicEvalSubtitle: {
       marginTop: 4,
@@ -2496,19 +2668,6 @@ function createStyles(colors) {
       color: colors.text,
       fontSize: 10,
       fontWeight: "700",
-    },
-    topicEvalSavedRow: {
-      flexDirection: "row",
-      alignItems: "center",
-      justifyContent: "center",
-      paddingHorizontal: 10,
-      paddingVertical: 6,
-      borderRadius: 999,
-      borderWidth: 1,
-      borderColor: "#A7F3D0",
-      backgroundColor: "#ECFDF5",
-      marginRight: 6,
-      marginBottom: 6,
     },
     topicEvalInfoCard: {
       flexDirection: "row",
@@ -2657,8 +2816,8 @@ function createStyles(colors) {
       marginHorizontal: 3,
     },
     topicEvalStarBtnActive: {
-      borderColor: "#F59E0B",
-      backgroundColor: "#FFFBEB",
+      borderColor: colors.warningBorder,
+      backgroundColor: colors.warningSurface,
       shadowColor: "#F59E0B",
       shadowOffset: { width: 0, height: 4 },
       shadowOpacity: 0.12,
@@ -2680,13 +2839,13 @@ function createStyles(colors) {
       paddingVertical: 11,
       borderRadius: 16,
       borderWidth: 1,
-      borderColor: "#FECACA",
-      backgroundColor: "#FEF2F2",
+      borderColor: colors.dangerBorder,
+      backgroundColor: colors.dangerSurface,
     },
     topicEvalWarningText: {
       flex: 1,
       marginLeft: 8,
-      color: "#991B1B",
+      color: colors.danger,
       fontSize: 11,
       lineHeight: 17,
       fontWeight: "700",

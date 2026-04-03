@@ -17,6 +17,7 @@ import {
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useRouter, useLocalSearchParams } from "expo-router";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { ref, get } from "firebase/database";
 import { database } from "../constants/firebaseConfig";
 import { Ionicons } from "@expo/vector-icons";
@@ -26,13 +27,8 @@ import { getValue, pushAndSet, runTransactionSafe, safeUpdate } from "./lib/dbHe
 const C = {
   primary: "#0B72FF",
   muted: "#6B78A8",
-  bg: "#FFFFFF",
-  text: "#0B2540",
-  border: "#EAF0FF",
   success: "#16A34A",
   danger: "#EF4444",
-  warningBg: "#FFF7ED",
-  warningBorder: "#FED7AA",
 };
 const HEART_COLOR = "#EF4444";
 const DEFAULT_HEART_REFILL_MS = 20 * 60 * 1000;
@@ -133,6 +129,7 @@ function computeRefillState({ currentLives, maxLives, lastConsumedAt, refillMs, 
 export default function ExamCenter() {
   const router = useRouter();
   const params = useLocalSearchParams();
+  const insets = useSafeAreaInsets();
   const { colors, statusBarStyle } = useAppTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
   const modalStyles = useMemo(() => createModalStyles(colors), [colors]);
@@ -1147,7 +1144,17 @@ useEffect(() => {
               )}
             </ScrollView>
 
-            <View style={styles.footer}>
+            <View
+              style={[
+                styles.footer,
+                {
+                  marginBottom:
+                    Platform.OS === "android"
+                      ? Math.max(insets.bottom + 12, 28)
+                      : Math.max(insets.bottom, 12),
+                },
+              ]}
+            >
               <TouchableOpacity style={styles.ghostBtn} onPress={prevQ} disabled={currentIndex <= 0}>
                 <Text style={styles.ghostTxt}>Previous</Text>
               </TouchableOpacity>
@@ -1222,7 +1229,17 @@ useEffect(() => {
               );
             })()}
 
-            <View style={styles.footer}>
+            <View
+              style={[
+                styles.footer,
+                {
+                  marginBottom:
+                    Platform.OS === "android"
+                      ? Math.max(insets.bottom + 12, 28)
+                      : Math.max(insets.bottom, 12),
+                },
+              ]}
+            >
               <TouchableOpacity style={styles.ghostBtn} disabled={reviewIndex <= 0} onPress={() => setReviewIndex((i) => Math.max(0, i - 1))}>
                 <Text style={styles.ghostTxt}>Previous</Text>
               </TouchableOpacity>

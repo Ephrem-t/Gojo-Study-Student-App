@@ -1,12 +1,28 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ThemeProvider } from "@react-navigation/native";
-import { SafeAreaView, StyleSheet, View, Text, TouchableOpacity, Animated, Easing, Platform } from "react-native";
+import { AppState, SafeAreaView, StyleSheet, View, Text, TouchableOpacity, Animated, Easing, Modal, Platform } from "react-native";
 import { Stack, usePathname, useRouter } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { getValue } from "./lib/dbHelpers";
+import PasscodePanel from "../components/passcode-panel";
+import { AppLockProvider } from "../hooks/use-app-lock";
+import {
+  APP_LOCK_LAST_INACTIVE_AT_KEY,
+  APP_LOCK_PASSCODE_LENGTH,
+  DEFAULT_APP_LOCK_STATE,
+  loadStoredAppLock,
+  normalizePasscodeValue,
+  resolveAppLockAccountKey,
+} from "../constants/appLock";
+import {
+  SESSION_AUTH_KEYS,
+  SESSION_EXPIRED_NOTICE_KEY,
+  SESSION_LAST_ACTIVE_KEY,
+  isStudentSessionValid,
+} from "../constants/session";
 import { AppThemeProvider, useAppTheme } from "../hooks/use-app-theme";
 
 export const unstable_settings = {
@@ -41,8 +57,65 @@ export default function RootLayout() {
 function ThemedRootLayout() {
   const router = useRouter();
   const pathname = usePathname();
+  const insets = useSafeAreaInsets();
   const { colors, navigationTheme, statusBarStyle } = useAppTheme();
   const bootRedirectDoneRef = useRef(false);
+  const appStateRef = useRef(AppState.currentState);
+  const sessionSyncDoneRef = useRef(false);
+  const [appLock, setAppLock] = useState(DEFAULT_APP_LOCK_STATE);
+  const [appLocked, setAppLocked] = useState(false);
+  const [unlockCode, setUnlockCode] = useState("");
+  const [unlockError, setUnlockError] = useState("");
+  const currentPath = String(pathname || "/");
+  const isPublicRoute = currentPath === "/" || currentPath === "/index";
+
+  const resetAppLockState = useCallback(() => {
+    AsyncStorage.removeItem(APP_LOCK_LAST_INACTIVE_AT_KEY).catch(() => null);
+    setAppLock(DEFAULT_APP_LOCK_STATE);
+    setAppLocked(false);
+    setUnlockCode("");
+    setUnlockError("");
+  }, []);
+
+  const syncAppLockState = useCallback(async (session: Record<string, string | null>, options?: { evaluateAutoLock?: boolean }) => {
+    const role = String(session.role || "");
+    const evaluateAutoLock = Boolean(options?.evaluateAutoLock);
+
+    if (role !== "student") {
+      resetAppLockState();
+      return;
+    }
+
+    const accountKey = resolveAppLockAccountKey(session.studentNodeKey, session.studentId, session.userId);
+    const normalizedAppLock = await loadStoredAppLock(accountKey);
+
+    setAppLock(normalizedAppLock);
+
+    if (!normalizedAppLock.enabled) {
+      AsyncStorage.removeItem(APP_LOCK_LAST_INACTIVE_AT_KEY).catch(() => null);
+      setAppLocked(false);
+      setUnlockCode("");
+      setUnlockError("");
+      return;
+    }
+
+    if (!evaluateAutoLock) {
+      return;
+    }
+
+    const lastInactiveValue = await AsyncStorage.getItem(APP_LOCK_LAST_INACTIVE_AT_KEY);
+    await AsyncStorage.removeItem(APP_LOCK_LAST_INACTIVE_AT_KEY).catch(() => null);
+
+    const lastInactiveAt = Number(lastInactiveValue || 0);
+    const shouldLock =
+      lastInactiveAt > 0 && Date.now() - lastInactiveAt >= Number(normalizedAppLock.autoLockDelayMs || 0);
+
+    if (shouldLock) {
+      setUnlockCode("");
+      setUnlockError("");
+      setAppLocked(true);
+    }
+  }, [resetAppLockState]);
 
   useEffect(() => {
     if (Platform.OS !== "web") return;
@@ -82,37 +155,145 @@ function ThemedRootLayout() {
     };
   }, []);
 
-  useEffect(() => {
-    if (bootRedirectDoneRef.current) return;
+  const syncSessionAccess = useCallback(async (options?: { forceAppLock?: boolean }) => {
+    const shouldForceHome = isPublicRoute || currentPath === "/setting";
+    const evaluateAutoLock = !sessionSyncDoneRef.current || Boolean(options?.forceAppLock);
 
-    (async () => {
-      const role = await AsyncStorage.getItem("role");
-      const userId = await AsyncStorage.getItem("userId");
-      if (role !== "student" || !userId) return;
+    const pairs = await AsyncStorage.multiGet([
+      "role",
+      "userId",
+      SESSION_LAST_ACTIVE_KEY,
+      "studentNodeKey",
+      "studentId",
+    ]);
+    const session = Object.fromEntries(pairs) as Record<string, string | null>;
 
-      const currentPath = String(pathname || "/");
-      const shouldForceHome =
-        currentPath === "/" ||
-        currentPath === "/index" ||
-        currentPath === "/setting";
+    if (isStudentSessionValid(session)) {
+      await AsyncStorage.setItem(SESSION_LAST_ACTIVE_KEY, String(Date.now()));
+      await syncAppLockState(session, {
+        evaluateAutoLock,
+      });
 
-      if (shouldForceHome) {
+      if (shouldForceHome && !bootRedirectDoneRef.current) {
         bootRedirectDoneRef.current = true;
         router.replace("/dashboard/home");
       }
-    })();
-  }, [pathname, router]);
+
+      sessionSyncDoneRef.current = true;
+      return;
+    }
+
+    sessionSyncDoneRef.current = true;
+    bootRedirectDoneRef.current = false;
+    resetAppLockState();
+
+    if (session.role === "student" && session.userId) {
+      await AsyncStorage.multiRemove(SESSION_AUTH_KEYS);
+      await AsyncStorage.setItem(SESSION_EXPIRED_NOTICE_KEY, String(Date.now()));
+    }
+
+    if (!isPublicRoute) {
+      router.replace("/");
+    }
+  }, [currentPath, isPublicRoute, resetAppLockState, router, syncAppLockState]);
+
+  useEffect(() => {
+    syncSessionAccess().catch((error) => {
+      console.warn("Session sync error:", error);
+    });
+  }, [syncSessionAccess]);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener("change", (nextState) => {
+      const wasBackgrounded = /inactive|background/.test(appStateRef.current);
+
+      if (/inactive|background/.test(nextState)) {
+        if (appLock.enabled) {
+          AsyncStorage.setItem(APP_LOCK_LAST_INACTIVE_AT_KEY, String(Date.now())).catch(() => null);
+        } else {
+          AsyncStorage.removeItem(APP_LOCK_LAST_INACTIVE_AT_KEY).catch(() => null);
+        }
+      }
+
+      appStateRef.current = nextState;
+
+      if (wasBackgrounded && nextState === "active") {
+        syncSessionAccess({ forceAppLock: true }).catch((error) => {
+          console.warn("Session resume sync error:", error);
+        });
+      }
+    });
+
+    return () => {
+      subscription.remove();
+    };
+  }, [appLock.enabled, syncSessionAccess]);
+
+  useEffect(() => {
+    if (!appLocked || unlockCode.length !== APP_LOCK_PASSCODE_LENGTH) return;
+
+    if (unlockCode === appLock.passcode) {
+      AsyncStorage.removeItem(APP_LOCK_LAST_INACTIVE_AT_KEY).catch(() => null);
+      setAppLocked(false);
+      setUnlockCode("");
+      setUnlockError("");
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      setUnlockCode("");
+      setUnlockError("Wrong 4-digit passcode. Try again.");
+    }, 120);
+
+    return () => clearTimeout(timer);
+  }, [appLock.passcode, appLocked, unlockCode]);
+
+  const handleUnlockDigit = useCallback((digit: string) => {
+    setUnlockError("");
+    setUnlockCode((current) => {
+      if (current.length >= APP_LOCK_PASSCODE_LENGTH) return current;
+      return normalizePasscodeValue(`${current}${digit}`);
+    });
+  }, []);
+
+  const handleUnlockBackspace = useCallback(() => {
+    setUnlockError("");
+    setUnlockCode((current) => current.slice(0, -1));
+  }, []);
+
+  const lockAppNow = useCallback(() => {
+    setUnlockCode("");
+    setUnlockError("");
+    setAppLocked(true);
+  }, []);
 
   return (
-    <ThemeProvider value={navigationTheme}>
-      <SafeAreaView style={[styles.container, { backgroundColor: colors.background }]}>
-        <StatusBar style={statusBarStyle} backgroundColor={colors.background} />
-        <GlobalNotificationToast />
-        <Stack initialRouteName="index" screenOptions={{ headerShown: false, contentStyle: { backgroundColor: colors.background } }}>
-          <Stack.Screen name="setting" options={{ animation: "slide_from_right", presentation: "card" }} />
-        </Stack>
-      </SafeAreaView>
-    </ThemeProvider>
+    <AppLockProvider value={{ appLockEnabled: appLock.enabled, lockAppNow }}>
+      <ThemeProvider value={navigationTheme}>
+        <SafeAreaView style={[styles.container, { backgroundColor: colors.background }]}>
+          <StatusBar style={statusBarStyle} backgroundColor={colors.background} />
+          <GlobalNotificationToast />
+          <Stack initialRouteName="index" screenOptions={{ headerShown: false, contentStyle: { backgroundColor: colors.background } }}>
+            <Stack.Screen name="setting" options={{ animation: "slide_from_right", presentation: "card" }} />
+          </Stack>
+
+          <Modal visible={appLock.enabled && appLocked} transparent animationType="fade" onRequestClose={() => null}>
+            <View style={[styles.lockOverlay, { backgroundColor: colors.overlay }]}> 
+              <PasscodePanel
+                colors={colors}
+                title="Passcode Lock"
+                subtitle="Enter your 4-digit code to unlock Gojo Study."
+                value={unlockCode}
+                errorText={unlockError}
+                onDigitPress={handleUnlockDigit}
+                onBackspace={handleUnlockBackspace}
+                footerNote="Tap the lock icon on the home page header to lock Gojo Study instantly on this phone."
+              />
+            </View>
+          </Modal>
+        </SafeAreaView>
+      </ThemeProvider>
+    </AppLockProvider>
   );
 }
 
@@ -308,6 +489,13 @@ function GlobalNotificationToast() {
 
 const styles = StyleSheet.create({
   container: { flex: 1 },
+
+  lockOverlay: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 20,
+  },
 
   toastWrap: {
     position: "absolute",

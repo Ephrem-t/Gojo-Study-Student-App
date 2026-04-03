@@ -1827,8 +1827,8 @@ function createStyles(colors) {
     alignItems: "center",
   },
   pickerChipActive: {
-    backgroundColor: "#EEF4FF",
-    borderColor: "#AFCFFF",
+    backgroundColor: colors.infoSurface,
+    borderColor: colors.infoBorder,
     shadowColor: "#2563EB",
     shadowOffset: { width: 0, height: 4 },
     shadowOpacity: 0.08,
@@ -1882,7 +1882,7 @@ function createStyles(colors) {
   },
   choiceChipActive: {
     backgroundColor: PRIMARY_SOFT,
-    borderColor: "#BFDBFE",
+    borderColor: colors.infoBorder,
   },
   choiceChipText: {
     color: TEXT,
@@ -1965,7 +1965,7 @@ function createStyles(colors) {
     backgroundColor: colors.inputBackground,
   },
   daySelected: {
-    backgroundColor: "#EAF2FF",
+    backgroundColor: colors.infoSurface,
   },
   dayText: {
     color: TEXT,

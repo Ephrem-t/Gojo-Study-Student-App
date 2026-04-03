@@ -24,6 +24,19 @@ import { StatusBar } from "expo-status-bar";
 import { database } from "../constants/firebaseConfig";
 import { get, ref, update } from "firebase/database";
 import { useAppTheme } from "../hooks/use-app-theme";
+import PasscodePanel from "../components/passcode-panel";
+import {
+  APP_LOCK_AUTO_LOCK_OPTIONS,
+  APP_LOCK_PASSCODE_LENGTH,
+  DEFAULT_APP_LOCK_STATE,
+  buildStoredAppLockPayload,
+  clearStoredAppLock,
+  getAutoLockDelayLabel,
+  loadStoredAppLock,
+  normalizePasscodeValue,
+  resolveAppLockAccountKey,
+  saveStoredAppLock,
+} from "../constants/appLock";
 
 const { width: SCREEN_WIDTH } = Dimensions.get("window");
 
@@ -49,11 +62,41 @@ export default function SettingScreen() {
   const [savingPwd, setSavingPwd] = useState(false);
   const [schoolKey, setSchoolKey] = useState(null);
   const [userNodeKey, setUserNodeKey] = useState(null);
+  const [currentUserId, setCurrentUserId] = useState(null);
   const [studentNodeKey, setStudentNodeKey] = useState(null);
   const [preferences, setPreferences] = useState(defaultPreferences);
   const [newPwd, setNewPwd] = useState("");
   const [confirmPwd, setConfirmPwd] = useState("");
+  const [appLock, setAppLock] = useState(DEFAULT_APP_LOCK_STATE);
+  const [autoLockModalVisible, setAutoLockModalVisible] = useState(false);
+  const [passcodeModalVisible, setPasscodeModalVisible] = useState(false);
+  const [passcodeSaving, setPasscodeSaving] = useState(false);
+  const [passcodeModalMode, setPasscodeModalMode] = useState("create");
+  const [passcodeStep, setPasscodeStep] = useState("create");
+  const [passcodeDraft, setPasscodeDraft] = useState("");
+  const [passcodeEntry, setPasscodeEntry] = useState("");
+  const [passcodeError, setPasscodeError] = useState("");
   const isDarkMode = resolvedAppearance === "dark";
+  const appLockAccountKey = useMemo(
+    () => resolveAppLockAccountKey(studentNodeKey, currentUserId, userNodeKey),
+    [studentNodeKey, currentUserId, userNodeKey]
+  );
+  const autoLockLabel = getAutoLockDelayLabel(appLock.autoLockDelayMs);
+  const passcodeCaption = appLock.enabled
+    ? `Tap the lock on the home page header to lock instantly on this phone. Auto-lock if away for ${autoLockLabel}.`
+    : "Add 4 digits that you will use to unlock your Gojo app on this phone.";
+  const passcodeModalTitle =
+    passcodeStep === "create"
+      ? passcodeModalMode === "change"
+        ? "New Passcode"
+        : "Create Passcode"
+      : "Confirm Passcode";
+  const passcodeModalSubtitle =
+    passcodeStep === "create"
+      ? passcodeModalMode === "change"
+        ? "Enter a new 4-digit code for Gojo Study."
+        : "Enter 4 digits that you will use to unlock your Gojo app on this phone."
+      : "Enter the same 4 digits again to confirm.";
 
   useEffect(() => {
     Animated.parallel([
@@ -125,6 +168,7 @@ export default function SettingScreen() {
       try {
         const nextSchoolKey = await AsyncStorage.getItem("schoolKey");
         const nextUserNodeKey = (await AsyncStorage.getItem("userNodeKey")) || null;
+        const nextUserId = (await AsyncStorage.getItem("userId")) || null;
         const nextStudentNodeKey =
           (await AsyncStorage.getItem("studentNodeKey")) ||
           (await AsyncStorage.getItem("studentId")) ||
@@ -134,6 +178,7 @@ export default function SettingScreen() {
 
         setSchoolKey(nextSchoolKey);
         setUserNodeKey(nextUserNodeKey);
+        setCurrentUserId(nextUserId);
         setStudentNodeKey(nextStudentNodeKey);
 
         if (!nextSchoolKey || !nextUserNodeKey) return;
@@ -145,8 +190,13 @@ export default function SettingScreen() {
 
         const userVal = userSnap?.exists() ? userSnap.val() || {} : {};
         const studentVal = studentSnap?.exists() ? studentSnap.val() || {} : {};
+        const storedAppLock = await loadStoredAppLock(
+          resolveAppLockAccountKey(nextStudentNodeKey, nextUserId, nextUserNodeKey)
+        );
 
         if (!active) return;
+
+        setAppLock(storedAppLock);
 
         const remotePreferences =
           userVal?.appPreferences ||
@@ -277,6 +327,143 @@ export default function SettingScreen() {
     );
   }, []);
 
+  const resetPasscodeComposer = useCallback(() => {
+    setPasscodeStep("create");
+    setPasscodeDraft("");
+    setPasscodeEntry("");
+    setPasscodeError("");
+  }, []);
+
+  const closePasscodeModal = useCallback(() => {
+    if (passcodeSaving) return;
+    setPasscodeModalVisible(false);
+    resetPasscodeComposer();
+  }, [passcodeSaving, resetPasscodeComposer]);
+
+  const closeAutoLockModal = useCallback(() => {
+    setAutoLockModalVisible(false);
+  }, []);
+
+  const openPasscodeModal = useCallback((mode = "create") => {
+    setPasscodeModalMode(mode);
+    resetPasscodeComposer();
+    setPasscodeModalVisible(true);
+  }, [resetPasscodeComposer]);
+
+  const savePasscodeLock = useCallback(async (nextPasscode) => {
+    const payload = buildStoredAppLockPayload(nextPasscode, true, appLock.autoLockDelayMs);
+    if (!payload.enabled || payload.passcode.length !== APP_LOCK_PASSCODE_LENGTH) {
+      Alert.alert("Invalid", "Passcode must be exactly 4 digits.");
+      return;
+    }
+
+    try {
+      setPasscodeSaving(true);
+      const storedPayload = await saveStoredAppLock(appLockAccountKey, payload);
+      setAppLock(storedPayload);
+      setPasscodeModalVisible(false);
+      resetPasscodeComposer();
+      Alert.alert(
+        passcodeModalMode === "change" ? "Passcode Updated" : "Passcode Lock On",
+        "Gojo Study will now ask for this 4-digit passcode when the app opens."
+      );
+    } catch (error) {
+      console.warn("Settings app lock save error:", error);
+      Alert.alert("Error", "Could not save the passcode lock.");
+    } finally {
+      setPasscodeSaving(false);
+    }
+  }, [appLock.autoLockDelayMs, appLockAccountKey, passcodeModalMode, resetPasscodeComposer]);
+
+  const updateAutoLockDelay = useCallback(async (nextDelay) => {
+    if (!appLock.enabled || !appLock.passcode) {
+      Alert.alert("Error", "Set the passcode first.");
+      return;
+    }
+
+    try {
+      const payload = buildStoredAppLockPayload(appLock.passcode, true, nextDelay);
+      const storedPayload = await saveStoredAppLock(appLockAccountKey, payload);
+      setAppLock(storedPayload);
+      setAutoLockModalVisible(false);
+    } catch (error) {
+      console.warn("Settings app lock auto-lock update error:", error);
+      Alert.alert("Error", "Could not update auto-lock time.");
+    }
+  }, [appLock.enabled, appLock.passcode, appLockAccountKey]);
+
+  const disablePasscodeLock = useCallback(async () => {
+    try {
+      await clearStoredAppLock(appLockAccountKey);
+      setAppLock(DEFAULT_APP_LOCK_STATE);
+      resetPasscodeComposer();
+      Alert.alert("Passcode Lock Off", "Gojo Study will open without the 4-digit passcode.");
+    } catch (error) {
+      console.warn("Settings app lock disable error:", error);
+      Alert.alert("Error", "Could not turn off the passcode lock.");
+    }
+  }, [appLockAccountKey, resetPasscodeComposer]);
+
+  const handlePasscodeDigit = useCallback((digit) => {
+    if (passcodeSaving) return;
+
+    const nextValue = normalizePasscodeValue(`${passcodeEntry}${digit}`);
+    setPasscodeError("");
+
+    if (passcodeStep === "create") {
+      if (nextValue.length < APP_LOCK_PASSCODE_LENGTH) {
+        setPasscodeEntry(nextValue);
+        return;
+      }
+
+      setPasscodeDraft(nextValue);
+      setPasscodeEntry("");
+      setPasscodeStep("confirm");
+      return;
+    }
+
+    if (nextValue.length < APP_LOCK_PASSCODE_LENGTH) {
+      setPasscodeEntry(nextValue);
+      return;
+    }
+
+    if (nextValue !== passcodeDraft) {
+      setPasscodeDraft("");
+      setPasscodeEntry("");
+      setPasscodeStep("create");
+      setPasscodeError("The 4 digits did not match. Enter the passcode again.");
+      return;
+    }
+
+    savePasscodeLock(nextValue);
+  }, [passcodeDraft, passcodeEntry, passcodeSaving, passcodeStep, savePasscodeLock]);
+
+  const handlePasscodeBackspace = useCallback(() => {
+    if (passcodeSaving) return;
+    setPasscodeError("");
+    setPasscodeEntry((current) => current.slice(0, -1));
+  }, [passcodeSaving]);
+
+  const togglePasscodeLock = useCallback((nextValue) => {
+    if (nextValue) {
+      openPasscodeModal("create");
+      return;
+    }
+
+    Alert.alert(
+      "Turn Off Passcode Lock",
+      "Gojo Study will stop asking for the 4-digit passcode when the app opens.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Turn Off",
+          style: "destructive",
+          onPress: disablePasscodeLock,
+        },
+      ]
+    );
+  }, [disablePasscodeLock, openPasscodeModal]);
+
   const savePassword = useCallback(async () => {
     if (!newPwd || newPwd.length < 4) {
       Alert.alert("Invalid", "Password must be at least 4 characters.");
@@ -338,6 +525,9 @@ export default function SettingScreen() {
       "role",
       "schoolKey",
       "studentGrade",
+      "lastActiveAt",
+      "lastLoginAt",
+      "sessionExpiredNotice",
       "grade",
       "profileImage",
       "appearancePreference",
@@ -494,6 +684,38 @@ export default function SettingScreen() {
                 styles={styles}
               />
               <Divider styles={styles} />
+              <SettingSwitchRow
+                icon="lock-closed-outline"
+                label="Passcode Lock"
+                caption={passcodeCaption}
+                value={appLock.enabled}
+                onValueChange={togglePasscodeLock}
+                colors={colors}
+                styles={styles}
+              />
+              {appLock.enabled ? (
+                <>
+                  <Divider styles={styles} />
+                  <SettingRow
+                    icon="timer-outline"
+                    label="Auto-Lock"
+                    caption={`Lock Gojo Study if away for ${autoLockLabel}`}
+                    onPress={() => setAutoLockModalVisible(true)}
+                    colors={colors}
+                    styles={styles}
+                  />
+                  <Divider styles={styles} />
+                  <SettingRow
+                    icon="keypad-outline"
+                    label="Change Passcode"
+                    caption="Set a new 4-digit code for unlocking Gojo Study"
+                    onPress={() => openPasscodeModal("change")}
+                    colors={colors}
+                    styles={styles}
+                  />
+                  <Divider styles={styles} />
+                </>
+              ) : null}
               <SettingRow
                 icon="person-outline"
                 label="Profile"
@@ -584,6 +806,70 @@ export default function SettingScreen() {
                     disabled={savingPwd}
                   >
                     {savingPwd ? <ActivityIndicator color={colors.white} /> : <Text style={styles.saveText}>Save</Text>}
+                  </TouchableOpacity>
+                </View>
+              </View>
+            </View>
+          </Modal>
+
+          <Modal
+            visible={passcodeModalVisible}
+            transparent
+            animationType="fade"
+            onRequestClose={closePasscodeModal}
+          >
+            <View style={styles.modalBg}>
+              <PasscodePanel
+                colors={colors}
+                title={passcodeModalTitle}
+                subtitle={passcodeModalSubtitle}
+                value={passcodeEntry}
+                errorText={passcodeError}
+                busy={passcodeSaving}
+                onDigitPress={handlePasscodeDigit}
+                onBackspace={handlePasscodeBackspace}
+                secondaryLabel="Cancel"
+                onSecondaryPress={closePasscodeModal}
+                footerNote="When passcode lock is on, a lock icon appears on the home page header so you can lock Gojo Study instantly on this phone."
+              />
+            </View>
+          </Modal>
+
+          <Modal
+            visible={autoLockModalVisible}
+            transparent
+            animationType="fade"
+            onRequestClose={closeAutoLockModal}
+          >
+            <View style={styles.modalBg}>
+              <View style={styles.modalCard}>
+                <Text style={styles.modalTitle}>Auto-Lock</Text>
+                <Text style={styles.selectionSubtitle}>Choose when Gojo Study should lock after you leave the app.</Text>
+
+                <View style={styles.selectionList}>
+                  {APP_LOCK_AUTO_LOCK_OPTIONS.map((option) => {
+                    const selected = option.value === appLock.autoLockDelayMs;
+
+                    return (
+                      <TouchableOpacity
+                        key={option.value}
+                        activeOpacity={0.86}
+                        style={[styles.selectionOption, selected && styles.selectionOptionActive]}
+                        onPress={() => updateAutoLockDelay(option.value)}
+                      >
+                        <View>
+                          <Text style={styles.selectionOptionTitle}>{option.label}</Text>
+                          <Text style={styles.selectionOptionCaption}>Lock after being away for {option.label.toLowerCase()}</Text>
+                        </View>
+                        {selected ? <Ionicons name="checkmark-circle" size={20} color={colors.primary} /> : null}
+                      </TouchableOpacity>
+                    );
+                  })}
+                </View>
+
+                <View style={styles.modalActions}>
+                  <TouchableOpacity style={[styles.modalBtn, styles.cancelBtn]} onPress={closeAutoLockModal}>
+                    <Text style={styles.cancelText}>Close</Text>
                   </TouchableOpacity>
                 </View>
               </View>
@@ -792,6 +1078,43 @@ function createStyles(colors) {
   saveText: {
     color: colors.white,
     fontWeight: "700",
+  },
+  selectionSubtitle: {
+    fontSize: 12,
+    lineHeight: 18,
+    color: colors.muted,
+    marginBottom: 12,
+  },
+  selectionList: {
+    marginTop: 2,
+  },
+  selectionOption: {
+    minHeight: 58,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.card,
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 10,
+  },
+  selectionOptionActive: {
+    borderColor: colors.primary,
+    backgroundColor: colors.soft,
+  },
+  selectionOptionTitle: {
+    fontSize: 14,
+    fontWeight: "700",
+    color: colors.text,
+  },
+  selectionOptionCaption: {
+    marginTop: 2,
+    fontSize: 11,
+    color: colors.muted,
+    fontWeight: "600",
   },
   });
 }

@@ -18,16 +18,14 @@ import { ref, get, set, remove, update } from "firebase/database";
 import { database } from "../constants/firebaseConfig";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useAppTheme } from "../hooks/use-app-theme";
+import {
+  DEFAULT_NOTE_COLOR_KEY,
+  getNoteColorOptions,
+  normalizeNoteColorTag,
+  resolveNoteColorTag,
+} from "./lib/noteColors";
 
 const MAX_NOTES_PER_CHAPTER = 5;
-
-const NOTE_COLORS = [
-  "#EEF4FF",
-  "#FFF4E8",
-  "#ECFDF3",
-  "#FEF3F2",
-  "#F4F3FF",
-];
 
 function normalizeGradeKey(g) {
   if (!g) return null;
@@ -96,7 +94,7 @@ export default function ChapterNoteScreen() {
   const [noteTitle, setNoteTitle] = useState("");
   const [noteText, setNoteText] = useState("");
   const [pinned, setPinned] = useState(false);
-  const [colorTag, setColorTag] = useState(NOTE_COLORS[0]);
+  const [colorTag, setColorTag] = useState(DEFAULT_NOTE_COLOR_KEY);
   const [settingsVisible, setSettingsVisible] = useState(false);
   const [noteFontSize, setNoteFontSize] = useState(15);
   const [showHelperTip, setShowHelperTip] = useState(true);
@@ -134,7 +132,15 @@ export default function ChapterNoteScreen() {
     return !String(noteText || "").trim();
   }, [noteText]);
 
-  const noteBodyTextColor = useMemo(() => getContrastTextForBackground(colorTag, colors), [colorTag, colors]);
+  const noteColorOptions = useMemo(() => getNoteColorOptions(colors), [colors]);
+  const noteBodyBackgroundColor = useMemo(
+    () => resolveNoteColorTag(colorTag, colors, noteColorOptions[0]?.value || colors.inputBackground),
+    [colorTag, colors, noteColorOptions]
+  );
+  const noteBodyTextColor = useMemo(
+    () => getContrastTextForBackground(noteBodyBackgroundColor, colors),
+    [noteBodyBackgroundColor, colors]
+  );
 
   useEffect(() => {
     (async () => {
@@ -144,27 +150,28 @@ export default function ChapterNoteScreen() {
         const snap = await get(ref(database, notePath));
         if (snap.exists()) {
           const val = snap.val() || {};
+          const savedColorTag = normalizeNoteColorTag(val.colorTag);
           setNoteTitle(val.title || "");
           setNoteText(val.text || "");
           setPinned(!!val.pinned);
-          setColorTag(val.colorTag || NOTE_COLORS[0]);
+          setColorTag(savedColorTag);
           lastSavedRef.current = JSON.stringify({
             title: val.title || "",
             text: val.text || "",
             pinned: !!val.pinned,
-            colorTag: val.colorTag || NOTE_COLORS[0],
+            colorTag: savedColorTag,
           });
         } else {
           const defaultTitle = `${unitTitle || "Chapter"} Note`;
           setNoteTitle(defaultTitle);
           setNoteText("");
           setPinned(false);
-          setColorTag(NOTE_COLORS[0]);
+          setColorTag(DEFAULT_NOTE_COLOR_KEY);
           lastSavedRef.current = JSON.stringify({
             title: defaultTitle,
             text: "",
             pinned: false,
-            colorTag: NOTE_COLORS[0],
+            colorTag: DEFAULT_NOTE_COLOR_KEY,
           });
         }
       } catch {
@@ -395,7 +402,7 @@ export default function ChapterNoteScreen() {
             style={[
               styles.bodyInput,
               {
-                backgroundColor: colorTag,
+                backgroundColor: noteBodyBackgroundColor,
                 fontSize: noteFontSize,
                 lineHeight: Math.round(noteFontSize * 1.45),
                 color: noteBodyTextColor,
@@ -467,13 +474,13 @@ export default function ChapterNoteScreen() {
             <Text style={styles.settingsLabel}>Note color</Text>
             <Text style={styles.settingsSubLabel}>Choose a color for easy note recognition.</Text>
             <View style={styles.colorRow}>
-              {NOTE_COLORS.map((c) => {
-                const active = colorTag === c;
+              {noteColorOptions.map((option) => {
+                const active = colorTag === option.key;
                 return (
                   <TouchableOpacity
-                    key={c}
-                    onPress={() => setColorTag(c)}
-                    style={[styles.colorDot, { backgroundColor: c }, active && styles.colorDotActive]}
+                    key={option.key}
+                    onPress={() => setColorTag(option.key)}
+                    style={[styles.colorDot, { backgroundColor: option.value }, active && styles.colorDotActive]}
                   />
                 );
               })}

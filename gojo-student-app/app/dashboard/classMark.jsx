@@ -45,7 +45,6 @@ const MUTED = "#6B78A8";
 const SUCCESS = "#27AE60";
 const WARNING = "#F2C94C";
 const DANGER = "#EB5757";
-const CARD_BORDER = "#F1F3F8";
 const SVG_HITBOX_FILL = "rgba(15,23,42,0.001)";
 const MARK_FILTER_OPTIONS = [
   { key: "all", label: "All" },
@@ -351,13 +350,14 @@ function AnalyticsCompletionGraph({ completed = 0, total = 0, colors }) {
 
 /* Animated linear progress */
 function LinearProgress({ percent = 0, height = 8, style }) {
+  const { colors } = useAppTheme();
   const widthAnim = useRef(new Animated.Value(0)).current;
   const pct = clamp(Math.round(percent || 0), 0, 100);
   const color = percentColor(pct);
   useEffect(() => { Animated.timing(widthAnim, { toValue: pct, duration: 450, useNativeDriver: false }).start(); }, [pct]);
   const w = widthAnim.interpolate({ inputRange: [0, 100], outputRange: ["0%", "100%"] });
   return (
-    <View style={[{ backgroundColor: "#EEF4FF", height, borderRadius: 8, overflow: "hidden" }, style]}>
+    <View style={[{ backgroundColor: colors.soft, height, borderRadius: 8, overflow: "hidden" }, style]}>
       <Animated.View style={{ width: w, height, backgroundColor: color }} />
     </View>
   );
@@ -2464,22 +2464,22 @@ function createStyles(colors) {
     borderWidth: 1,
   },
   analyticsStatusPillOn: {
-    backgroundColor: "#ECFDF3",
-    borderColor: "#BBF7D0",
+    backgroundColor: colors.successSurface,
+    borderColor: colors.successBorder,
   },
   analyticsStatusPillOff: {
-    backgroundColor: "#FFF7ED",
-    borderColor: "#FED7AA",
+    backgroundColor: colors.warningSurface,
+    borderColor: colors.warningBorder,
   },
   analyticsStatusText: {
     fontSize: 11,
     fontWeight: "800",
   },
   analyticsStatusTextOn: {
-    color: SUCCESS,
+    color: colors.success,
   },
   analyticsStatusTextOff: {
-    color: "#C2410C",
+    color: colors.warningText,
   },
   analyticsSubjectScoreRow: {
     marginTop: 10,
@@ -2512,7 +2512,7 @@ function createStyles(colors) {
     elevation: 1,
   },
   cardSelected: {
-    borderColor: "#B9D4FF",
+    borderColor: colors.infoBorder,
     shadowColor: PRIMARY,
     shadowOpacity: 0.05,
     elevation: 2,
