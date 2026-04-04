@@ -1,0 +1,6 @@
+Set-Location "gojo-student-app"; npx expo start --go -c
+
+
+#apk
+npm install -g expo-cli
+npm install -g eas-cli
