@@ -34,8 +34,6 @@ import { useAppTheme } from "../hooks/use-app-theme";
 
 export const options = { headerShown: false };
 
-const APP_ICON = require("../assets/images/icon.png");
-
 function normalizeUsernameValue(value = "") {
   return String(value || "").replace(/\s+/g, "").toUpperCase();
 }
@@ -118,11 +116,6 @@ export default function LoginScreen() {
       hideSubscription.remove();
     };
   }, []);
-
-  const schoolCodeHint = useMemo(() => {
-    const normalized = normalizeUsernameValue(username);
-    return normalized.length >= 3 ? normalized.slice(0, 3) : "";
-  }, [username]);
 
   const canSubmit = useMemo(
     () => !!normalizeUsernameValue(username) && !!String(password || "").trim() && !loading,
@@ -308,7 +301,7 @@ export default function LoginScreen() {
         <StatusBar style={statusBarStyle} />
         <View style={styles.bootWrap}>
           <View style={styles.bootCard}>
-            <Image source={APP_ICON} style={styles.bootLogo} resizeMode="contain" />
+            <Image source={require("../assets/images/login-logo.png")} style={styles.bootLogo} resizeMode="contain" />
             <ActivityIndicator color={colors.primary} size="large" />
             <Text style={styles.bootTitle}>Preparing your workspace</Text>
             <Text style={styles.bootText}>Checking your saved student session.</Text>
@@ -345,16 +338,9 @@ export default function LoginScreen() {
                 <Text style={styles.heroPillText}>Student app</Text>
               </View>
 
-              <Image source={APP_ICON} style={styles.logo} resizeMode="contain" />
+              <Image source={require("../assets/images/login-logo.png")} style={styles.logo} resizeMode="contain" />
               <Text style={styles.title}>Welcome back</Text>
               <Text style={styles.subtitle}>Sign in to continue to your student dashboard.</Text>
-
-              {schoolCodeHint ? (
-                <View style={styles.heroHintCard}>
-                  <Ionicons name="information-circle-outline" size={18} color={colors.primary} />
-                  <Text style={styles.heroHintText}>{`School code detected: ${schoolCodeHint}`}</Text>
-                </View>
-              ) : null}
             </View>
 
             <View style={styles.formCard}>
@@ -381,7 +367,7 @@ export default function LoginScreen() {
                   value={username}
                   onChangeText={(value) => {
                     setError("");
-                    setUsername(normalizeUsernameValue(value));
+                    setUsername(value);
                   }}
                   autoCapitalize="none"
                   autoCorrect={false}

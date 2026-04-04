@@ -12,8 +12,8 @@ import {
   TextInput,
   Platform,
   Alert,
-  Keyboard,
   Modal,
+  KeyboardAvoidingView,
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useRouter } from "expo-router";
@@ -23,7 +23,7 @@ import { getStorage, ref as storageRef, uploadBytes, getDownloadURL } from "fire
 import * as ImagePicker from "expo-image-picker";
 import { database } from "../constants/firebaseConfig";
 import { getOpenedChat, clearOpenedChat } from "./lib/chatStore";
-import { useSafeAreaInsets, SafeAreaView } from "react-native-safe-area-context";
+import { SafeAreaView } from "react-native-safe-area-context";
 // school-aware helpers
 import { getUserVal } from "./lib/userHelpers";
 import { useAppTheme } from "../hooks/use-app-theme";
@@ -86,7 +86,6 @@ async function getDbRef(subPath) {
 
 export default function MessagesScreen(props) {
   const router = useRouter();
-  const insets = useSafeAreaInsets();
   const storage = getStorage();
   const { colors, statusBarStyle } = useAppTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
@@ -118,9 +117,6 @@ export default function MessagesScreen(props) {
   const [sending, setSending] = useState(false);
   const [text, setText] = useState("");
   const [lastMessageMeta, setLastMessageMeta] = useState(null);
-
-  const [keyboardHeight, setKeyboardHeight] = useState(0);
-  const [keyboardVisible, setKeyboardVisible] = useState(false);
 
   const [viewerVisible, setViewerVisible] = useState(false);
   const [viewerImages, setViewerImages] = useState([]);
@@ -323,30 +319,6 @@ export default function MessagesScreen(props) {
       try { flatListRef.current && flatListRef.current.scrollToEnd({ animated: true }); } catch (e) {}
     }, 120);
   }, [messages]);
-
-  // Keyboard listeners
-  useEffect(() => {
-    const onShow = (e) => {
-      setKeyboardVisible(true);
-      const h = (e && e.endCoordinates && e.endCoordinates.height) ? e.endCoordinates.height : 300;
-      setKeyboardHeight(h);
-    };
-    const onHide = () => {
-      setKeyboardVisible(false);
-      setKeyboardHeight(0);
-    };
-
-    const showEvent = Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow";
-    const hideEvent = Platform.OS === "ios" ? "keyboardWillHide" : "keyboardDidHide";
-
-    const subShow = Keyboard.addListener(showEvent, onShow);
-    const subHide = Keyboard.addListener(hideEvent, onHide);
-
-    return () => {
-      subShow.remove();
-      subHide.remove();
-    };
-  }, []);
 
   const getResolvedUserId = async () => {
     if (currentUserId) return currentUserId;
@@ -903,9 +875,9 @@ export default function MessagesScreen(props) {
   };
 
   return (
-    <SafeAreaView style={[styles.safe, { paddingTop: insets.top }]} edges={["bottom"]}>
+    <SafeAreaView style={styles.safe} edges={["top", "bottom"]}>
       <StatusBar barStyle={statusBarStyle === "dark" ? "dark-content" : "light-content"} backgroundColor={colors.background} translucent={false} />
-      <View style={[styles.container, { paddingBottom: insets.bottom }]}>
+      <View style={styles.container}>
         {/* Header */}
         <View style={styles.header}>
           <TouchableOpacity style={styles.back} onPress={() => router.back()}>
@@ -922,47 +894,55 @@ export default function MessagesScreen(props) {
           </TouchableOpacity>
         </View>
 
-        {/* Messages */}
-        <View style={styles.messagesWrap}>
-          {loading ? (
-            <ActivityIndicator size="small" color={PRIMARY} style={{ marginTop: 24 }} />
-          ) : (
-            <FlatList
-              ref={flatListRef}
-              data={displayItems}
-              renderItem={renderMessage}
-              keyExtractor={(it, idx) => (it.type === "date" ? it.id : it.messageId || `${it.timeStamp}-${idx}`)}
-              showsVerticalScrollIndicator={false}
-              contentContainerStyle={{ paddingVertical: 12, paddingBottom: 12 + (keyboardVisible ? keyboardHeight : 0) }}
-              onContentSizeChange={() => flatListRef.current && flatListRef.current.scrollToEnd({ animated: true })}
+        <KeyboardAvoidingView
+          style={styles.chatArea}
+          behavior={Platform.OS === "ios" ? "padding" : undefined}
+          keyboardVerticalOffset={0}
+        >
+          {/* Messages */}
+          <View style={styles.messagesWrap}>
+            {loading ? (
+              <ActivityIndicator size="small" color={PRIMARY} style={{ marginTop: 24 }} />
+            ) : (
+              <FlatList
+                ref={flatListRef}
+                data={displayItems}
+                renderItem={renderMessage}
+                keyExtractor={(it, idx) => (it.type === "date" ? it.id : it.messageId || `${it.timeStamp}-${idx}`)}
+                showsVerticalScrollIndicator={false}
+                contentContainerStyle={styles.messagesContent}
+                keyboardDismissMode={Platform.OS === "ios" ? "interactive" : "on-drag"}
+                keyboardShouldPersistTaps="handled"
+                onContentSizeChange={() => flatListRef.current && flatListRef.current.scrollToEnd({ animated: true })}
+              />
+            )}
+          </View>
+
+          {/* Input */}
+          <View style={styles.inputRow}>
+            <TouchableOpacity onPress={pickImageAndSend} style={styles.attachmentBtn}>
+              <Ionicons name="image-outline" size={22} color={MUTED} />
+            </TouchableOpacity>
+
+            <TextInput
+              placeholder="Message"
+              placeholderTextColor={colors.muted}
+              value={text}
+              onChangeText={setText}
+              style={styles.input}
+              multiline
+              returnKeyType="send"
+              onSubmitEditing={sendMessage}
             />
-          )}
-        </View>
-
-        {/* Input */}
-        <View style={[styles.inputRow, { paddingBottom: Math.max(insets.bottom, 8), marginBottom: keyboardVisible ? keyboardHeight : 0 }]}>
-          <TouchableOpacity onPress={pickImageAndSend} style={styles.attachmentBtn}>
-            <Ionicons name="image-outline" size={22} color={MUTED} />
-          </TouchableOpacity>
-
-          <TextInput
-            placeholder="Message"
-            placeholderTextColor={colors.muted}
-            value={text}
-            onChangeText={setText}
-            style={styles.input}
-            multiline
-            returnKeyType="send"
-            onSubmitEditing={sendMessage}
-          />
-          <TouchableOpacity
-            style={[styles.sendBtn, (text.trim() ? styles.sendBtnActive : styles.sendBtnDisabled)]}
-            onPress={sendMessage}
-            disabled={!text.trim() || sending}
-          >
-            <Ionicons name="send" size={20} color={text.trim() ? colors.white : colors.muted} />
-          </TouchableOpacity>
-        </View>
+            <TouchableOpacity
+              style={[styles.sendBtn, (text.trim() ? styles.sendBtnActive : styles.sendBtnDisabled)]}
+              onPress={sendMessage}
+              disabled={!text.trim() || sending}
+            >
+              <Ionicons name="send" size={20} color={text.trim() ? colors.white : colors.muted} />
+            </TouchableOpacity>
+          </View>
+        </KeyboardAvoidingView>
 
         {/* Viewer fallback modal */}
         <Modal visible={viewerVisible && !viewerLibAvailable} transparent animationType="fade" onRequestClose={closeViewer}>
@@ -988,6 +968,7 @@ function createStyles(colors) {
   return StyleSheet.create({
   safe: { flex: 1, backgroundColor: colors.background },
   container: { flex: 1, backgroundColor: colors.background },
+  chatArea: { flex: 1 },
 
   header: { height: 62, flexDirection: "row", alignItems: "center", paddingHorizontal: 12, borderBottomColor: colors.separator, borderBottomWidth: 1, backgroundColor: colors.background },
   back: { width: 36, height: 36, alignItems: "center", justifyContent: "center" },
@@ -998,6 +979,7 @@ function createStyles(colors) {
   headerAvatar: { width: 36, height: 36, borderRadius: 18, backgroundColor: colors.surfaceMuted },
 
   messagesWrap: { flex: 1, paddingHorizontal: 12, backgroundColor: colors.background },
+  messagesContent: { paddingVertical: 12, paddingBottom: 12 },
 
   messageRow: { flexDirection: "row", marginVertical: 6, alignItems: "flex-end" },
   messageRowLeft: { justifyContent: "flex-start" },
