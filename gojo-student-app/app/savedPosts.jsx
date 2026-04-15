@@ -21,7 +21,7 @@ import { get, ref, runTransaction } from "firebase/database";
 import { database } from "../constants/firebaseConfig";
 import { useAppTheme } from "../hooks/use-app-theme";
 import useUserProfileCard from "../hooks/use-user-profile-card";
-import { getInstagramFeedAspectRatio } from "./lib/instagramMedia";
+import { getImageAspectRatio } from "./lib/instagramMedia";
 import { extractProfileImage, normalizeProfileImageUri } from "./lib/profileImage";
 import { getSavedPostsLocation, getSavedPostsMap, setSavedPostEntry } from "./lib/savedPosts";
 import { queryUserByChildInSchool, queryUserByUsernameInSchool } from "./lib/userHelpers";
@@ -83,6 +83,18 @@ function getPosterImage(admin, postData) {
   return null;
 }
 
+function getPosterLookupKeys(postData) {
+  return [postData?.adminId, postData?.userId, postData?.createdBy].filter(Boolean);
+}
+
+function getCachedPoster(cache, postData) {
+  const keys = getPosterLookupKeys(postData);
+  for (const key of keys) {
+    if (cache[key]) return cache[key];
+  }
+  return null;
+}
+
 export default function SavedPostsScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
@@ -124,7 +136,7 @@ export default function SavedPostsScreen() {
   }, []);
 
   const resolvePosterForPost = useCallback(async (postData, schoolKey) => {
-    const keys = [postData?.adminId, postData?.userId, postData?.createdBy].filter(Boolean);
+    const keys = getPosterLookupKeys(postData);
     if (!keys.length) return;
 
     const cached = keys.find((key) => adminCacheRef.current[key]);
@@ -204,7 +216,7 @@ export default function SavedPostsScreen() {
             if (!isStudentVisiblePost(data)) return null;
 
             await resolvePosterForPost(data, schoolKey);
-            const admin = adminCacheRef.current[data.adminId] || adminCacheRef.current[data.userId] || null;
+            const admin = getCachedPoster(adminCacheRef.current, data);
 
             const safePostImage = normalizeProfileImageUri(data.postUrl);
             const safeAdminImage = normalizeProfileImageUri(extractProfileImage(admin));
@@ -217,6 +229,7 @@ export default function SavedPostsScreen() {
               admin,
               savedAt: Number(meta?.savedAt || 0),
               likesMap: data.likes || {},
+              schoolKey,
             };
           } catch {
             return null;
@@ -361,7 +374,7 @@ export default function SavedPostsScreen() {
         };
       }
 
-      getInstagramFeedAspectRatio(imageUri).then((nextAspectRatio) => {
+      getImageAspectRatio(imageUri).then((nextAspectRatio) => {
         if (active) setMediaAspectRatio(nextAspectRatio);
       });
 
@@ -394,7 +407,7 @@ export default function SavedPostsScreen() {
                 data?.userId,
                 data?.createdBy,
               ].filter(Boolean),
-              fallbackSchoolCode: admin?._schoolKey,
+              fallbackSchoolCode: admin?._schoolKey || item.schoolKey || null,
               fallbackUser: admin,
               fallbackName: posterName,
               fallbackAvatar: posterImage,
@@ -438,7 +451,7 @@ export default function SavedPostsScreen() {
               setViewerVisible(true);
             }}
           >
-            <Image source={{ uri: imageUri }} style={[styles.postImage, { aspectRatio: mediaAspectRatio }]} resizeMode="cover" />
+            <Image source={{ uri: imageUri }} style={[styles.postImage, { aspectRatio: mediaAspectRatio }]} resizeMode="contain" />
           </TouchableOpacity>
         ) : null}
 

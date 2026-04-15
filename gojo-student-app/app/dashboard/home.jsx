@@ -12,6 +12,7 @@ import {
   Animated,
   Modal,
   Pressable,
+  Dimensions,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
@@ -36,7 +37,6 @@ import { queryUserByUsernameInSchool, queryUserByChildInSchool } from "../lib/us
 import { useAppTheme } from "../../hooks/use-app-theme";
 import useUserProfileCard from "../../hooks/use-user-profile-card";
 import { extractProfileImage, normalizeProfileImageUri } from "../lib/profileImage";
-import { getInstagramFeedAspectRatio } from "../lib/instagramMedia";
 import { getSavedPostsLocation, toggleSavedPostEntry } from "../lib/savedPosts";
 
 /**
@@ -48,6 +48,8 @@ import { getSavedPostsLocation, toggleSavedPostEntry } from "../lib/savedPosts";
 
 const PAGE_SIZE = 20;
 const DESCRIPTION_PREVIEW_LENGTH = 140;
+const SCREEN_WIDTH = Dimensions.get("window").width;
+const IMAGE_HEIGHT = Math.round(SCREEN_WIDTH * 0.9 * 0.65);
 
 function getFileExtensionFromUrl(url) {
   if (!url) return "jpg";
@@ -121,6 +123,18 @@ function getPosterImage(admin, postData) {
   return null;
 }
 
+function getPosterLookupKeys(postData) {
+  return [postData?.adminId, postData?.userId, postData?.createdBy].filter(Boolean);
+}
+
+function getCachedPoster(cache, postData) {
+  const keys = getPosterLookupKeys(postData);
+  for (const key of keys) {
+    if (cache[key]) return cache[key];
+  }
+  return null;
+}
+
 export default function HomeScreen() {
   const { colors } = useAppTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
@@ -144,6 +158,7 @@ export default function HomeScreen() {
   const adminCacheRef = useRef({});
   const postsQueryRef = useRef(null);
   const savedPostsQueryRef = useRef(null);
+  const hasUserScrolledFeedRef = useRef(false);
 
   const loadUserContext = useCallback(async () => {
     const uid = await AsyncStorage.getItem("userId");
@@ -205,7 +220,7 @@ export default function HomeScreen() {
   }, []);
 
   const resolvePosterForPost = useCallback(async (postData, schoolKey) => {
-    const keys = [postData?.adminId, postData?.userId, postData?.createdBy].filter(Boolean);
+    const keys = getPosterLookupKeys(postData);
     if (!keys.length) return;
 
     const cached = keys.find((k) => adminCacheRef.current[k]);
@@ -326,13 +341,8 @@ export default function HomeScreen() {
               seenNode[currentUserId] = true;
             }
 
-            const admin =
-              adminCacheRef.current[p.data.adminId] ||
-              adminCacheRef.current[p.data.userId] ||
-              null;
-            const imageUri = normalizeProfileImageUri(p.data.postUrl);
-            const aspectRatio = imageUri ? await getInstagramFeedAspectRatio(imageUri) : 1;
-            return { postId: p.postId, data: p.data, admin, likesMap: likesNode, seenMap: seenNode, aspectRatio };
+            const admin = getCachedPoster(adminCacheRef.current, p.data);
+            return { postId: p.postId, data: p.data, admin, likesMap: likesNode, seenMap: seenNode, schoolKey };
           }));
 
           enriched.forEach((e) => {
@@ -462,13 +472,8 @@ export default function HomeScreen() {
       const enrichedOlder = await Promise.all(filteredByTarget.map(async (p) => {
         const likesNode = p.data.likes || {};
         const seenNode = p.data.seenBy || {};
-        const admin =
-          adminCacheRef.current[p.data.adminId] ||
-          adminCacheRef.current[p.data.userId] ||
-          null;
-        const imageUri = normalizeProfileImageUri(p.data.postUrl);
-        const aspectRatio = imageUri ? await getInstagramFeedAspectRatio(imageUri) : 1;
-        return { postId: p.postId, data: p.data, admin, likesMap: likesNode, seenMap: seenNode, aspectRatio };
+        const admin = getCachedPoster(adminCacheRef.current, p.data);
+        return { postId: p.postId, data: p.data, admin, likesMap: likesNode, seenMap: seenNode, schoolKey };
       }));
 
       enrichedOlder.forEach((e) => {
@@ -541,9 +546,10 @@ export default function HomeScreen() {
           const updated = {
             postId: val.postId || postId,
             data: val,
+            admin: found?.admin || getCachedPoster(adminCacheRef.current, val),
             likesMap: val.likes || {},
             seenMap: val.seenBy || {},
-            aspectRatio: found?.aspectRatio || 1,
+            schoolKey: found?.schoolKey || null,
           };
           setPostsLatest((prev) => prev.map((p) => (p.postId === postId ? updated : p)));
           setPostsOlder((prev) => prev.map((p) => (p.postId === postId ? updated : p)));
@@ -605,6 +611,10 @@ export default function HomeScreen() {
 
   const openPostMenu = useCallback((postId) => {
     setPostMenuPostId(postId);
+  }, []);
+
+  const markFeedScrollStarted = useCallback(() => {
+    hasUserScrolledFeedRef.current = true;
   }, []);
 
   const handleReportPost = useCallback(() => {
@@ -689,7 +699,6 @@ export default function HomeScreen() {
     const isLiked = userId ? !!likesMap[userId] : false;
     const isSaved = !!savedPostsMap[postId];
     const imageUri = normalizeProfileImageUri(data.postUrl);
-    const mediaAspectRatio = item.aspectRatio || 1;
     const message = String(data.message || "").trim();
     const targetRoleLabel = formatTargetRoleLabel(data);
     const posterName = getPosterName(admin, data);
@@ -727,7 +736,7 @@ export default function HomeScreen() {
                 item.data?.userId,
                 item.data?.createdBy,
               ].filter(Boolean),
-              fallbackSchoolCode: item.admin?._schoolKey,
+              fallbackSchoolCode: item.admin?._schoolKey || item.schoolKey || null,
               fallbackUser: item.admin,
               fallbackName: posterName,
               fallbackAvatar: posterImage,
@@ -773,7 +782,7 @@ export default function HomeScreen() {
               setViewerVisible(true);
             }}
           >
-            <Image source={{ uri: imageUri }} style={[styles.postImage, { aspectRatio: mediaAspectRatio }]} resizeMode="cover" />
+            <Image source={{ uri: imageUri }} style={styles.postImage} resizeMode="contain" />
           </Pressable>
         ) : null}
 
@@ -842,8 +851,11 @@ export default function HomeScreen() {
         renderItem={({ item }) => <PostCard item={item} />}
         contentContainerStyle={[styles.list, { paddingBottom: 74 + Math.max(insets.bottom, 6) }]}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={[colors.primary]} tintColor={colors.primary} />}
-        onEndReachedThreshold={0.6}
+        onScrollBeginDrag={markFeedScrollStarted}
+        onMomentumScrollBegin={markFeedScrollStarted}
+        onEndReachedThreshold={0.18}
         onEndReached={() => {
+          if (!hasUserScrolledFeedRef.current) return;
           if (!loadingMore && hasMore) loadMore();
         }}
         ListFooterComponent={<ListFooter />}
@@ -952,6 +964,7 @@ function createStyles(colors) {
 
   postImage: {
     width: "100%",
+    height: IMAGE_HEIGHT,
     backgroundColor: colors.surfaceMuted,
   },
   reactionsSummary: {

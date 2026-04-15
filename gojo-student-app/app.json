@@ -3,8 +3,8 @@
     "name": "gojo-student-app",
     "slug": "gojo-student-app",
     "version": "1.0.0",
-    "orientation": "portrait",
-    "icon": "./assets/images/logo.png",
+    "orientation": "default",
+    "icon": "./assets/images/app-icon.png",
     "scheme": "gojostudentapp",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
@@ -13,8 +13,10 @@
     },
     "android": {
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
-        "foregroundImage": "./assets/images/logo.png"
+        "backgroundColor": "#EAF4FF",
+        "backgroundImage": "./assets/images/android-icon-background.png",
+        "foregroundImage": "./assets/images/app-icon-foreground.png",
+        "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
@@ -44,14 +46,16 @@
           "photosPermission": "Allow Gojo Student App to access your photos.",
           "savePhotosPermission": "Allow Gojo Student App to save images to your gallery."
         }
-      ],
+      ]
+    ,
       [
         "expo-splash-screen",
         {
-          "image": "./assets/images/splash-icon.png",
-          "backgroundColor": "#F6F8FC",
+          "image": "./assets/images/splash-students.png",
+          "imageWidth": 1,
+          "backgroundColor": "#F2F8FF",
           "dark": {
-            "backgroundColor": "#17212B"
+            "backgroundColor": "#07111B"
           }
         }
       ]

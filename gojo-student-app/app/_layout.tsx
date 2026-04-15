@@ -3,10 +3,12 @@ import { ThemeProvider } from "@react-navigation/native";
 import { AppState, SafeAreaView, StyleSheet, View, Text, TouchableOpacity, Animated, Easing, Modal, Platform } from "react-native";
 import { Stack, usePathname, useRouter } from "expo-router";
 import { StatusBar } from "expo-status-bar";
+import * as ScreenOrientation from "expo-screen-orientation";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { getValue } from "./lib/dbHelpers";
+import AppLaunchSplash from "../components/ui/app-launch-splash";
 import PasscodePanel from "../components/passcode-panel";
 import { AppLockProvider } from "../hooks/use-app-lock";
 import {
@@ -57,17 +59,19 @@ export default function RootLayout() {
 function ThemedRootLayout() {
   const router = useRouter();
   const pathname = usePathname();
-  const insets = useSafeAreaInsets();
   const { colors, navigationTheme, statusBarStyle } = useAppTheme();
   const bootRedirectDoneRef = useRef(false);
   const appStateRef = useRef(AppState.currentState);
   const sessionSyncDoneRef = useRef(false);
-  const [appLock, setAppLock] = useState(DEFAULT_APP_LOCK_STATE);
+  const [appLock, setAppLock] = useState<any>(DEFAULT_APP_LOCK_STATE);
   const [appLocked, setAppLocked] = useState(false);
+  const [bootReady, setBootReady] = useState(false);
+  const [minimumSplashElapsed, setMinimumSplashElapsed] = useState(false);
   const [unlockCode, setUnlockCode] = useState("");
   const [unlockError, setUnlockError] = useState("");
   const currentPath = String(pathname || "/");
   const isPublicRoute = currentPath === "/" || currentPath === "/index";
+  const showLaunchSplash = !bootReady || !minimumSplashElapsed;
 
   const resetAppLockState = useCallback(() => {
     AsyncStorage.removeItem(APP_LOCK_LAST_INACTIVE_AT_KEY).catch(() => null);
@@ -155,6 +159,12 @@ function ThemedRootLayout() {
     };
   }, []);
 
+  useEffect(() => {
+    if (Platform.OS === "web") return;
+
+    ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP).catch(() => null);
+  }, [currentPath]);
+
   const syncSessionAccess = useCallback(async (options?: { forceAppLock?: boolean }) => {
     const shouldForceHome = isPublicRoute || currentPath === "/setting";
     const evaluateAutoLock = !sessionSyncDoneRef.current || Boolean(options?.forceAppLock);
@@ -198,10 +208,30 @@ function ThemedRootLayout() {
   }, [currentPath, isPublicRoute, resetAppLockState, router, syncAppLockState]);
 
   useEffect(() => {
-    syncSessionAccess().catch((error) => {
-      console.warn("Session sync error:", error);
-    });
+    let active = true;
+
+    syncSessionAccess()
+      .catch((error) => {
+        console.warn("Session sync error:", error);
+      })
+      .finally(() => {
+        if (active) {
+          setBootReady(true);
+        }
+      });
+
+    return () => {
+      active = false;
+    };
   }, [syncSessionAccess]);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setMinimumSplashElapsed(true);
+    }, 1800);
+
+    return () => clearTimeout(timer);
+  }, []);
 
   useEffect(() => {
     const subscription = AppState.addEventListener("change", (nextState) => {
@@ -287,10 +317,17 @@ function ThemedRootLayout() {
                 errorText={unlockError}
                 onDigitPress={handleUnlockDigit}
                 onBackspace={handleUnlockBackspace}
+                /* supply optional action props to satisfy TS consumers */
+                secondaryLabel=""
+                onSecondaryPress={() => {}}
+                primaryLabel=""
+                onPrimaryPress={() => {}}
                 footerNote="Tap the lock icon on the home page header to lock Gojo Study instantly on this phone."
               />
             </View>
           </Modal>
+
+          {showLaunchSplash ? <AppLaunchSplash /> : null}
         </SafeAreaView>
       </ThemeProvider>
     </AppLockProvider>

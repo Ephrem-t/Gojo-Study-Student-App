@@ -283,10 +283,6 @@ export default function DashboardLayout() {
     </View>
   );
 
-  const HomeHeaderRight = () => (
-    <View style={styles.headerLeftSpacer} />
-  );
-
   const ExamTabIcon = ({ color, size }) => (
     <View style={[styles.tabIconShell, styles.examTabIconWrap]}>
       <Ionicons name="document-text-outline" size={size - 1} color={color} />
@@ -445,7 +441,6 @@ export default function DashboardLayout() {
           name="home"
           options={{
             title: "Home",
-            headerLeft: () => <HomeHeaderRight />,
             headerTitle: () => <HomeHeaderTitle />,
             headerRight: () => <HomeHeaderLeft />,
             tabBarIcon: ({ color, focused }) => <HomeTabIcon color={color} focused={focused} />,
@@ -579,10 +574,6 @@ function createStyles(colors) {
     flexDirection: "row",
     alignItems: "center",
     marginRight: 12,
-  },
-
-  headerLeftSpacer: {
-    width: 46,
   },
 
   profileImage: {

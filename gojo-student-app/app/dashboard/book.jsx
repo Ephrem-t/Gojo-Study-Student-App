@@ -16,12 +16,14 @@ import {
   Switch,
   Animated,
   PanResponder,
+  Platform,
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { ref, get, remove, update } from "firebase/database";
 import { database } from "../../constants/firebaseConfig";
 import { Ionicons } from "@expo/vector-icons";
 import * as FileSystem from "expo-file-system/legacy";
+import * as ScreenOrientation from "expo-screen-orientation";
 import { resolveNoteColorTag } from "../lib/noteColors";
 import { useRouter, useFocusEffect } from "expo-router";
 import NativePdfView, { nativePdfUnavailableMessage } from "../../components/native-pdf-view";
@@ -32,6 +34,9 @@ const MAX_NOTES_PER_CHAPTER = 5;
 const BOOKS_DIR = `${FileSystem.documentDirectory}books/`;
 const DOWNLOAD_INDEX_KEY = "downloaded_books_index_v1";
 const BOOK_SETTINGS_KEY = "book_settings_v1";
+const READER_PROGRESS_KEY = "book_reader_progress_v1";
+const READER_MODE_SCROLL = "scroll";
+const READER_MODE_PAGED = "paged";
 
 function sha1(msg) {
   function rotl(n, s) { return (n << s) | (n >>> (32 - s)); }
@@ -149,6 +154,30 @@ function normalizeChapterNotes(value) {
     .filter((note) => typeof note === "object" && (typeof note.text === "string" || typeof note.title === "string"));
 }
 
+function clampPositivePage(value, fallback = 1) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.floor(parsed);
+}
+
+function normalizeReaderMode(value) {
+  return value === READER_MODE_PAGED ? READER_MODE_PAGED : READER_MODE_SCROLL;
+}
+
+function createInitialViewerState(readerMode = READER_MODE_SCROLL) {
+  return {
+    visible: false,
+    title: "",
+    subjectName: "",
+    localUri: null,
+    reloadKey: 0,
+    initialPage: 1,
+    currentPage: 1,
+    totalPages: 0,
+    readerMode: normalizeReaderMode(readerMode),
+  };
+}
+
 export default function BooksScreen() {
   const router = useRouter();
   const { colors, resolvedAppearance } = useAppTheme();
@@ -174,6 +203,7 @@ export default function BooksScreen() {
     showDownloadedOnly: false,
     autoExpandSubjects: false,
     compactMode: false,
+    readerMode: READER_MODE_SCROLL,
   });
 
   const [downloadProgress, setDownloadProgress] = useState({});
@@ -183,13 +213,7 @@ export default function BooksScreen() {
   const [downloadedFilesList, setDownloadedFilesList] = useState([]);
   const [managerVisible, setManagerVisible] = useState(false);
 
-  const [viewer, setViewer] = useState({
-    visible: false,
-    title: "",
-    subjectName: "",
-    localUri: null,
-    reloadKey: 0,
-  });
+  const [viewer, setViewer] = useState(() => createInitialViewerState());
   const [viewerLoading, setViewerLoading] = useState(false);
   const [notesMap, setNotesMap] = useState({});
   const [noteSheet, setNoteSheet] = useState({ visible: false, subject: null, unit: null });
@@ -199,6 +223,8 @@ export default function BooksScreen() {
   const [showFloatingIndicators, setShowFloatingIndicators] = useState(false);
 
   const floatingAnimValue = useRef(new Animated.Value(0)).current;
+  const readerProgressRef = useRef({});
+  const readerProgressSaveTimeoutRef = useRef(null);
 
   const ensureBooksDir = useCallback(async () => {
     const info = await FileSystem.getInfoAsync(BOOKS_DIR);
@@ -221,6 +247,71 @@ export default function BooksScreen() {
       await AsyncStorage.setItem(BOOK_SETTINGS_KEY, JSON.stringify(next));
     } catch {}
   }, []);
+
+  const loadReaderProgressIndex = useCallback(async () => {
+    try {
+      const raw = await AsyncStorage.getItem(READER_PROGRESS_KEY);
+      const parsed = raw ? JSON.parse(raw) : {};
+      readerProgressRef.current = parsed && typeof parsed === "object" ? parsed : {};
+      return readerProgressRef.current;
+    } catch {
+      readerProgressRef.current = {};
+      return {};
+    }
+  }, []);
+
+  const flushReaderProgress = useCallback(async () => {
+    if (readerProgressSaveTimeoutRef.current) {
+      clearTimeout(readerProgressSaveTimeoutRef.current);
+      readerProgressSaveTimeoutRef.current = null;
+    }
+
+    try {
+      await AsyncStorage.setItem(READER_PROGRESS_KEY, JSON.stringify(readerProgressRef.current));
+    } catch {}
+  }, []);
+
+  const queueReaderProgressSave = useCallback((localUri, page, totalPages = 0) => {
+    if (!localUri) return;
+
+    readerProgressRef.current = {
+      ...readerProgressRef.current,
+      [localUri]: {
+        page: clampPositivePage(page, 1),
+        totalPages: Math.max(0, Number(totalPages || 0)),
+        updatedAt: Date.now(),
+      },
+    };
+
+    if (readerProgressSaveTimeoutRef.current) {
+      clearTimeout(readerProgressSaveTimeoutRef.current);
+    }
+
+    readerProgressSaveTimeoutRef.current = setTimeout(() => {
+      AsyncStorage.setItem(READER_PROGRESS_KEY, JSON.stringify(readerProgressRef.current)).catch(() => null);
+      readerProgressSaveTimeoutRef.current = null;
+    }, 250);
+  }, []);
+
+  useEffect(() => {
+    loadReaderProgressIndex().catch(() => null);
+  }, [loadReaderProgressIndex]);
+
+  useEffect(() => {
+    return () => {
+      flushReaderProgress().catch(() => null);
+    };
+  }, [flushReaderProgress]);
+
+  useEffect(() => {
+    if (Platform.OS === "web" || !viewer.visible || !NativePdfView) return undefined;
+
+    ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.ALL_BUT_UPSIDE_DOWN).catch(() => null);
+
+    return () => {
+      ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP).catch(() => null);
+    };
+  }, [viewer.visible]);
 
   const downloadedUriSet = useMemo(() => {
   return new Set(downloadedFilesList.map((f) => f.uri));
@@ -417,16 +508,12 @@ export default function BooksScreen() {
 
   const closeViewer = useCallback(() => {
     setViewerLoading(false);
-    setViewer({
-      visible: false,
-      title: "",
-      subjectName: "",
-      localUri: null,
-      reloadKey: 0,
-    });
-  }, []);
+    queueReaderProgressSave(viewer.localUri, viewer.currentPage, viewer.totalPages);
+    flushReaderProgress().catch(() => null);
+    setViewer(createInitialViewerState(settings.readerMode));
+  }, [flushReaderProgress, queueReaderProgressSave, settings.readerMode, viewer.currentPage, viewer.localUri, viewer.totalPages]);
 
-  const openLocalPdfInViewer = useCallback((localUri, title, subjectName = "") => {
+  const openLocalPdfInViewer = useCallback(async (localUri, title, subjectName = "") => {
     if (!localUri) {
       Alert.alert("Unable to load", "This chapter is not downloaded on your phone yet.");
       return;
@@ -437,6 +524,13 @@ export default function BooksScreen() {
       return;
     }
 
+    const progressIndex = await loadReaderProgressIndex();
+    const savedProgress = progressIndex?.[localUri] || {};
+    const knownTotalPages = Math.max(0, Number(savedProgress.totalPages || 0));
+    const initialPage = knownTotalPages
+      ? Math.min(clampPositivePage(savedProgress.page, 1), knownTotalPages)
+      : clampPositivePage(savedProgress.page, 1);
+
     setViewerLoading(true);
     setViewer({
       visible: true,
@@ -444,8 +538,12 @@ export default function BooksScreen() {
       subjectName,
       localUri,
       reloadKey: 0,
+      initialPage,
+      currentPage: initialPage,
+      totalPages: knownTotalPages,
+      readerMode: normalizeReaderMode(settings.readerMode),
     });
-  }, []);
+  }, [loadReaderProgressIndex, settings.readerMode]);
 
   const reloadViewer = useCallback(() => {
     setViewerLoading(true);
@@ -454,9 +552,56 @@ export default function BooksScreen() {
       return {
         ...prev,
         reloadKey: prev.reloadKey + 1,
+        initialPage: clampPositivePage(prev.currentPage, prev.initialPage),
       };
     });
   }, []);
+
+  const handleViewerLoadComplete = useCallback((numberOfPages) => {
+    const safeTotalPages = Math.max(0, Number(numberOfPages || 0));
+    const fallbackPage = clampPositivePage(viewer.currentPage, 1);
+    const nextPage = safeTotalPages ? Math.min(fallbackPage, safeTotalPages) : fallbackPage;
+
+    setViewerLoading(false);
+    setViewer((prev) => ({
+      ...prev,
+      totalPages: safeTotalPages,
+      initialPage: safeTotalPages ? Math.min(clampPositivePage(prev.initialPage, 1), safeTotalPages) : clampPositivePage(prev.initialPage, 1),
+      currentPage: nextPage,
+    }));
+
+    if (viewer.localUri) {
+      queueReaderProgressSave(viewer.localUri, nextPage, safeTotalPages);
+    }
+  }, [queueReaderProgressSave, viewer.currentPage, viewer.localUri]);
+
+  const handleViewerPageChanged = useCallback((page, numberOfPages) => {
+    const safePage = clampPositivePage(page, 1);
+    const safeTotalPages = Math.max(0, Number(numberOfPages || viewer.totalPages || 0));
+
+    setViewer((prev) => ({
+      ...prev,
+      currentPage: safePage,
+      totalPages: safeTotalPages || prev.totalPages,
+    }));
+
+    if (viewer.localUri) {
+      queueReaderProgressSave(viewer.localUri, safePage, safeTotalPages || viewer.totalPages);
+    }
+  }, [queueReaderProgressSave, viewer.localUri, viewer.totalPages]);
+
+  const handleViewerModeToggle = useCallback(() => {
+    const nextMode = viewer.readerMode === READER_MODE_PAGED ? READER_MODE_SCROLL : READER_MODE_PAGED;
+
+    setViewer((prev) => ({
+      ...prev,
+      readerMode: nextMode,
+      reloadKey: prev.reloadKey + 1,
+      initialPage: clampPositivePage(prev.currentPage, prev.initialPage),
+    }));
+
+    updateSetting("readerMode", nextMode).catch(() => null);
+  }, [updateSetting, viewer.readerMode]);
 
   const deleteFile = useCallback(async (file) => {
     await FileSystem.deleteAsync(file.uri, { idempotent: true });
@@ -702,10 +847,6 @@ export default function BooksScreen() {
     });
   }, [router, schoolCode, studentId, studentGrade]);
 
-  const openNoteEditor = useCallback((subject, unit) => {
-    openNoteEditorWithId(subject, unit, null);
-  }, [openNoteEditorWithId]);
-
   const openNoteSheet = useCallback((subject, unit) => {
     setNoteSheet({ visible: true, subject, unit });
   }, []);
@@ -865,6 +1006,14 @@ export default function BooksScreen() {
     if (settings.compactMode) out.push("Compact");
     return out;
   }, [settings]);
+
+  const readerStatusLabel = useMemo(() => {
+    const modeLabel = viewer.readerMode === READER_MODE_PAGED ? "Page swipe mode" : "Fit-width scroll mode";
+    if (viewer.initialPage > 1) {
+      return `Resumes at page ${viewer.initialPage} | ${modeLabel}`;
+    }
+    return modeLabel;
+  }, [viewer.initialPage, viewer.readerMode]);
 
   const handleScroll = useCallback((e) => {
     const y = e.nativeEvent.contentOffset.y;
@@ -1188,7 +1337,9 @@ export default function BooksScreen() {
           </TouchableOpacity>
         </View>
 
-        <Animated.View style={[
+        <Animated.View
+          pointerEvents={showFloatingIndicators ? "auto" : "none"}
+          style={[
           styles.floatingIndicatorsWrap,
           {
             transform: [{ translateY: floatingAnimValue.interpolate({
@@ -1466,6 +1617,43 @@ export default function BooksScreen() {
 
                 <Text style={styles.settingsSectionTitle}>Preferences</Text>
 
+                <Text style={styles.settingsSectionTitle}>Reader</Text>
+                <View style={styles.languageWrap}>
+                  <TouchableOpacity
+                    onPress={() => updateSetting("readerMode", READER_MODE_SCROLL)}
+                    style={[
+                      styles.filterChip,
+                      normalizeReaderMode(settings.readerMode) === READER_MODE_SCROLL ? styles.filterChipOn : null,
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.filterChipText,
+                        normalizeReaderMode(settings.readerMode) === READER_MODE_SCROLL ? styles.filterChipTextOn : null,
+                      ]}
+                    >
+                      Fit-width Scroll
+                    </Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    onPress={() => updateSetting("readerMode", READER_MODE_PAGED)}
+                    style={[
+                      styles.filterChip,
+                      normalizeReaderMode(settings.readerMode) === READER_MODE_PAGED ? styles.filterChipOn : null,
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.filterChipText,
+                        normalizeReaderMode(settings.readerMode) === READER_MODE_PAGED ? styles.filterChipTextOn : null,
+                      ]}
+                    >
+                      Page Swipe
+                    </Text>
+                  </TouchableOpacity>
+                </View>
+
                 <View style={styles.settingRow}>
                   <View style={{ flex: 1 }}>
                     <Text style={styles.settingTitle}>Show downloaded only</Text>
@@ -1523,26 +1711,48 @@ export default function BooksScreen() {
                 <Text style={styles.readerSubtitle} numberOfLines={1}>{viewer.subjectName}</Text>
               )}
               <Text style={styles.readerStatusText} numberOfLines={1}>
-                Opened from your phone storage
+                {readerStatusLabel}
               </Text>
             </View>
 
-            <TouchableOpacity
-              onPress={reloadViewer}
-              style={styles.readerHeaderIconBtn}
-            >
-              <Ionicons name="refresh" size={18} color={PRIMARY} />
-            </TouchableOpacity>
+            <View style={styles.readerHeaderActions}>
+              <TouchableOpacity
+                onPress={handleViewerModeToggle}
+                style={[styles.readerHeaderIconBtn, viewer.readerMode === READER_MODE_PAGED && styles.readerModeBtnActive]}
+              >
+                <Ionicons
+                  name={viewer.readerMode === READER_MODE_PAGED ? "albums-outline" : "reader-outline"}
+                  size={18}
+                  color={PRIMARY}
+                />
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                onPress={reloadViewer}
+                style={styles.readerHeaderIconBtn}
+              >
+                <Ionicons name="refresh" size={18} color={PRIMARY} />
+              </TouchableOpacity>
+            </View>
           </View>
 
           <View style={styles.readerBodyWrap}>
             {viewer.localUri && NativePdfView ? (
               <>
                 <NativePdfView
-                  key={`${viewer.localUri}-${viewer.reloadKey}`}
-                  source={{ uri: viewer.localUri }}
+                  key={`${viewer.localUri}-${viewer.reloadKey}-${viewer.readerMode}`}
+                  source={{ uri: viewer.localUri, cache: true }}
+                  page={viewer.initialPage}
                   style={styles.readerWebView}
-                  onLoadComplete={() => setViewerLoading(false)}
+                  fitPolicy={0}
+                  minScale={1}
+                  maxScale={4}
+                  spacing={viewer.readerMode === READER_MODE_PAGED ? 0 : 12}
+                  horizontal={viewer.readerMode === READER_MODE_PAGED}
+                  enablePaging={viewer.readerMode === READER_MODE_PAGED}
+                  enableAnnotationRendering
+                  onLoadComplete={handleViewerLoadComplete}
+                  onPageChanged={handleViewerPageChanged}
                   onError={(error) => {
                     console.warn("Textbook PDF load error:", error);
                     setViewerLoading(false);
@@ -1550,6 +1760,13 @@ export default function BooksScreen() {
                   }}
                   enableDoubleTapZoom
                 />
+
+                <View style={styles.readerPageChip}>
+                  <Ionicons name="bookmark-outline" size={14} color={PRIMARY} />
+                  <Text style={styles.readerPageChipText}>
+                    Page {viewer.currentPage} / {viewer.totalPages || "--"}
+                  </Text>
+                </View>
 
                 {viewerLoading ? (
                   <View style={styles.readerLoadingOverlay}>
@@ -2086,6 +2303,16 @@ function createStyles(colors) {
     alignItems: "center",
     justifyContent: "center",
   },
+  readerHeaderActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginLeft: 8,
+  },
+  readerModeBtnActive: {
+    backgroundColor: colors.soft,
+    borderColor: PRIMARY,
+    marginRight: 8,
+  },
   readerTitleWrap: {
     flex: 1,
     marginHorizontal: 10,
@@ -2126,6 +2353,30 @@ function createStyles(colors) {
   readerWebView: {
     flex: 1,
     backgroundColor: BG,
+  },
+  readerPageChip: {
+    position: "absolute",
+    right: 16,
+    bottom: 16,
+    flexDirection: "row",
+    alignItems: "center",
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    backgroundColor: colors.card,
+    borderWidth: 1,
+    borderColor: BORDER,
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.08,
+    shadowRadius: 12,
+    elevation: 3,
+  },
+  readerPageChipText: {
+    marginLeft: 6,
+    fontSize: 12,
+    fontWeight: "800",
+    color: TEXT,
   },
   readerLoadingOverlay: {
     ...StyleSheet.absoluteFillObject,
