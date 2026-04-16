@@ -16,7 +16,9 @@ import {
   Switch,
   Animated,
   PanResponder,
+  Linking,
   Platform,
+  useWindowDimensions,
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { ref, get, remove, update } from "firebase/database";
@@ -24,7 +26,13 @@ import { database } from "../../constants/firebaseConfig";
 import { Ionicons } from "@expo/vector-icons";
 import * as FileSystem from "expo-file-system/legacy";
 import * as ScreenOrientation from "expo-screen-orientation";
+import { openBrowserAsync, WebBrowserPresentationStyle } from "expo-web-browser";
 import { resolveNoteColorTag } from "../lib/noteColors";
+import {
+  deletePdfTextSearchIndex,
+  ensurePdfTextSearchIndex,
+  searchPdfTextSearchIndex,
+} from "../lib/pdfTextSearch";
 import { useRouter, useFocusEffect } from "expo-router";
 import NativePdfView, { nativePdfUnavailableMessage } from "../../components/native-pdf-view";
 import { useAppTheme } from "../../hooks/use-app-theme";
@@ -35,8 +43,10 @@ const BOOKS_DIR = `${FileSystem.documentDirectory}books/`;
 const DOWNLOAD_INDEX_KEY = "downloaded_books_index_v1";
 const BOOK_SETTINGS_KEY = "book_settings_v1";
 const READER_PROGRESS_KEY = "book_reader_progress_v1";
+const READER_BOOKMARKS_KEY = "book_reader_bookmarks_v1";
 const READER_MODE_SCROLL = "scroll";
 const READER_MODE_PAGED = "paged";
+const READER_SEARCH_RESULT_LIMIT = 40;
 
 function sha1(msg) {
   function rotl(n, s) { return (n << s) | (n >>> (32 - s)); }
@@ -160,6 +170,62 @@ function clampPositivePage(value, fallback = 1) {
   return Math.floor(parsed);
 }
 
+function clampPageWithinBounds(value, totalPages = 0, fallback = 1) {
+  const nextPage = clampPositivePage(value, fallback);
+  return totalPages > 0 ? Math.min(nextPage, totalPages) : nextPage;
+}
+
+function flattenPdfTableContents(entries, depth = 0, seed = "outline") {
+  if (!Array.isArray(entries)) return [];
+
+  return entries.flatMap((entry, index) => {
+    const title = String(entry?.title || "").trim();
+    const page = clampPositivePage(Number(entry?.pageIdx) + 1, 1);
+    const key = `${seed}-${depth}-${index}-${page}-${title || "untitled"}`;
+    const currentEntry = title ? [{ key, title, page, depth }] : [];
+
+    return currentEntry.concat(flattenPdfTableContents(entry?.children || [], depth + 1, key));
+  });
+}
+
+function normalizeStoredReaderBookmarks(value) {
+  if (!Array.isArray(value)) return [];
+
+  const seenPages = new Set();
+
+  return value
+    .map((entry, index) => {
+      const page = clampPositivePage(entry?.page, 0);
+      if (!page) return null;
+
+      const label = String(entry?.label || `Page ${page}`).trim() || `Page ${page}`;
+      const note = String(entry?.note || "").trim();
+      const createdAt = Number(entry?.createdAt || Date.now() + index);
+      const updatedAt = Number(entry?.updatedAt || createdAt);
+
+      return {
+        page,
+        label,
+        note,
+        createdAt,
+        updatedAt,
+      };
+    })
+    .filter((entry) => {
+      if (!entry) return false;
+      if (seenPages.has(entry.page)) return false;
+      seenPages.add(entry.page);
+      return true;
+    })
+    .sort((a, b) => a.page - b.page || a.createdAt - b.createdAt);
+}
+
+function getFilenameFromLocalUri(localUri) {
+  const normalized = String(localUri || "").split("?")[0].split("#")[0];
+  const parts = normalized.split("/").filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : null;
+}
+
 function normalizeReaderMode(value) {
   return value === READER_MODE_PAGED ? READER_MODE_PAGED : READER_MODE_SCROLL;
 }
@@ -178,8 +244,21 @@ function createInitialViewerState(readerMode = READER_MODE_SCROLL) {
   };
 }
 
+function createInitialReaderTextIndexState(localUri = null) {
+  return {
+    localUri,
+    status: "idle",
+    pageCount: 0,
+    indexedPages: 0,
+    error: "",
+    fromCache: false,
+    lastUpdated: 0,
+  };
+}
+
 export default function BooksScreen() {
   const router = useRouter();
+  const { width: windowWidth, height: windowHeight } = useWindowDimensions();
   const { colors, resolvedAppearance } = useAppTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
 
@@ -215,16 +294,69 @@ export default function BooksScreen() {
 
   const [viewer, setViewer] = useState(() => createInitialViewerState());
   const [viewerLoading, setViewerLoading] = useState(false);
+  const [viewerLoadProgress, setViewerLoadProgress] = useState(0);
   const [notesMap, setNotesMap] = useState({});
   const [noteSheet, setNoteSheet] = useState({ visible: false, subject: null, unit: null });
   const [noteReader, setNoteReader] = useState({ visible: false, subject: null, unit: null, note: null });
   const [brokenCoverMap, setBrokenCoverMap] = useState({});
+  const [readerJumpVisible, setReaderJumpVisible] = useState(false);
+  const [readerJumpInput, setReaderJumpInput] = useState("1");
+  const [readerBookmarksVisible, setReaderBookmarksVisible] = useState(false);
+  const [readerOutlineVisible, setReaderOutlineVisible] = useState(false);
+  const [readerBookmarks, setReaderBookmarks] = useState([]);
+  const [readerOutline, setReaderOutline] = useState([]);
+  const [bookmarkEditor, setBookmarkEditor] = useState({ visible: false, page: 1, label: "", note: "" });
+  const [readerSearchVisible, setReaderSearchVisible] = useState(false);
+  const [readerSearchQuery, setReaderSearchQuery] = useState("");
+  const [readerTextIndexState, setReaderTextIndexState] = useState(() => createInitialReaderTextIndexState());
+  const [readerChromeVisible, setReaderChromeVisible] = useState(true);
 
   const [showFloatingIndicators, setShowFloatingIndicators] = useState(false);
 
   const floatingAnimValue = useRef(new Animated.Value(0)).current;
+  const readerChromeAnimValue = useRef(new Animated.Value(1)).current;
+  const readerChromeHideTimeoutRef = useRef(null);
   const readerProgressRef = useRef({});
   const readerProgressSaveTimeoutRef = useRef(null);
+  const readerBookmarksRef = useRef({});
+  const viewerLocalUriRef = useRef(null);
+  const pdfViewRef = useRef(null);
+  const readerTextIndexRef = useRef(null);
+  const readerTextIndexRequestRef = useRef(0);
+  const readerHiddenCloseTapRef = useRef(0);
+
+  const isLandscapeLayout = windowWidth > windowHeight;
+  const isTabletLayout = Math.min(windowWidth, windowHeight) >= 768;
+  const isReaderWideLayout = viewer.visible && (isTabletLayout || windowWidth >= 900);
+  const readerToolsEnabled = false;
+
+  const readerHeaderStyle = [
+    styles.readerHeader,
+    isLandscapeLayout && styles.readerHeaderLandscape,
+    isReaderWideLayout && styles.readerHeaderWide,
+  ];
+  const readerToolRowStyle = [
+    styles.readerToolRow,
+    isReaderWideLayout && styles.readerToolRowWide,
+  ];
+  const readerBodyWrapStyle = [
+    styles.readerBodyWrap,
+    isReaderWideLayout && styles.readerBodyWrapWide,
+  ];
+  const readerPageChipStyle = [
+    styles.readerPageChip,
+    isReaderWideLayout && styles.readerPageChipWide,
+  ];
+  const readerBottomDockStyle = [
+    styles.readerBottomDock,
+    isReaderWideLayout && styles.readerBottomDockWide,
+  ];
+  const readerPanelSheetStyle = [
+    styles.bottomSheet,
+    (isLandscapeLayout || isReaderWideLayout) && styles.readerPanelFloatingSheet,
+    isLandscapeLayout && styles.readerPanelLandscapeSheet,
+    isReaderWideLayout && styles.readerPanelTabletSheet,
+  ];
 
   const ensureBooksDir = useCallback(async () => {
     const info = await FileSystem.getInfoAsync(BOOKS_DIR);
@@ -256,6 +388,18 @@ export default function BooksScreen() {
       return readerProgressRef.current;
     } catch {
       readerProgressRef.current = {};
+      return {};
+    }
+  }, []);
+
+  const loadReaderBookmarksIndex = useCallback(async () => {
+    try {
+      const raw = await AsyncStorage.getItem(READER_BOOKMARKS_KEY);
+      const parsed = raw ? JSON.parse(raw) : {};
+      readerBookmarksRef.current = parsed && typeof parsed === "object" ? parsed : {};
+      return readerBookmarksRef.current;
+    } catch {
+      readerBookmarksRef.current = {};
       return {};
     }
   }, []);
@@ -293,15 +437,216 @@ export default function BooksScreen() {
     }, 250);
   }, []);
 
+  const persistBookmarksForLocalUri = useCallback(async (localUri, entries) => {
+    if (!localUri) return;
+
+    const normalized = normalizeStoredReaderBookmarks(entries);
+    const nextIndex = { ...readerBookmarksRef.current };
+
+    if (normalized.length) nextIndex[localUri] = normalized;
+    else delete nextIndex[localUri];
+
+    readerBookmarksRef.current = nextIndex;
+
+    if (viewerLocalUriRef.current === localUri) {
+      setReaderBookmarks(normalized);
+    }
+
+    try {
+      await AsyncStorage.setItem(READER_BOOKMARKS_KEY, JSON.stringify(nextIndex));
+    } catch {}
+  }, []);
+
+  const removeReaderArtifactsForLocalUri = useCallback(async (
+    localUri,
+    { clearProgress = true, clearBookmarks = true } = {}
+  ) => {
+    if (!localUri) return;
+
+    const writes = [];
+
+    if (clearProgress && readerProgressRef.current[localUri]) {
+      const nextProgress = { ...readerProgressRef.current };
+      delete nextProgress[localUri];
+      readerProgressRef.current = nextProgress;
+      writes.push(AsyncStorage.setItem(READER_PROGRESS_KEY, JSON.stringify(nextProgress)).catch(() => null));
+    }
+
+    if (clearBookmarks && readerBookmarksRef.current[localUri]) {
+      const nextBookmarks = { ...readerBookmarksRef.current };
+      delete nextBookmarks[localUri];
+      readerBookmarksRef.current = nextBookmarks;
+
+      if (viewerLocalUriRef.current === localUri) {
+        setReaderBookmarks([]);
+      }
+
+      writes.push(AsyncStorage.setItem(READER_BOOKMARKS_KEY, JSON.stringify(nextBookmarks)).catch(() => null));
+    }
+
+    if (writes.length) {
+      await Promise.all(writes);
+    }
+  }, []);
+
+  const ensureReaderTextIndex = useCallback(async (localUri, { force = false } = {}) => {
+    if (!localUri) return null;
+
+    if (
+      !force &&
+      readerTextIndexRef.current &&
+      readerTextIndexState.localUri === localUri &&
+      readerTextIndexState.status === "ready"
+    ) {
+      return readerTextIndexRef.current;
+    }
+
+    const requestId = readerTextIndexRequestRef.current + 1;
+    readerTextIndexRequestRef.current = requestId;
+
+    setReaderTextIndexState((prev) => ({
+      ...createInitialReaderTextIndexState(localUri),
+      status: "indexing",
+      pageCount: prev.localUri === localUri ? prev.pageCount : 0,
+      indexedPages: prev.localUri === localUri ? prev.indexedPages : 0,
+    }));
+
+    try {
+      const { index, fromCache } = await ensurePdfTextSearchIndex(localUri, {
+        force,
+        onProgress: ({ page, pageCount }) => {
+          if (readerTextIndexRequestRef.current !== requestId) return;
+
+          setReaderTextIndexState((prev) => ({
+            ...prev,
+            localUri,
+            status: "indexing",
+            pageCount,
+            indexedPages: page,
+            error: "",
+            fromCache: false,
+          }));
+        },
+      });
+
+      if (readerTextIndexRequestRef.current !== requestId) {
+        return null;
+      }
+
+      readerTextIndexRef.current = index;
+      setReaderTextIndexState({
+        localUri,
+        status: "ready",
+        pageCount: index.pageCount,
+        indexedPages: index.pageCount,
+        error: "",
+        fromCache,
+        lastUpdated: Date.now(),
+      });
+      return index;
+    } catch (error) {
+      if (readerTextIndexRequestRef.current !== requestId) {
+        return null;
+      }
+
+      readerTextIndexRef.current = null;
+      setReaderTextIndexState({
+        ...createInitialReaderTextIndexState(localUri),
+        status: "error",
+        error: error?.message || "Could not index the PDF text.",
+        lastUpdated: Date.now(),
+      });
+      return null;
+    }
+  }, [readerTextIndexState.localUri, readerTextIndexState.status]);
+
   useEffect(() => {
     loadReaderProgressIndex().catch(() => null);
   }, [loadReaderProgressIndex]);
+
+  useEffect(() => {
+    loadReaderBookmarksIndex().catch(() => null);
+  }, [loadReaderBookmarksIndex]);
+
+  useEffect(() => {
+    viewerLocalUriRef.current = viewer.localUri;
+  }, [viewer.localUri]);
+
+  useEffect(() => {
+    readerTextIndexRequestRef.current += 1;
+    readerTextIndexRef.current = null;
+    setReaderTextIndexState(createInitialReaderTextIndexState(viewer.localUri || null));
+  }, [viewer.localUri]);
+
+  useEffect(() => {
+    setReaderChromeVisible(true);
+  }, [viewer.localUri, viewer.visible]);
+
+  useEffect(() => {
+    Animated.timing(readerChromeAnimValue, {
+      toValue: readerChromeVisible ? 1 : 0,
+      duration: readerChromeVisible ? 220 : 180,
+      useNativeDriver: true,
+    }).start();
+  }, [readerChromeAnimValue, readerChromeVisible]);
+
+  useEffect(() => {
+    if (!readerToolsEnabled) return undefined;
+
+    if (readerChromeHideTimeoutRef.current) {
+      clearTimeout(readerChromeHideTimeoutRef.current);
+      readerChromeHideTimeoutRef.current = null;
+    }
+
+    if (
+      !viewer.visible ||
+      !readerChromeVisible ||
+      viewerLoading ||
+      readerJumpVisible ||
+      readerBookmarksVisible ||
+      readerOutlineVisible ||
+      readerSearchVisible ||
+      bookmarkEditor.visible
+    ) {
+      return undefined;
+    }
+
+    readerChromeHideTimeoutRef.current = setTimeout(() => {
+      setReaderChromeVisible(false);
+      readerChromeHideTimeoutRef.current = null;
+    }, 4200);
+
+    return () => {
+      if (readerChromeHideTimeoutRef.current) {
+        clearTimeout(readerChromeHideTimeoutRef.current);
+        readerChromeHideTimeoutRef.current = null;
+      }
+    };
+  }, [
+    bookmarkEditor.visible,
+    readerBookmarksVisible,
+    readerChromeVisible,
+    readerJumpVisible,
+    readerOutlineVisible,
+    readerSearchVisible,
+    viewer.currentPage,
+    viewer.visible,
+    viewerLoading,
+    readerToolsEnabled,
+  ]);
 
   useEffect(() => {
     return () => {
       flushReaderProgress().catch(() => null);
     };
   }, [flushReaderProgress]);
+
+  useEffect(() => {
+    if (!readerSearchVisible || !viewer.localUri) return;
+    if (readerTextIndexState.status === "ready" || readerTextIndexState.status === "indexing") return;
+
+    ensureReaderTextIndex(viewer.localUri).catch(() => null);
+  }, [ensureReaderTextIndex, readerSearchVisible, readerTextIndexState.status, viewer.localUri]);
 
   useEffect(() => {
     if (Platform.OS === "web" || !viewer.visible || !NativePdfView) return undefined;
@@ -379,6 +724,16 @@ export default function BooksScreen() {
     }
   }, [loadDownloadIndex, saveDownloadIndex]);
 
+  const getDownloadMetadataForLocalUri = useCallback(async (localUri) => {
+    const filename = getFilenameFromLocalUri(localUri);
+    if (!filename) return null;
+
+    const idx = await loadDownloadIndex();
+    const meta = idx[filename];
+
+    return meta ? { filename, ...meta } : null;
+  }, [loadDownloadIndex]);
+
   const refreshDownloadedFiles = useCallback(async () => {
     await ensureBooksDir();
     const idx = await loadDownloadIndex();
@@ -410,6 +765,44 @@ export default function BooksScreen() {
     setDownloadedFilesList(list);
   }, [ensureBooksDir, loadDownloadIndex, removeDownloadMetadata]);
 
+  const deleteLocalPdfCopy = useCallback(async (
+    localUri,
+    {
+      removeMetadata = true,
+      clearProgress = true,
+      clearBookmarks = true,
+      refreshList = true,
+    } = {}
+  ) => {
+    if (!localUri) return;
+
+    const filename = getFilenameFromLocalUri(localUri);
+
+    try {
+      const info = await FileSystem.getInfoAsync(localUri);
+      if (info?.exists) {
+        await FileSystem.deleteAsync(localUri, { idempotent: true });
+      }
+    } catch {}
+
+    if (removeMetadata && filename) {
+      await removeDownloadMetadata(filename);
+    }
+
+    await deletePdfTextSearchIndex(localUri);
+    await removeReaderArtifactsForLocalUri(localUri, { clearProgress, clearBookmarks });
+
+    if (viewerLocalUriRef.current === localUri) {
+      readerTextIndexRequestRef.current += 1;
+      readerTextIndexRef.current = null;
+      setReaderTextIndexState(createInitialReaderTextIndexState(null));
+    }
+
+    if (refreshList) {
+      await refreshDownloadedFiles();
+    }
+  }, [refreshDownloadedFiles, removeDownloadMetadata, removeReaderArtifactsForLocalUri]);
+
   const cancelDownload = useCallback(async (url) => {
     const active = activeDownloadsRef.current[url];
     if (active?.resumable?.cancelAsync) {
@@ -417,8 +810,10 @@ export default function BooksScreen() {
     }
 
     const localPath = getLocalPathForUrl(url);
-    const info = await FileSystem.getInfoAsync(localPath);
-    if (info.exists) await FileSystem.deleteAsync(localPath, { idempotent: true });
+    if (localPath) {
+      const info = await FileSystem.getInfoAsync(localPath);
+      if (info.exists) await FileSystem.deleteAsync(localPath, { idempotent: true });
+    }
 
     setDownloadingMap((s) => {
       const c = { ...s };
@@ -506,14 +901,43 @@ export default function BooksScreen() {
     }
   }, [ensureBooksDir, getLocalPathForUrl, registerDownloadMetadata, refreshDownloadedFiles]);
 
+  const closeReaderPanels = useCallback(() => {
+    setReaderJumpVisible(false);
+    setReaderBookmarksVisible(false);
+    setReaderOutlineVisible(false);
+    setReaderSearchVisible(false);
+  }, []);
+
   const closeViewer = useCallback(() => {
+    readerHiddenCloseTapRef.current = 0;
     setViewerLoading(false);
+    setViewerLoadProgress(0);
+    setReaderChromeVisible(true);
+    closeReaderPanels();
+    readerTextIndexRequestRef.current += 1;
     queueReaderProgressSave(viewer.localUri, viewer.currentPage, viewer.totalPages);
     flushReaderProgress().catch(() => null);
+    setReaderOutline([]);
+    setReaderJumpInput("1");
+    setBookmarkEditor({ visible: false, page: 1, label: "", note: "" });
+    setReaderSearchQuery("");
+    pdfViewRef.current = null;
     setViewer(createInitialViewerState(settings.readerMode));
-  }, [flushReaderProgress, queueReaderProgressSave, settings.readerMode, viewer.currentPage, viewer.localUri, viewer.totalPages]);
+  }, [closeReaderPanels, flushReaderProgress, queueReaderProgressSave, settings.readerMode, viewer.currentPage, viewer.localUri, viewer.totalPages]);
 
-  const openLocalPdfInViewer = useCallback(async (localUri, title, subjectName = "") => {
+  const handleReaderHiddenClosePress = useCallback(() => {
+    const now = Date.now();
+
+    if (now - readerHiddenCloseTapRef.current <= 320) {
+      readerHiddenCloseTapRef.current = 0;
+      closeViewer();
+      return;
+    }
+
+    readerHiddenCloseTapRef.current = now;
+  }, [closeViewer]);
+
+  const openLocalPdfInViewer = useCallback((localUri, title, subjectName = "") => {
     if (!localUri) {
       Alert.alert("Unable to load", "This chapter is not downloaded on your phone yet.");
       return;
@@ -524,14 +948,22 @@ export default function BooksScreen() {
       return;
     }
 
-    const progressIndex = await loadReaderProgressIndex();
+    const progressIndex = readerProgressRef.current;
+    const bookmarkIndex = readerBookmarksRef.current;
     const savedProgress = progressIndex?.[localUri] || {};
     const knownTotalPages = Math.max(0, Number(savedProgress.totalPages || 0));
     const initialPage = knownTotalPages
       ? Math.min(clampPositivePage(savedProgress.page, 1), knownTotalPages)
       : clampPositivePage(savedProgress.page, 1);
 
-    setViewerLoading(true);
+    setReaderBookmarks(normalizeStoredReaderBookmarks(bookmarkIndex?.[localUri]));
+    setReaderOutline([]);
+    setReaderJumpInput(String(initialPage));
+    setBookmarkEditor({ visible: false, page: initialPage, label: "", note: "" });
+    setReaderSearchQuery("");
+    setReaderChromeVisible(true);
+    setViewerLoading(false);
+    setViewerLoadProgress(0);
     setViewer({
       visible: true,
       title,
@@ -543,10 +975,21 @@ export default function BooksScreen() {
       totalPages: knownTotalPages,
       readerMode: normalizeReaderMode(settings.readerMode),
     });
-  }, [loadReaderProgressIndex, settings.readerMode]);
+  }, [settings.readerMode]);
 
-  const reloadViewer = useCallback(() => {
+  const reloadViewer = useCallback(async () => {
+    if (!viewer.localUri) return;
+
+    const localInfo = await FileSystem.getInfoAsync(viewer.localUri).catch(() => null);
+    if (!localInfo?.exists || Number(localInfo.size || 0) <= 0) {
+      setViewerLoading(false);
+      setViewerLoadProgress(0);
+      Alert.alert("Saved copy missing", "This chapter file is no longer available on your phone.");
+      return;
+    }
+
     setViewerLoading(true);
+    setViewerLoadProgress(0);
     setViewer((prev) => {
       if (!prev.localUri) return prev;
       return {
@@ -555,14 +998,17 @@ export default function BooksScreen() {
         initialPage: clampPositivePage(prev.currentPage, prev.initialPage),
       };
     });
-  }, []);
+  }, [viewer.localUri]);
 
-  const handleViewerLoadComplete = useCallback((numberOfPages) => {
+  const handleViewerLoadComplete = useCallback((numberOfPages, _path, _size, tableContents = []) => {
     const safeTotalPages = Math.max(0, Number(numberOfPages || 0));
     const fallbackPage = clampPositivePage(viewer.currentPage, 1);
     const nextPage = safeTotalPages ? Math.min(fallbackPage, safeTotalPages) : fallbackPage;
 
     setViewerLoading(false);
+    setViewerLoadProgress(1);
+    setReaderOutline(flattenPdfTableContents(tableContents));
+    setReaderJumpInput(String(nextPage));
     setViewer((prev) => ({
       ...prev,
       totalPages: safeTotalPages,
@@ -570,25 +1016,393 @@ export default function BooksScreen() {
       currentPage: nextPage,
     }));
 
-    if (viewer.localUri) {
-      queueReaderProgressSave(viewer.localUri, nextPage, safeTotalPages);
+    if (viewerLocalUriRef.current) {
+      queueReaderProgressSave(viewerLocalUriRef.current, nextPage, safeTotalPages);
     }
-  }, [queueReaderProgressSave, viewer.currentPage, viewer.localUri]);
+  }, [queueReaderProgressSave, viewer.currentPage]);
 
   const handleViewerPageChanged = useCallback((page, numberOfPages) => {
     const safePage = clampPositivePage(page, 1);
     const safeTotalPages = Math.max(0, Number(numberOfPages || viewer.totalPages || 0));
 
+    setReaderJumpInput(String(safePage));
     setViewer((prev) => ({
       ...prev,
       currentPage: safePage,
       totalPages: safeTotalPages || prev.totalPages,
     }));
 
-    if (viewer.localUri) {
-      queueReaderProgressSave(viewer.localUri, safePage, safeTotalPages || viewer.totalPages);
+    if (viewerLocalUriRef.current) {
+      queueReaderProgressSave(viewerLocalUriRef.current, safePage, safeTotalPages || viewer.totalPages);
     }
-  }, [queueReaderProgressSave, viewer.localUri, viewer.totalPages]);
+  }, [queueReaderProgressSave, viewer.totalPages]);
+
+  const jumpToReaderPage = useCallback((requestedPage, { closePanels = false } = {}) => {
+    const safePage = clampPageWithinBounds(requestedPage, viewer.totalPages, viewer.currentPage || 1);
+
+    if (pdfViewRef.current?.setPage) {
+      pdfViewRef.current.setPage(safePage);
+      setViewer((prev) => ({
+        ...prev,
+        currentPage: safePage,
+        initialPage: safePage,
+      }));
+    } else {
+      setViewer((prev) => ({
+        ...prev,
+        currentPage: safePage,
+        initialPage: safePage,
+        reloadKey: prev.reloadKey + 1,
+      }));
+    }
+
+    setReaderJumpInput(String(safePage));
+
+    if (viewerLocalUriRef.current) {
+      queueReaderProgressSave(viewerLocalUriRef.current, safePage, viewer.totalPages);
+    }
+
+    if (closePanels) {
+      closeReaderPanels();
+    }
+  }, [closeReaderPanels, queueReaderProgressSave, viewer.currentPage, viewer.totalPages]);
+
+  const submitReaderJump = useCallback(() => {
+    if (!viewer.totalPages) {
+      Alert.alert("Page count unavailable", "Wait for the chapter to finish loading before jumping to a page.");
+      return;
+    }
+
+    const requestedPage = Number(readerJumpInput);
+    if (!Number.isFinite(requestedPage)) {
+      Alert.alert("Invalid page", `Enter a page number between 1 and ${viewer.totalPages}.`);
+      return;
+    }
+
+    jumpToReaderPage(requestedPage, { closePanels: true });
+  }, [jumpToReaderPage, readerJumpInput, viewer.totalPages]);
+
+  const currentReaderBookmark = useMemo(() => {
+    return readerBookmarks.find((entry) => entry.page === viewer.currentPage) || null;
+  }, [readerBookmarks, viewer.currentPage]);
+
+  const editingReaderBookmark = useMemo(() => {
+    return readerBookmarks.find((entry) => entry.page === bookmarkEditor.page) || null;
+  }, [bookmarkEditor.page, readerBookmarks]);
+
+  const getBookmarkLabelForPage = useCallback((page) => {
+    const exactMatch = readerOutline.find((entry) => entry.page === page);
+    return exactMatch?.title || `Page ${page}`;
+  }, [readerOutline]);
+
+  const openBookmarkEditor = useCallback((page = viewer.currentPage) => {
+    const safePage = clampPageWithinBounds(page, viewer.totalPages, viewer.currentPage || 1);
+    const existing = readerBookmarks.find((entry) => entry.page === safePage);
+
+    closeReaderPanels();
+    setReaderChromeVisible(true);
+    setBookmarkEditor({
+      visible: true,
+      page: safePage,
+      label: existing?.label || getBookmarkLabelForPage(safePage),
+      note: existing?.note || "",
+    });
+  }, [closeReaderPanels, getBookmarkLabelForPage, readerBookmarks, viewer.currentPage, viewer.totalPages]);
+
+  const closeBookmarkEditor = useCallback(() => {
+    setBookmarkEditor({ visible: false, page: 1, label: "", note: "" });
+  }, []);
+
+  const saveReaderBookmarkDraft = useCallback(async () => {
+    const localUri = viewerLocalUriRef.current;
+    if (!localUri) return;
+
+    const safePage = clampPageWithinBounds(bookmarkEditor.page, viewer.totalPages, viewer.currentPage || 1);
+    const existing = readerBookmarks.find((entry) => entry.page === safePage);
+    const label = String(bookmarkEditor.label || "").trim() || getBookmarkLabelForPage(safePage);
+    const note = String(bookmarkEditor.note || "").trim();
+    const nextBookmarks = readerBookmarks
+      .filter((entry) => entry.page !== safePage)
+      .concat({
+        page: safePage,
+        label,
+        note,
+        createdAt: existing?.createdAt || Date.now(),
+        updatedAt: Date.now(),
+      });
+
+    await persistBookmarksForLocalUri(localUri, nextBookmarks);
+    closeBookmarkEditor();
+  }, [bookmarkEditor.label, bookmarkEditor.note, bookmarkEditor.page, closeBookmarkEditor, getBookmarkLabelForPage, persistBookmarksForLocalUri, readerBookmarks, viewer.currentPage, viewer.totalPages]);
+
+  const deleteReaderBookmark = useCallback(async (page = viewer.currentPage) => {
+    const localUri = viewerLocalUriRef.current;
+    if (!localUri) return;
+
+    const safePage = clampPageWithinBounds(page, viewer.totalPages, viewer.currentPage || 1);
+    const nextBookmarks = readerBookmarks.filter((entry) => entry.page !== safePage);
+
+    await persistBookmarksForLocalUri(localUri, nextBookmarks);
+
+    if (bookmarkEditor.visible && bookmarkEditor.page === safePage) {
+      closeBookmarkEditor();
+    }
+  }, [bookmarkEditor.page, bookmarkEditor.visible, closeBookmarkEditor, persistBookmarksForLocalUri, readerBookmarks, viewer.currentPage, viewer.totalPages]);
+
+  const retryReaderTextIndex = useCallback(() => {
+    if (!viewer.localUri) return;
+    ensureReaderTextIndex(viewer.localUri, { force: true }).catch(() => null);
+  }, [ensureReaderTextIndex, viewer.localUri]);
+
+  const openReaderSearch = useCallback(() => {
+    closeReaderPanels();
+    setReaderChromeVisible(true);
+    setReaderSearchQuery("");
+    setReaderSearchVisible(true);
+  }, [closeReaderPanels]);
+
+  const openReaderJumpPanel = useCallback(() => {
+    closeReaderPanels();
+    setReaderChromeVisible(true);
+    setReaderJumpInput(String(clampPositivePage(viewer.currentPage, 1)));
+    setReaderJumpVisible(true);
+  }, [closeReaderPanels, viewer.currentPage]);
+
+  const enterReaderFocusMode = useCallback(() => {
+    if (viewerLoading) return;
+    closeReaderPanels();
+    setReaderChromeVisible(false);
+  }, [closeReaderPanels, viewerLoading]);
+
+  const handleReaderPageTap = useCallback((page, x = 0) => {
+    if (viewerLoading) return;
+
+    const safeTapX = Number(x || 0);
+    const leftZone = windowWidth * 0.28;
+    const rightZone = windowWidth * 0.72;
+
+    if (!readerToolsEnabled) {
+      if (viewer.readerMode === READER_MODE_PAGED) {
+        if (safeTapX <= leftZone && viewer.currentPage > 1) {
+          jumpToReaderPage(viewer.currentPage - 1);
+        } else if (safeTapX >= rightZone && (!viewer.totalPages || viewer.currentPage < viewer.totalPages)) {
+          jumpToReaderPage(viewer.currentPage + 1);
+        }
+      }
+
+      return;
+    }
+
+    if (!readerChromeVisible && viewer.readerMode === READER_MODE_PAGED) {
+      if (safeTapX <= leftZone && viewer.currentPage > 1) {
+        jumpToReaderPage(viewer.currentPage - 1);
+        return;
+      }
+
+      if (safeTapX >= rightZone && (!viewer.totalPages || viewer.currentPage < viewer.totalPages)) {
+        jumpToReaderPage(viewer.currentPage + 1);
+        return;
+      }
+    }
+
+    setReaderChromeVisible((prev) => {
+      const next = !prev;
+      if (!next) {
+        closeReaderPanels();
+      }
+      return next;
+    });
+  }, [
+    closeReaderPanels,
+    jumpToReaderPage,
+    readerChromeVisible,
+    viewer.currentPage,
+    viewer.readerMode,
+    viewer.totalPages,
+    viewerLoading,
+    windowWidth,
+    readerToolsEnabled,
+  ]);
+
+  const readerSearchResults = useMemo(() => {
+    const rawQuery = String(readerSearchQuery || "").trim();
+    const query = rawQuery.toLowerCase();
+    const numericQuery = /^\d+$/.test(query) ? Number(query) : 0;
+    const canJumpDirectly = numericQuery > 0 && (!viewer.totalPages || numericQuery <= viewer.totalPages);
+    const textIndex = readerTextIndexState.lastUpdated >= 0 ? readerTextIndexRef.current : null;
+
+    const directResults = canJumpDirectly
+      ? [{
+          key: `page-${numericQuery}`,
+          kind: "page",
+          kindLabel: "Jump",
+          title: `Go to page ${numericQuery}`,
+          subtitle: "Direct page jump",
+          note: "",
+          page: numericQuery,
+          depth: 0,
+        }]
+      : [];
+
+    const bookmarkResults = readerBookmarks
+      .filter((entry) => {
+        if (!query) return true;
+        return [entry.label, entry.note, `page ${entry.page}`, String(entry.page)]
+          .some((part) => String(part || "").toLowerCase().includes(query));
+      })
+      .map((entry) => ({
+        key: `bookmark-${entry.page}`,
+        kind: "bookmark",
+        kindLabel: "Bookmark",
+        title: entry.label,
+        subtitle: `Page ${entry.page}`,
+        note: entry.note || "",
+        page: entry.page,
+        depth: 0,
+      }));
+
+    const outlineResults = readerOutline
+      .filter((entry) => {
+        if (!query) return true;
+        return [entry.title, `page ${entry.page}`, String(entry.page)]
+          .some((part) => String(part || "").toLowerCase().includes(query));
+      })
+      .map((entry) => ({
+        key: `outline-${entry.key}`,
+        kind: "outline",
+        kindLabel: "Contents",
+        title: entry.title,
+        subtitle: `Page ${entry.page}`,
+        note: "",
+        page: entry.page,
+        depth: entry.depth,
+      }));
+
+    const reservedResults = query
+      ? directResults.length + bookmarkResults.length + outlineResults.length
+      : bookmarkResults.length + outlineResults.length;
+    const textResults = query && readerTextIndexState.status === "ready"
+      ? searchPdfTextSearchIndex(
+          textIndex,
+          rawQuery,
+          Math.max(0, READER_SEARCH_RESULT_LIMIT - reservedResults)
+        )
+      : [];
+
+    const merged = query
+      ? directResults.concat(bookmarkResults, outlineResults, textResults)
+      : bookmarkResults.concat(outlineResults.slice(0, READER_SEARCH_RESULT_LIMIT));
+
+    return merged.slice(0, READER_SEARCH_RESULT_LIMIT);
+  }, [readerBookmarks, readerOutline, readerSearchQuery, readerTextIndexState.lastUpdated, readerTextIndexState.status, viewer.totalPages]);
+
+  const readerSearchStatusLabel = useMemo(() => {
+    if (readerTextIndexState.status === "indexing") {
+      return readerTextIndexState.pageCount
+        ? `Preparing full text search... ${readerTextIndexState.indexedPages}/${readerTextIndexState.pageCount} pages indexed.`
+        : "Preparing full text search...";
+    }
+
+    if (readerTextIndexState.status === "ready") {
+      return readerTextIndexState.fromCache
+        ? `Full text search ready across ${readerTextIndexState.pageCount} pages. Cached for faster reuse.`
+        : `Full text search ready across ${readerTextIndexState.pageCount} pages.`;
+    }
+
+    if (readerTextIndexState.status === "error") {
+      return readerTextIndexState.error || "Full text indexing failed for this PDF.";
+    }
+
+    return "Search full PDF text, bookmarks, and chapter contents.";
+  }, [readerTextIndexState.error, readerTextIndexState.fromCache, readerTextIndexState.indexedPages, readerTextIndexState.pageCount, readerTextIndexState.status]);
+
+  const handleViewerLinkPress = useCallback(async (href) => {
+    const url = String(href || "").trim();
+    if (!url) return;
+
+    const normalizedUrl = url.replace(/\s+/g, "");
+    const pageMatch = normalizedUrl.match(/^#?page[=:/](\d+)$/i);
+
+    if (pageMatch) {
+      jumpToReaderPage(Number(pageMatch[1]), { closePanels: true });
+      return;
+    }
+
+    try {
+      if (/^https?:\/\//i.test(url)) {
+        await openBrowserAsync(url, {
+          presentationStyle: WebBrowserPresentationStyle.AUTOMATIC,
+        });
+        return;
+      }
+
+      const supported = await Linking.canOpenURL(url);
+      if (!supported) {
+        Alert.alert("Unsupported link", "This PDF link cannot be opened on this device.");
+        return;
+      }
+
+      await Linking.openURL(url);
+    } catch (error) {
+      console.warn("PDF link open error:", error);
+      Alert.alert("Unable to open link", "This link could not be opened from the PDF.");
+    }
+  }, [jumpToReaderPage]);
+
+  const repairAndReopenPdf = useCallback(async (localUri, fallbackMeta = null) => {
+    const metadata = fallbackMeta || await getDownloadMetadataForLocalUri(localUri);
+
+    if (!metadata?.url) {
+      Alert.alert("Repair unavailable", "This saved PDF has no source URL to download again.");
+      return;
+    }
+
+    setViewerLoading(true);
+    setViewerLoadProgress(0);
+
+    try {
+      await deleteLocalPdfCopy(localUri, {
+        removeMetadata: true,
+        clearProgress: false,
+        clearBookmarks: false,
+        refreshList: false,
+      });
+
+      const freshUri = await downloadToLocal(metadata.url, {
+        title: metadata.title || viewer.title,
+        subjectName: metadata.subjectName || viewer.subjectName,
+      });
+
+      await refreshDownloadedFiles();
+      await openLocalPdfInViewer(freshUri, metadata.title || viewer.title, metadata.subjectName || viewer.subjectName || "");
+    } catch (error) {
+      console.warn("Textbook PDF repair error:", error);
+      setViewerLoading(false);
+      setViewerLoadProgress(0);
+      Alert.alert("Repair failed", "A fresh copy could not be downloaded right now.");
+    }
+  }, [deleteLocalPdfCopy, downloadToLocal, getDownloadMetadataForLocalUri, openLocalPdfInViewer, refreshDownloadedFiles, viewer.subjectName, viewer.title]);
+
+  const handleViewerError = useCallback(async (error) => {
+    console.warn("Textbook PDF load error:", error);
+    setViewerLoading(false);
+    setViewerLoadProgress(0);
+
+    const localUri = viewerLocalUriRef.current;
+    const metadata = localUri ? await getDownloadMetadataForLocalUri(localUri) : null;
+
+    Alert.alert(
+      "Couldn’t open this chapter",
+      metadata?.url
+        ? "The saved PDF looks damaged or incomplete. Retry it, or replace the cached copy with a fresh download."
+        : "The saved PDF looks damaged or incomplete. Retry it, or close and open the chapter again from the list.",
+      [
+        { text: "Close", style: "cancel", onPress: closeViewer },
+        { text: "Retry", onPress: () => reloadViewer() },
+        ...(metadata?.url ? [{ text: "Redownload", onPress: () => repairAndReopenPdf(localUri, metadata) }] : []),
+      ]
+    );
+  }, [closeViewer, getDownloadMetadataForLocalUri, reloadViewer, repairAndReopenPdf]);
 
   const handleViewerModeToggle = useCallback(() => {
     const nextMode = viewer.readerMode === READER_MODE_PAGED ? READER_MODE_SCROLL : READER_MODE_PAGED;
@@ -604,10 +1418,12 @@ export default function BooksScreen() {
   }, [updateSetting, viewer.readerMode]);
 
   const deleteFile = useCallback(async (file) => {
-    await FileSystem.deleteAsync(file.uri, { idempotent: true });
-    await removeDownloadMetadata(file.name);
-    await refreshDownloadedFiles();
-  }, [removeDownloadMetadata, refreshDownloadedFiles]);
+    await deleteLocalPdfCopy(file.uri, {
+      removeMetadata: true,
+      clearProgress: true,
+      clearBookmarks: true,
+    });
+  }, [deleteLocalPdfCopy]);
 
   const loadStudentContext = useCallback(async () => {
     try {
@@ -946,11 +1762,15 @@ export default function BooksScreen() {
     let localUri = null;
     try {
       const localPath = getLocalPathForUrl(url);
-      const info = localPath ? await FileSystem.getInfoAsync(localPath) : { exists: false };
-      if (info.exists && Number(info.size || 0) > 0) {
+      if (localPath && downloadedUriSet.has(localPath)) {
         localUri = localPath;
-      } else if (info.exists && localPath) {
-        await FileSystem.deleteAsync(localPath, { idempotent: true });
+      } else {
+        const info = localPath ? await FileSystem.getInfoAsync(localPath) : { exists: false };
+        if (info.exists && Number(info.size || 0) > 0) {
+          localUri = localPath;
+        } else if (info.exists && localPath) {
+          await FileSystem.deleteAsync(localPath, { idempotent: true });
+        }
       }
     } catch {}
 
@@ -964,7 +1784,7 @@ export default function BooksScreen() {
     }
 
     openLocalPdfInViewer(localUri, unit.title, subjectName);
-  }, [downloadToLocal, downloadingMap, getLocalPathForUrl, openLocalPdfInViewer]);
+  }, [downloadToLocal, downloadedUriSet, downloadingMap, getLocalPathForUrl, openLocalPdfInViewer]);
 
   const downloadOrCancel = useCallback(async (unit, subjectName) => {
     const url = unit.pdfUrl;
@@ -1008,12 +1828,70 @@ export default function BooksScreen() {
   }, [settings]);
 
   const readerStatusLabel = useMemo(() => {
-    const modeLabel = viewer.readerMode === READER_MODE_PAGED ? "Page swipe mode" : "Fit-width scroll mode";
+    const modeLabel = viewer.readerMode === READER_MODE_PAGED ? "Swipe mode" : "Scroll mode";
     if (viewer.initialPage > 1) {
-      return `Resumes at page ${viewer.initialPage} | ${modeLabel}`;
+      return `Resuming from page ${viewer.initialPage} • ${modeLabel}`;
     }
-    return modeLabel;
+    return `${modeLabel} • Tap the page to hide controls`;
   }, [viewer.initialPage, viewer.readerMode]);
+
+  const readerCurrentSection = useMemo(() => {
+    if (!readerOutline.length) return null;
+
+    let currentSection = null;
+    for (const entry of readerOutline) {
+      if (entry.page <= viewer.currentPage) {
+        currentSection = entry;
+      } else {
+        break;
+      }
+    }
+
+    return currentSection;
+  }, [readerOutline, viewer.currentPage]);
+
+  const readerNextSection = useMemo(() => {
+    return readerOutline.find((entry) => entry.page > viewer.currentPage) || null;
+  }, [readerOutline, viewer.currentPage]);
+
+  const readerProgressPercent = useMemo(() => {
+    if (!viewer.totalPages) return 0;
+    return Math.min(100, Math.max(1, Math.round((viewer.currentPage / viewer.totalPages) * 100)));
+  }, [viewer.currentPage, viewer.totalPages]);
+
+  const readerRemainingPages = useMemo(() => {
+    if (!viewer.totalPages) return 0;
+    return Math.max(viewer.totalPages - viewer.currentPage, 0);
+  }, [viewer.currentPage, viewer.totalPages]);
+
+  const readerCanGoBackward = viewer.currentPage > 1;
+  const readerCanGoForward = viewer.totalPages ? viewer.currentPage < viewer.totalPages : false;
+
+  const readerSectionSummary = useMemo(() => {
+    if (readerNextSection) {
+      return `Next: ${readerNextSection.title} on page ${readerNextSection.page}`;
+    }
+
+    if (!viewer.totalPages) {
+      return "Page count will appear after the PDF finishes loading.";
+    }
+
+    if (!readerRemainingPages) {
+      return "You are on the last page of this chapter.";
+    }
+
+    return `${readerRemainingPages} page${readerRemainingPages === 1 ? "" : "s"} left in this chapter.`;
+  }, [readerNextSection, readerRemainingPages, viewer.totalPages]);
+
+  const readerPageChipLabel = useMemo(() => {
+    if (!viewer.totalPages) {
+      return `Page ${viewer.currentPage}`;
+    }
+
+    return `Page ${viewer.currentPage} / ${viewer.totalPages}`;
+  }, [viewer.currentPage, viewer.totalPages]);
+
+  const isCurrentPageBookmarked = Boolean(currentReaderBookmark);
 
   const handleScroll = useCallback((e) => {
     const y = e.nativeEvent.contentOffset.y;
@@ -1700,46 +2578,11 @@ export default function BooksScreen() {
 
       <Modal visible={viewer.visible} animationType="slide" onRequestClose={closeViewer}>
         <SafeAreaView style={styles.readerContainer}>
-          <View style={styles.readerHeader}>
-            <TouchableOpacity onPress={closeViewer} style={styles.readerHeaderIconBtn}>
-              <Ionicons name="arrow-back" size={20} color={TEXT} />
-            </TouchableOpacity>
-
-            <View style={styles.readerTitleWrap}>
-              <Text style={styles.readerTitle} numberOfLines={1}>{viewer.title}</Text>
-              {!!viewer.subjectName && (
-                <Text style={styles.readerSubtitle} numberOfLines={1}>{viewer.subjectName}</Text>
-              )}
-              <Text style={styles.readerStatusText} numberOfLines={1}>
-                {readerStatusLabel}
-              </Text>
-            </View>
-
-            <View style={styles.readerHeaderActions}>
-              <TouchableOpacity
-                onPress={handleViewerModeToggle}
-                style={[styles.readerHeaderIconBtn, viewer.readerMode === READER_MODE_PAGED && styles.readerModeBtnActive]}
-              >
-                <Ionicons
-                  name={viewer.readerMode === READER_MODE_PAGED ? "albums-outline" : "reader-outline"}
-                  size={18}
-                  color={PRIMARY}
-                />
-              </TouchableOpacity>
-
-              <TouchableOpacity
-                onPress={reloadViewer}
-                style={styles.readerHeaderIconBtn}
-              >
-                <Ionicons name="refresh" size={18} color={PRIMARY} />
-              </TouchableOpacity>
-            </View>
-          </View>
-
-          <View style={styles.readerBodyWrap}>
+          <View style={readerBodyWrapStyle}>
             {viewer.localUri && NativePdfView ? (
               <>
                 <NativePdfView
+                  ref={pdfViewRef}
                   key={`${viewer.localUri}-${viewer.reloadKey}-${viewer.readerMode}`}
                   source={{ uri: viewer.localUri, cache: true }}
                   page={viewer.initialPage}
@@ -1751,27 +2594,275 @@ export default function BooksScreen() {
                   horizontal={viewer.readerMode === READER_MODE_PAGED}
                   enablePaging={viewer.readerMode === READER_MODE_PAGED}
                   enableAnnotationRendering
+                  onLoadProgress={(progress) => setViewerLoadProgress(Number(progress || 0))}
                   onLoadComplete={handleViewerLoadComplete}
                   onPageChanged={handleViewerPageChanged}
-                  onError={(error) => {
-                    console.warn("Textbook PDF load error:", error);
-                    setViewerLoading(false);
-                    Alert.alert("Unable to load", "This PDF could not be opened from your phone. Delete it and download it again.");
-                  }}
+                  onPageSingleTap={handleReaderPageTap}
+                  onPressLink={handleViewerLinkPress}
+                  onError={handleViewerError}
                   enableDoubleTapZoom
                 />
 
-                <View style={styles.readerPageChip}>
-                  <Ionicons name="bookmark-outline" size={14} color={PRIMARY} />
+                {readerToolsEnabled ? (
+                  <>
+                    <Animated.View
+                      pointerEvents={readerChromeVisible ? "auto" : "none"}
+                      style={[
+                        styles.readerTopOverlay,
+                        {
+                          opacity: readerChromeAnimValue,
+                          transform: [{
+                            translateY: readerChromeAnimValue.interpolate({
+                              inputRange: [0, 1],
+                              outputRange: [-26, 0],
+                            }),
+                          }],
+                        },
+                      ]}
+                    >
+                      <View style={readerHeaderStyle}>
+                        <TouchableOpacity onPress={closeViewer} style={styles.readerHeaderIconBtn} hitSlop={8}>
+                          <Ionicons name="arrow-back" size={20} color={TEXT} />
+                        </TouchableOpacity>
+
+                        <View style={styles.readerTitleWrap}>
+                          <Text style={[styles.readerTitle, isReaderWideLayout && styles.readerTitleWide]} numberOfLines={isReaderWideLayout ? 2 : 1}>{viewer.title}</Text>
+                          {!!viewer.subjectName && (
+                            <Text style={[styles.readerSubtitle, isReaderWideLayout && styles.readerSubtitleWide]} numberOfLines={1}>{viewer.subjectName}</Text>
+                          )}
+
+                          <View style={styles.readerMetaPillRow}>
+                            <View style={[styles.readerMetaPill, styles.readerMetaPillPrimary]}>
+                              <Ionicons name="compass-outline" size={12} color={PRIMARY} />
+                              <Text style={styles.readerMetaPillText} numberOfLines={1}>
+                                {readerCurrentSection?.title || "Chapter reader"}
+                              </Text>
+                            </View>
+
+                            <View style={styles.readerMetaPill}>
+                              <Ionicons name="stats-chart-outline" size={12} color={PRIMARY} />
+                              <Text style={styles.readerMetaPillText}>
+                                {viewer.totalPages ? `${readerProgressPercent}% read` : "Loading"}
+                              </Text>
+                            </View>
+
+                            {isCurrentPageBookmarked ? (
+                              <View style={styles.readerMetaPill}>
+                                <Ionicons name="bookmark" size={12} color={PRIMARY} />
+                                <Text style={styles.readerMetaPillText}>Saved</Text>
+                              </View>
+                            ) : null}
+                          </View>
+
+                          <Text style={[styles.readerStatusText, isReaderWideLayout && styles.readerStatusTextWide]} numberOfLines={1}>
+                            {readerStatusLabel}
+                          </Text>
+                        </View>
+
+                        <View style={styles.readerHeaderActions}>
+                          <TouchableOpacity
+                            onPress={handleViewerModeToggle}
+                            style={[
+                              styles.readerHeaderIconBtn,
+                              styles.readerHeaderActionBtn,
+                              viewer.readerMode === READER_MODE_PAGED && styles.readerModeBtnActive,
+                            ]}
+                            hitSlop={8}
+                          >
+                            <Ionicons
+                              name={viewer.readerMode === READER_MODE_PAGED ? "albums-outline" : "reader-outline"}
+                              size={18}
+                              color={PRIMARY}
+                            />
+                          </TouchableOpacity>
+
+                          <TouchableOpacity
+                            onPress={reloadViewer}
+                            style={[styles.readerHeaderIconBtn, styles.readerHeaderActionBtn]}
+                            hitSlop={8}
+                          >
+                            <Ionicons name="refresh" size={18} color={PRIMARY} />
+                          </TouchableOpacity>
+
+                          <TouchableOpacity
+                            onPress={enterReaderFocusMode}
+                            style={[styles.readerHeaderIconBtn, styles.readerHeaderActionBtn]}
+                            hitSlop={8}
+                          >
+                            <Ionicons name="scan-outline" size={18} color={PRIMARY} />
+                          </TouchableOpacity>
+                        </View>
+                      </View>
+                    </Animated.View>
+
+                    <Animated.View
+                      pointerEvents={readerChromeVisible ? "auto" : "none"}
+                      style={[
+                        styles.readerBottomOverlay,
+                        {
+                          opacity: readerChromeAnimValue,
+                          transform: [{
+                            translateY: readerChromeAnimValue.interpolate({
+                              inputRange: [0, 1],
+                              outputRange: [34, 0],
+                            }),
+                          }],
+                        },
+                      ]}
+                    >
+                      <View style={readerBottomDockStyle}>
+                        <View style={styles.readerDockTopRow}>
+                          <View style={styles.readerDockSectionWrap}>
+                            <Text style={styles.readerDockEyebrow}>Current section</Text>
+                            <Text style={styles.readerDockSectionTitle} numberOfLines={1}>
+                              {readerCurrentSection?.title || viewer.subjectName || "Chapter overview"}
+                            </Text>
+                            <Text style={styles.readerDockSectionHint} numberOfLines={1}>
+                              {readerSectionSummary}
+                            </Text>
+                          </View>
+
+                          <TouchableOpacity style={styles.readerDockFocusBtn} onPress={enterReaderFocusMode}>
+                            <Ionicons name="scan-outline" size={18} color={PRIMARY} />
+                          </TouchableOpacity>
+                        </View>
+
+                        <TouchableOpacity style={styles.readerProgressCard} activeOpacity={0.9} onPress={openReaderJumpPanel}>
+                          <View style={styles.readerProgressHeaderRow}>
+                            <Text style={styles.readerProgressLabel}>Reading progress</Text>
+                            <Text style={styles.readerProgressValue}>
+                              {viewer.totalPages ? `${readerProgressPercent}%` : "--"}
+                            </Text>
+                          </View>
+
+                          <View style={styles.readerProgressTrack}>
+                            <View
+                              style={[
+                                styles.readerProgressFill,
+                                { width: viewer.totalPages ? `${Math.max(readerProgressPercent, 4)}%` : "12%" },
+                              ]}
+                            />
+                          </View>
+
+                          <View style={styles.readerProgressFooterRow}>
+                            <Text style={styles.readerProgressFooterText}>
+                              Page {viewer.currentPage} of {viewer.totalPages || "--"}
+                            </Text>
+                            <Text style={styles.readerProgressFooterText}>
+                              {viewer.totalPages
+                                ? `${readerRemainingPages} page${readerRemainingPages === 1 ? "" : "s"} left`
+                                : "Tap to jump"}
+                            </Text>
+                          </View>
+                        </TouchableOpacity>
+
+                        <ScrollView
+                          horizontal
+                          showsHorizontalScrollIndicator={false}
+                          style={styles.readerDockToolScroller}
+                          contentContainerStyle={readerToolRowStyle}
+                        >
+                          <TouchableOpacity
+                            style={[styles.readerToolBtn, !readerCanGoBackward && styles.readerToolBtnDisabled]}
+                            onPress={() => jumpToReaderPage(viewer.currentPage - 1)}
+                            disabled={!readerCanGoBackward}
+                          >
+                            <Ionicons name="chevron-back-outline" size={16} color={PRIMARY} />
+                            <Text style={styles.readerToolBtnText}>Prev</Text>
+                          </TouchableOpacity>
+
+                          <TouchableOpacity style={styles.readerToolBtn} onPress={openReaderJumpPanel}>
+                            <Ionicons name="navigate-outline" size={16} color={PRIMARY} />
+                            <Text style={styles.readerToolBtnText}>Go to</Text>
+                          </TouchableOpacity>
+
+                          <TouchableOpacity style={styles.readerToolBtn} onPress={openReaderSearch}>
+                            <Ionicons name="search-outline" size={16} color={PRIMARY} />
+                            <Text style={styles.readerToolBtnText}>Find</Text>
+                          </TouchableOpacity>
+
+                          <TouchableOpacity
+                            style={[styles.readerToolBtn, isCurrentPageBookmarked && styles.readerToolBtnActive]}
+                            onPress={() => openBookmarkEditor(viewer.currentPage)}
+                          >
+                            <Ionicons
+                              name={isCurrentPageBookmarked ? "bookmark" : "bookmark-outline"}
+                              size={16}
+                              color={PRIMARY}
+                            />
+                            <Text style={styles.readerToolBtnText}>
+                              {isCurrentPageBookmarked ? "Saved" : "Save"}
+                            </Text>
+                          </TouchableOpacity>
+
+                          <TouchableOpacity style={styles.readerToolBtn} onPress={() => setReaderBookmarksVisible(true)}>
+                            <Ionicons name="bookmarks-outline" size={16} color={PRIMARY} />
+                            <Text style={styles.readerToolBtnText}>Bookmarks</Text>
+                            {readerBookmarks.length ? (
+                              <View style={styles.readerToolCountPill}>
+                                <Text style={styles.readerToolCountText}>{readerBookmarks.length}</Text>
+                              </View>
+                            ) : null}
+                          </TouchableOpacity>
+
+                          <TouchableOpacity
+                            style={[styles.readerToolBtn, !readerOutline.length && styles.readerToolBtnDisabled]}
+                            onPress={() => setReaderOutlineVisible(true)}
+                            disabled={!readerOutline.length}
+                          >
+                            <Ionicons name="list-outline" size={16} color={PRIMARY} />
+                            <Text style={styles.readerToolBtnText}>Contents</Text>
+                          </TouchableOpacity>
+
+                          <TouchableOpacity style={styles.readerToolBtn} onPress={handleViewerModeToggle}>
+                            <Ionicons
+                              name={viewer.readerMode === READER_MODE_PAGED ? "albums-outline" : "reader-outline"}
+                              size={16}
+                              color={PRIMARY}
+                            />
+                            <Text style={styles.readerToolBtnText}>
+                              {viewer.readerMode === READER_MODE_PAGED ? "Paged" : "Scroll"}
+                            </Text>
+                          </TouchableOpacity>
+
+                          <TouchableOpacity
+                            style={[styles.readerToolBtn, !readerCanGoForward && styles.readerToolBtnDisabled]}
+                            onPress={() => jumpToReaderPage(viewer.currentPage + 1)}
+                            disabled={!readerCanGoForward}
+                          >
+                            <Ionicons name="chevron-forward-outline" size={16} color={PRIMARY} />
+                            <Text style={styles.readerToolBtnText}>Next</Text>
+                          </TouchableOpacity>
+                        </ScrollView>
+                      </View>
+                    </Animated.View>
+                  </>
+                ) : null}
+
+                {!readerToolsEnabled ? (
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel="Close reader"
+                    accessibilityHint="Double tap the top left corner to close the reader."
+                    onPress={handleReaderHiddenClosePress}
+                    style={styles.readerHiddenCloseZone}
+                  />
+                ) : null}
+
+                <View pointerEvents="none" style={readerPageChipStyle}>
                   <Text style={styles.readerPageChipText}>
-                    Page {viewer.currentPage} / {viewer.totalPages || "--"}
+                    {readerPageChipLabel}
                   </Text>
                 </View>
 
-                {viewerLoading ? (
+                {viewerLoading && viewer.reloadKey > 0 ? (
                   <View style={styles.readerLoadingOverlay}>
                     <ActivityIndicator size="large" color={PRIMARY} />
-                    <Text style={styles.readerLoadingText}>Opening chapter...</Text>
+                    <Text style={styles.readerLoadingText}>
+                      {viewerLoadProgress > 0 && viewerLoadProgress < 1
+                        ? `Refreshing chapter... ${Math.round(viewerLoadProgress * 100)}%`
+                        : "Refreshing chapter..."}
+                    </Text>
                   </View>
                 ) : null}
               </>
@@ -1782,6 +2873,320 @@ export default function BooksScreen() {
             )}
           </View>
         </SafeAreaView>
+      </Modal>
+
+      <Modal visible={readerJumpVisible} transparent animationType="fade" onRequestClose={() => setReaderJumpVisible(false)}>
+        <Pressable style={styles.modalBackdrop} onPress={() => setReaderJumpVisible(false)} />
+        <View style={readerPanelSheetStyle}>
+          <View style={styles.sheetHandle} />
+          <Text style={styles.sheetTitle}>Go to Page</Text>
+          <Text style={styles.readerPanelSubtitle}>
+            Jump directly to any page in this chapter.
+          </Text>
+
+          <TextInput
+            value={readerJumpInput}
+            onChangeText={setReaderJumpInput}
+            keyboardType="number-pad"
+            placeholder={viewer.totalPages ? `1 - ${viewer.totalPages}` : "Wait for page count"}
+            placeholderTextColor={MUTED}
+            style={styles.readerJumpInput}
+          />
+
+          <Text style={styles.readerJumpHint}>
+            {viewer.totalPages ? `Enter a page number between 1 and ${viewer.totalPages}.` : "Page count appears after the PDF finishes loading."}
+          </Text>
+
+          <View style={styles.readerQuickActionRow}>
+            <TouchableOpacity style={styles.readerQuickActionBtn} onPress={() => jumpToReaderPage(1, { closePanels: true })}>
+              <Text style={styles.readerQuickActionText}>First page</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.readerQuickActionBtn}
+              onPress={() => jumpToReaderPage(Math.max(1, viewer.currentPage - 1), { closePanels: true })}
+            >
+              <Text style={styles.readerQuickActionText}>Previous</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.readerQuickActionBtn}
+              onPress={() => jumpToReaderPage(Math.min(viewer.totalPages || viewer.currentPage + 1, viewer.currentPage + 1), { closePanels: true })}
+            >
+              <Text style={styles.readerQuickActionText}>Next</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.readerQuickActionBtn}
+              onPress={() => jumpToReaderPage(viewer.totalPages || viewer.currentPage, { closePanels: true })}
+            >
+              <Text style={styles.readerQuickActionText}>Last page</Text>
+            </TouchableOpacity>
+          </View>
+
+          <TouchableOpacity style={styles.readerPanelPrimaryBtn} onPress={submitReaderJump}>
+            <Ionicons name="arrow-forward-outline" size={16} color={colors.white} />
+            <Text style={styles.readerPanelPrimaryBtnText}>Go to page</Text>
+          </TouchableOpacity>
+        </View>
+      </Modal>
+
+      <Modal visible={readerBookmarksVisible} transparent animationType="slide" onRequestClose={() => setReaderBookmarksVisible(false)}>
+        <Pressable style={styles.modalBackdrop} onPress={() => setReaderBookmarksVisible(false)} />
+        <View style={readerPanelSheetStyle}>
+          <View style={styles.sheetHandle} />
+          <Text style={styles.sheetTitle}>Bookmarks</Text>
+          <Text style={styles.readerPanelSubtitle}>Save important pages and return to them quickly.</Text>
+
+          <TouchableOpacity
+            style={[styles.readerCurrentBookmarkCard, isCurrentPageBookmarked && styles.readerCurrentBookmarkCardActive]}
+            onPress={() => openBookmarkEditor(viewer.currentPage)}
+          >
+            <View style={styles.readerCurrentBookmarkIcon}>
+              <Ionicons
+                name={isCurrentPageBookmarked ? "bookmark" : "bookmark-outline"}
+                size={18}
+                color={PRIMARY}
+              />
+            </View>
+            <View style={styles.readerCurrentBookmarkTextWrap}>
+              <Text style={styles.readerCurrentBookmarkTitle}>
+                {currentReaderBookmark?.label || `Current page ${viewer.currentPage}`}
+              </Text>
+              <Text style={styles.readerCurrentBookmarkText}>
+                {currentReaderBookmark?.note
+                  ? currentReaderBookmark.note
+                  : isCurrentPageBookmarked
+                    ? "Tap to edit this bookmark name or add a note."
+                    : "Save this page with a custom name or note."}
+              </Text>
+            </View>
+          </TouchableOpacity>
+
+          {readerBookmarks.length ? (
+            <FlatList
+              data={readerBookmarks}
+              keyExtractor={(item) => `${item.page}`}
+              contentContainerStyle={styles.readerPanelList}
+              renderItem={({ item }) => (
+                <View style={styles.readerPanelRow}>
+                  <TouchableOpacity
+                    style={styles.readerPanelRowMain}
+                    onPress={() => {
+                      jumpToReaderPage(item.page, { closePanels: true });
+                      setReaderBookmarksVisible(false);
+                    }}
+                  >
+                    <View style={styles.readerPanelRowIcon}>
+                      <Ionicons name="bookmark" size={16} color={PRIMARY} />
+                    </View>
+                    <View style={styles.readerPanelRowTextWrap}>
+                      <Text style={styles.readerPanelRowTitle} numberOfLines={1}>{item.label}</Text>
+                      <Text style={styles.readerPanelRowSubtitle}>Page {item.page}</Text>
+                      {!!item.note ? (
+                        <Text style={styles.readerBookmarkNotePreview} numberOfLines={2}>{item.note}</Text>
+                      ) : null}
+                    </View>
+                    {item.page === viewer.currentPage ? (
+                      <View style={styles.readerCurrentPill}>
+                        <Text style={styles.readerCurrentPillText}>Current</Text>
+                      </View>
+                    ) : null}
+                  </TouchableOpacity>
+
+                  <View style={styles.readerPanelActionGroup}>
+                    <TouchableOpacity style={styles.readerPanelEditBtn} onPress={() => openBookmarkEditor(item.page)}>
+                      <Ionicons name="create-outline" size={18} color={PRIMARY} />
+                    </TouchableOpacity>
+
+                    <TouchableOpacity style={styles.readerPanelDeleteBtn} onPress={() => deleteReaderBookmark(item.page)}>
+                      <Ionicons name="trash-outline" size={18} color={colors.danger} />
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              )}
+            />
+          ) : (
+            <View style={styles.readerPanelEmptyState}>
+              <Ionicons name="bookmarks-outline" size={22} color={PRIMARY} />
+              <Text style={styles.readerPanelEmptyTitle}>No bookmarks yet</Text>
+              <Text style={styles.readerPanelEmptyText}>Save pages from the reader toolbar to see them here.</Text>
+            </View>
+          )}
+        </View>
+      </Modal>
+
+      <Modal visible={readerOutlineVisible} transparent animationType="slide" onRequestClose={() => setReaderOutlineVisible(false)}>
+        <Pressable style={styles.modalBackdrop} onPress={() => setReaderOutlineVisible(false)} />
+        <View style={readerPanelSheetStyle}>
+          <View style={styles.sheetHandle} />
+          <Text style={styles.sheetTitle}>Contents</Text>
+          <Text style={styles.readerPanelSubtitle}>Jump through the PDF outline just like a full reader app.</Text>
+
+          {readerOutline.length ? (
+            <FlatList
+              data={readerOutline}
+              keyExtractor={(item) => item.key}
+              contentContainerStyle={styles.readerPanelList}
+              renderItem={({ item }) => (
+                <TouchableOpacity
+                  style={[styles.readerPanelRowMain, { paddingLeft: 14 + item.depth * 14 }]}
+                  onPress={() => {
+                    jumpToReaderPage(item.page, { closePanels: true });
+                    setReaderOutlineVisible(false);
+                  }}
+                >
+                  <View style={styles.readerPanelRowIcon}>
+                    <Ionicons name="list-outline" size={16} color={PRIMARY} />
+                  </View>
+                  <View style={styles.readerPanelRowTextWrap}>
+                    <Text style={styles.readerPanelRowTitle} numberOfLines={1}>{item.title}</Text>
+                    <Text style={styles.readerPanelRowSubtitle}>Page {item.page}</Text>
+                  </View>
+                </TouchableOpacity>
+              )}
+            />
+          ) : (
+            <View style={styles.readerPanelEmptyState}>
+              <Ionicons name="document-text-outline" size={22} color={PRIMARY} />
+              <Text style={styles.readerPanelEmptyTitle}>No outline found</Text>
+              <Text style={styles.readerPanelEmptyText}>This PDF does not expose chapter contents for quick jumps.</Text>
+            </View>
+          )}
+        </View>
+      </Modal>
+
+      <Modal visible={bookmarkEditor.visible} transparent animationType="slide" onRequestClose={closeBookmarkEditor}>
+        <Pressable style={styles.modalBackdrop} onPress={closeBookmarkEditor} />
+        <View style={readerPanelSheetStyle}>
+          <View style={styles.sheetHandle} />
+          <Text style={styles.sheetTitle}>{editingReaderBookmark ? "Edit Bookmark" : "Save Bookmark"}</Text>
+          <Text style={styles.readerPanelSubtitle}>Give this page a name and add an optional note for later.</Text>
+
+          <ScrollView showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
+            <View style={styles.readerBookmarkPagePill}>
+              <Ionicons name="bookmark-outline" size={14} color={PRIMARY} />
+              <Text style={styles.readerBookmarkPagePillText}>Page {bookmarkEditor.page}</Text>
+            </View>
+
+            <Text style={styles.readerFieldLabel}>Bookmark name</Text>
+            <TextInput
+              value={bookmarkEditor.label}
+              onChangeText={(value) => setBookmarkEditor((prev) => ({ ...prev, label: value }))}
+              placeholder={`Page ${bookmarkEditor.page}`}
+              placeholderTextColor={MUTED}
+              style={styles.readerBookmarkInput}
+            />
+
+            <Text style={styles.readerFieldLabel}>Note</Text>
+            <TextInput
+              value={bookmarkEditor.note}
+              onChangeText={(value) => setBookmarkEditor((prev) => ({ ...prev, note: value }))}
+              placeholder="Optional reminder, summary, or revision hint"
+              placeholderTextColor={MUTED}
+              multiline
+              textAlignVertical="top"
+              style={styles.readerBookmarkNoteInput}
+            />
+
+            <View style={styles.readerEditorActionRow}>
+              {editingReaderBookmark ? (
+                <TouchableOpacity style={styles.readerEditorDangerBtn} onPress={() => deleteReaderBookmark(bookmarkEditor.page)}>
+                  <Text style={styles.readerEditorDangerBtnText}>Delete</Text>
+                </TouchableOpacity>
+              ) : null}
+
+              <TouchableOpacity style={styles.readerEditorSecondaryBtn} onPress={closeBookmarkEditor}>
+                <Text style={styles.readerEditorSecondaryBtnText}>Cancel</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity style={styles.readerEditorPrimaryBtn} onPress={saveReaderBookmarkDraft}>
+                <Ionicons name="save-outline" size={16} color={colors.white} />
+                <Text style={styles.readerEditorPrimaryBtnText}>{editingReaderBookmark ? "Update" : "Save"}</Text>
+              </TouchableOpacity>
+            </View>
+          </ScrollView>
+        </View>
+      </Modal>
+
+      <Modal visible={readerSearchVisible} transparent animationType="slide" onRequestClose={() => setReaderSearchVisible(false)}>
+        <Pressable style={styles.modalBackdrop} onPress={() => setReaderSearchVisible(false)} />
+        <View style={readerPanelSheetStyle}>
+          <View style={styles.sheetHandle} />
+          <Text style={styles.sheetTitle}>Find in Chapter</Text>
+          <Text style={styles.readerPanelSubtitle}>{readerSearchStatusLabel}</Text>
+
+          {readerTextIndexState.status === "indexing" ? (
+            <View style={styles.readerSearchStatusCard}>
+              <ActivityIndicator size="small" color={PRIMARY} />
+              <Text style={styles.readerSearchStatusText}>You can already search bookmarks and contents while the PDF text index builds.</Text>
+            </View>
+          ) : null}
+
+          {readerTextIndexState.status === "error" ? (
+            <View style={[styles.readerSearchStatusCard, styles.readerSearchStatusCardError]}>
+              <Text style={styles.readerSearchStatusText}>{readerTextIndexState.error || "Full text indexing failed for this PDF."}</Text>
+              <TouchableOpacity style={styles.readerSearchRetryBtn} onPress={retryReaderTextIndex}>
+                <Text style={styles.readerSearchRetryBtnText}>Retry indexing</Text>
+              </TouchableOpacity>
+            </View>
+          ) : null}
+
+          <TextInput
+            value={readerSearchQuery}
+            onChangeText={setReaderSearchQuery}
+            placeholder="Search text, title, note, or page"
+            placeholderTextColor={MUTED}
+            style={styles.readerSearchInput}
+          />
+
+          {readerSearchResults.length ? (
+            <FlatList
+              data={readerSearchResults}
+              keyExtractor={(item) => item.key}
+              contentContainerStyle={styles.readerPanelList}
+              renderItem={({ item }) => (
+                <TouchableOpacity
+                  style={[styles.readerPanelRowMain, { marginBottom: 10, paddingLeft: 14 + (item.kind === "outline" ? item.depth * 14 : 0) }]}
+                  onPress={() => {
+                    jumpToReaderPage(item.page, { closePanels: true });
+                  }}
+                >
+                  <View style={styles.readerPanelRowIcon}>
+                    <Ionicons
+                      name={item.kind === "bookmark" ? "bookmark" : item.kind === "outline" ? "list-outline" : "navigate-outline"}
+                      size={16}
+                      color={PRIMARY}
+                    />
+                  </View>
+                  <View style={styles.readerPanelRowTextWrap}>
+                    <View style={styles.readerSearchTitleRow}>
+                      <Text style={styles.readerPanelRowTitle} numberOfLines={1}>{item.title}</Text>
+                      <View style={styles.readerSearchTag}>
+                        <Text style={styles.readerSearchTagText}>{item.kindLabel}</Text>
+                      </View>
+                    </View>
+                    <Text style={styles.readerPanelRowSubtitle}>{item.subtitle}</Text>
+                    {!!item.note ? (
+                      <Text style={styles.readerBookmarkNotePreview} numberOfLines={2}>{item.note}</Text>
+                    ) : null}
+                  </View>
+                  {item.page === viewer.currentPage ? (
+                    <View style={styles.readerCurrentPill}>
+                      <Text style={styles.readerCurrentPillText}>Current</Text>
+                    </View>
+                  ) : null}
+                </TouchableOpacity>
+              )}
+            />
+          ) : (
+            <View style={styles.readerPanelEmptyState}>
+              <Ionicons name="search-outline" size={22} color={PRIMARY} />
+              <Text style={styles.readerPanelEmptyTitle}>Nothing matched</Text>
+              <Text style={styles.readerPanelEmptyText}>Try a page number, a bookmark name, or a chapter title from the PDF contents.</Text>
+            </View>
+          )}
+        </View>
       </Modal>
 
       <Modal visible={managerVisible} animationType="slide" onRequestClose={() => setManagerVisible(false)}>
@@ -2284,34 +3689,103 @@ function createStyles(colors) {
 
   readerContainer: { flex: 1, backgroundColor: BG },
   readerHeader: {
-    minHeight: 74,
+    minHeight: 84,
     flexDirection: "row",
     alignItems: "center",
+    marginHorizontal: 12,
+    marginTop: 12,
     paddingHorizontal: 14,
-    paddingVertical: 10,
-    borderBottomWidth: 1,
-    borderBottomColor: BORDER,
-    backgroundColor: CARD,
+    paddingVertical: 12,
+    borderWidth: 1,
+    borderColor: colors.tabGlassBorder,
+    borderRadius: 24,
+    backgroundColor: colors.tabGlass,
+    shadowColor: "#08101C",
+    shadowOffset: { width: 0, height: 12 },
+    shadowOpacity: 0.16,
+    shadowRadius: 22,
+    elevation: 7,
   },
   readerHeaderIconBtn: {
     width: 42,
     height: 42,
     borderRadius: 14,
     borderWidth: 1,
-    borderColor: BORDER,
+    borderColor: colors.tabGlassBorder,
     backgroundColor: colors.inputBackground,
     alignItems: "center",
     justifyContent: "center",
+  },
+  readerHeaderActionBtn: {
+    marginLeft: 8,
   },
   readerHeaderActions: {
     flexDirection: "row",
     alignItems: "center",
     marginLeft: 8,
   },
+  readerHeaderWide: {
+    minHeight: 92,
+    paddingHorizontal: 20,
+    paddingVertical: 14,
+  },
+  readerHeaderLandscape: {
+    minHeight: 74,
+  },
+  readerToolRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 4,
+    paddingTop: 2,
+    paddingBottom: 2,
+  },
+  readerToolRowWide: {
+    paddingHorizontal: 6,
+    paddingTop: 2,
+    paddingBottom: 2,
+  },
+  readerToolBtn: {
+    height: 42,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: colors.tabGlassBorder,
+    backgroundColor: colors.card,
+    paddingHorizontal: 14,
+    flexDirection: "row",
+    alignItems: "center",
+    marginRight: 8,
+  },
+  readerToolBtnActive: {
+    borderColor: PRIMARY,
+    backgroundColor: colors.soft,
+  },
+  readerToolBtnDisabled: {
+    opacity: 0.45,
+  },
+  readerToolBtnText: {
+    marginLeft: 6,
+    fontSize: 13,
+    fontWeight: "800",
+    color: TEXT,
+  },
+  readerToolCountPill: {
+    minWidth: 18,
+    height: 18,
+    borderRadius: 9,
+    paddingHorizontal: 5,
+    marginLeft: 8,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: colors.soft,
+  },
+  readerToolCountText: {
+    fontSize: 10,
+    fontWeight: "900",
+    color: PRIMARY,
+  },
   readerModeBtnActive: {
     backgroundColor: colors.soft,
     borderColor: PRIMARY,
-    marginRight: 8,
   },
   readerTitleWrap: {
     flex: 1,
@@ -2330,17 +3804,53 @@ function createStyles(colors) {
     fontSize: 15,
     color: TEXT,
   },
+  readerTitleWide: {
+    fontSize: 17,
+    lineHeight: 23,
+  },
   readerSubtitle: {
     marginTop: 2,
     fontSize: 12,
     fontWeight: "600",
     color: MUTED,
   },
+  readerSubtitleWide: {
+    fontSize: 13,
+  },
+  readerMetaPillRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    marginTop: 8,
+  },
+  readerMetaPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: colors.tabGlassBorder,
+    backgroundColor: colors.card,
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+    marginRight: 8,
+    marginBottom: 6,
+  },
+  readerMetaPillPrimary: {
+    maxWidth: "74%",
+  },
+  readerMetaPillText: {
+    marginLeft: 5,
+    fontSize: 11,
+    fontWeight: "800",
+    color: TEXT,
+  },
   readerStatusText: {
     marginTop: 2,
     fontSize: 11,
     fontWeight: "700",
     color: PRIMARY,
+  },
+  readerStatusTextWide: {
+    fontSize: 12,
   },
   readerBodyWrap: {
     flex: 1,
@@ -2350,9 +3860,141 @@ function createStyles(colors) {
     borderWidth: 0,
     backgroundColor: CARD,
   },
+  readerBodyWrapWide: {
+    margin: 16,
+    borderRadius: 26,
+    borderWidth: 1,
+    borderColor: BORDER,
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.05,
+    shadowRadius: 18,
+    elevation: 3,
+  },
   readerWebView: {
     flex: 1,
     backgroundColor: BG,
+  },
+  readerTopOverlay: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    zIndex: 12,
+  },
+  readerBottomOverlay: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    bottom: 0,
+    zIndex: 12,
+    paddingHorizontal: 12,
+    paddingBottom: 12,
+  },
+  readerBottomDock: {
+    borderRadius: 26,
+    borderWidth: 1,
+    borderColor: colors.tabGlassBorder,
+    backgroundColor: colors.tabGlass,
+    padding: 14,
+    shadowColor: "#08101C",
+    shadowOffset: { width: 0, height: 12 },
+    shadowOpacity: 0.2,
+    shadowRadius: 20,
+    elevation: 8,
+  },
+  readerBottomDockWide: {
+    maxWidth: 840,
+    alignSelf: "center",
+    width: "100%",
+  },
+  readerDockTopRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 12,
+  },
+  readerDockSectionWrap: {
+    flex: 1,
+    marginRight: 12,
+  },
+  readerDockEyebrow: {
+    fontSize: 10,
+    fontWeight: "900",
+    letterSpacing: 0.5,
+    textTransform: "uppercase",
+    color: PRIMARY,
+  },
+  readerDockSectionTitle: {
+    marginTop: 4,
+    fontSize: 16,
+    fontWeight: "900",
+    color: TEXT,
+  },
+  readerDockSectionHint: {
+    marginTop: 4,
+    fontSize: 12,
+    fontWeight: "600",
+    color: MUTED,
+  },
+  readerDockFocusBtn: {
+    width: 42,
+    height: 42,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: colors.tabGlassBorder,
+    backgroundColor: colors.card,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  readerProgressCard: {
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: colors.tabGlassBorder,
+    backgroundColor: colors.card,
+    paddingHorizontal: 14,
+    paddingVertical: 13,
+  },
+  readerProgressHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  readerProgressLabel: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: MUTED,
+  },
+  readerProgressValue: {
+    fontSize: 13,
+    fontWeight: "900",
+    color: PRIMARY,
+  },
+  readerProgressTrack: {
+    height: 8,
+    borderRadius: 999,
+    backgroundColor: colors.surfaceMuted,
+    overflow: "hidden",
+    marginTop: 12,
+  },
+  readerProgressFill: {
+    height: "100%",
+    borderRadius: 999,
+    backgroundColor: PRIMARY,
+  },
+  readerProgressFooterRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginTop: 10,
+  },
+  readerProgressFooterText: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: MUTED,
+  },
+  readerDockToolScroller: {
+    marginTop: 12,
   },
   readerPageChip: {
     position: "absolute",
@@ -2363,14 +4005,38 @@ function createStyles(colors) {
     borderRadius: 999,
     paddingHorizontal: 12,
     paddingVertical: 8,
-    backgroundColor: colors.card,
+    backgroundColor: colors.tabGlass,
     borderWidth: 1,
-    borderColor: BORDER,
+    borderColor: colors.tabGlassBorder,
     shadowColor: "#0F172A",
     shadowOffset: { width: 0, height: 6 },
     shadowOpacity: 0.08,
     shadowRadius: 12,
     elevation: 3,
+    zIndex: 15,
+  },
+  readerHiddenCloseZone: {
+    position: "absolute",
+    top: 8,
+    left: 8,
+    width: 68,
+    height: 68,
+    zIndex: 16,
+  },
+  readerPageChipWide: {
+    right: 24,
+    bottom: 24,
+    paddingHorizontal: 14,
+    paddingVertical: 9,
+  },
+  readerPageChipWithChrome: {
+    bottom: 182,
+  },
+  readerPageChipWithChromeWide: {
+    bottom: 194,
+  },
+  readerPageChipFocusMode: {
+    bottom: 16,
   },
   readerPageChipText: {
     marginLeft: 6,
@@ -2540,6 +4206,18 @@ function createStyles(colors) {
     paddingHorizontal: 16,
     paddingTop: 10,
     paddingBottom: 24,
+  },
+  readerPanelFloatingSheet: {
+    width: "92%",
+    alignSelf: "center",
+    bottom: 12,
+  },
+  readerPanelTabletSheet: {
+    maxWidth: 840,
+    maxHeight: "82%",
+  },
+  readerPanelLandscapeSheet: {
+    maxHeight: "88%",
   },
   sheetHandle: {
     width: 42,
@@ -2929,6 +4607,388 @@ function createStyles(colors) {
     color: colors.white,
     fontSize: 13,
     fontWeight: "800",
+  },
+  readerPanelSubtitle: {
+    marginTop: -6,
+    marginBottom: 14,
+    fontSize: 12,
+    fontWeight: "600",
+    color: MUTED,
+  },
+  readerJumpInput: {
+    height: 52,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: BORDER,
+    backgroundColor: colors.inputBackground,
+    paddingHorizontal: 16,
+    color: TEXT,
+    fontSize: 18,
+    fontWeight: "800",
+  },
+  readerJumpHint: {
+    marginTop: 10,
+    fontSize: 12,
+    lineHeight: 18,
+    color: MUTED,
+    fontWeight: "600",
+  },
+  readerQuickActionRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    marginTop: 14,
+    marginBottom: 14,
+  },
+  readerQuickActionBtn: {
+    height: 38,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: BORDER,
+    backgroundColor: colors.inputBackground,
+    paddingHorizontal: 12,
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 8,
+    marginBottom: 8,
+  },
+  readerQuickActionText: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: TEXT,
+  },
+  readerPanelPrimaryBtn: {
+    height: 46,
+    borderRadius: 14,
+    backgroundColor: PRIMARY,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+  },
+  readerPanelPrimaryBtnText: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: colors.white,
+  },
+  readerCurrentBookmarkCard: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 14,
+    paddingVertical: 13,
+    borderWidth: 1,
+    borderColor: BORDER,
+    borderRadius: 18,
+    backgroundColor: colors.inputBackground,
+    marginBottom: 12,
+  },
+  readerCurrentBookmarkCardActive: {
+    borderColor: PRIMARY,
+    backgroundColor: colors.soft,
+  },
+  readerCurrentBookmarkIcon: {
+    width: 40,
+    height: 40,
+    borderRadius: 14,
+    backgroundColor: CARD,
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 12,
+  },
+  readerCurrentBookmarkTextWrap: {
+    flex: 1,
+  },
+  readerCurrentBookmarkTitle: {
+    fontSize: 14,
+    fontWeight: "800",
+    color: TEXT,
+  },
+  readerCurrentBookmarkText: {
+    marginTop: 4,
+    fontSize: 12,
+    lineHeight: 18,
+    color: MUTED,
+    fontWeight: "600",
+  },
+  readerBookmarkPagePill: {
+    alignSelf: "flex-start",
+    flexDirection: "row",
+    alignItems: "center",
+    borderRadius: 999,
+    paddingHorizontal: 11,
+    paddingVertical: 7,
+    backgroundColor: colors.soft,
+    marginBottom: 14,
+  },
+  readerBookmarkPagePillText: {
+    marginLeft: 6,
+    fontSize: 12,
+    fontWeight: "800",
+    color: PRIMARY,
+  },
+  readerFieldLabel: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: TEXT,
+    marginBottom: 8,
+  },
+  readerBookmarkInput: {
+    height: 48,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: BORDER,
+    backgroundColor: colors.inputBackground,
+    paddingHorizontal: 14,
+    color: TEXT,
+    fontSize: 14,
+    fontWeight: "700",
+    marginBottom: 14,
+  },
+  readerBookmarkNoteInput: {
+    minHeight: 110,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: BORDER,
+    backgroundColor: colors.inputBackground,
+    paddingHorizontal: 14,
+    paddingTop: 14,
+    paddingBottom: 14,
+    color: TEXT,
+    fontSize: 13,
+    lineHeight: 20,
+    fontWeight: "600",
+  },
+  readerEditorActionRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginTop: 16,
+    marginBottom: 4,
+  },
+  readerEditorDangerBtn: {
+    height: 44,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: colors.danger,
+    backgroundColor: CARD,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 14,
+    marginRight: 8,
+  },
+  readerEditorDangerBtnText: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: colors.danger,
+  },
+  readerEditorSecondaryBtn: {
+    height: 44,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: BORDER,
+    backgroundColor: colors.inputBackground,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 16,
+    marginRight: 8,
+  },
+  readerEditorSecondaryBtnText: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: TEXT,
+  },
+  readerEditorPrimaryBtn: {
+    flex: 1,
+    height: 44,
+    borderRadius: 14,
+    backgroundColor: PRIMARY,
+    alignItems: "center",
+    justifyContent: "center",
+    flexDirection: "row",
+    gap: 8,
+  },
+  readerEditorPrimaryBtnText: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: colors.white,
+  },
+  readerSearchInput: {
+    height: 48,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: BORDER,
+    backgroundColor: colors.inputBackground,
+    paddingHorizontal: 14,
+    color: TEXT,
+    fontSize: 14,
+    fontWeight: "700",
+    marginBottom: 14,
+  },
+  readerSearchStatusCard: {
+    flexDirection: "row",
+    alignItems: "center",
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: BORDER,
+    backgroundColor: colors.inputBackground,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    marginBottom: 12,
+  },
+  readerSearchStatusCardError: {
+    borderColor: colors.warningBorder,
+    backgroundColor: colors.warningSurface,
+  },
+  readerSearchStatusText: {
+    flex: 1,
+    marginLeft: 10,
+    fontSize: 12,
+    lineHeight: 18,
+    color: TEXT,
+    fontWeight: "600",
+  },
+  readerSearchRetryBtn: {
+    height: 36,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: PRIMARY,
+    backgroundColor: CARD,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 12,
+    marginLeft: 10,
+  },
+  readerSearchRetryBtnText: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: PRIMARY,
+  },
+  readerPanelList: {
+    paddingBottom: 12,
+  },
+  readerPanelRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 10,
+  },
+  readerPanelActionGroup: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginLeft: 10,
+  },
+  readerPanelRowMain: {
+    flex: 1,
+    minHeight: 58,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: BORDER,
+    backgroundColor: colors.inputBackground,
+    paddingHorizontal: 14,
+    paddingVertical: 11,
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  readerPanelRowIcon: {
+    width: 34,
+    height: 34,
+    borderRadius: 12,
+    backgroundColor: colors.soft,
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 10,
+  },
+  readerPanelRowTextWrap: {
+    flex: 1,
+    minWidth: 0,
+  },
+  readerPanelRowTitle: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: TEXT,
+  },
+  readerPanelRowSubtitle: {
+    marginTop: 3,
+    fontSize: 11,
+    fontWeight: "700",
+    color: MUTED,
+  },
+  readerBookmarkNotePreview: {
+    marginTop: 4,
+    fontSize: 12,
+    lineHeight: 18,
+    color: MUTED,
+    fontWeight: "600",
+  },
+  readerPanelEditBtn: {
+    width: 46,
+    height: 46,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: BORDER,
+    backgroundColor: colors.inputBackground,
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 8,
+  },
+  readerPanelDeleteBtn: {
+    width: 46,
+    height: 46,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: colors.danger,
+    backgroundColor: CARD,
+    alignItems: "center",
+    justifyContent: "center",
+    marginLeft: 10,
+  },
+  readerCurrentPill: {
+    borderRadius: 999,
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+    backgroundColor: colors.soft,
+    marginLeft: 10,
+  },
+  readerCurrentPillText: {
+    fontSize: 10,
+    fontWeight: "900",
+    color: PRIMARY,
+  },
+  readerSearchTitleRow: {
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  readerSearchTag: {
+    marginLeft: 8,
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    backgroundColor: colors.soft,
+  },
+  readerSearchTagText: {
+    fontSize: 10,
+    fontWeight: "800",
+    color: PRIMARY,
+  },
+  readerPanelEmptyState: {
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 26,
+    paddingHorizontal: 18,
+    borderWidth: 1,
+    borderColor: BORDER,
+    borderRadius: 18,
+    backgroundColor: colors.inputBackground,
+  },
+  readerPanelEmptyTitle: {
+    marginTop: 10,
+    fontSize: 14,
+    fontWeight: "800",
+    color: TEXT,
+  },
+  readerPanelEmptyText: {
+    marginTop: 6,
+    fontSize: 12,
+    lineHeight: 18,
+    textAlign: "center",
+    color: MUTED,
   },
 
   settingsSectionTitle: {

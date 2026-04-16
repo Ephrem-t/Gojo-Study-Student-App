@@ -1,0 +1,1 @@
+module.exports = require("../../pdfjs/path2d-polyfill");
