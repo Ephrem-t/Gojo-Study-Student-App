@@ -124,9 +124,68 @@ function formatCountdownParts(ms) {
 }
 
 function formatInlineCountdown(ms) {
-  return formatCountdownParts(ms)
-    .map((part) => `${part.value}${part.label}`)
-    .join(" ");
+  const totalSeconds = Math.max(0, Math.ceil(ms / 1000));
+  const days = Math.floor(totalSeconds / 86400);
+  const hours = Math.floor((totalSeconds % 86400) / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  const parts = [];
+  if (days > 0) parts.push(`${days}d`);
+  if (hours > 0) parts.push(`${hours}h`);
+  if (minutes > 0) parts.push(`${minutes} min`);
+  if (parts.length === 0) parts.push(`${seconds}s`);
+
+  return parts.slice(0, 3).join(" ");
+}
+
+function countQuestionOrderItems(questionOrder) {
+  if (Array.isArray(questionOrder)) return questionOrder.length;
+  if (questionOrder && typeof questionOrder === "object") return Object.keys(questionOrder).length;
+  return 0;
+}
+
+function summarizeAttemptEntries(attemptsNode = {}) {
+  let entries = attemptsNode || {};
+  if (attemptsNode && (attemptsNode.attemptStatus || attemptsNode.startTime || attemptsNode.scorePercent != null)) {
+    entries = { legacy_single_attempt: attemptsNode };
+  }
+
+  const values = Object.values(entries || {});
+  const completed = values.filter((entry) => String(entry?.attemptStatus || "").toLowerCase() === "completed");
+  const inProgress = values.filter((entry) => String(entry?.attemptStatus || "").toLowerCase() === "in_progress");
+
+  const latestCompleted = completed.sort(
+    (a, b) => Number(b?.endTime || b?.startTime || 0) - Number(a?.endTime || a?.startTime || 0)
+  )[0] || null;
+
+  const totalQuestions = latestCompleted
+    ? Number(latestCompleted?.total || latestCompleted?.totalQuestions || countQuestionOrderItems(latestCompleted?.questionOrder))
+    : 0;
+  const correctCount = latestCompleted ? Number(latestCompleted?.correctCount || 0) : 0;
+  const wrongCount = Math.max(0, totalQuestions - correctCount);
+  const pointsAwarded = latestCompleted ? Number(latestCompleted?.pointsAwarded || 0) : 0;
+  const rankingCounted = latestCompleted
+    ? String(latestCompleted?.rankingCounted).toLowerCase() === "true" || latestCompleted?.rankingCounted === true || Number(latestCompleted?.rankingCounted) === 1
+    : false;
+  const resultVisible = latestCompleted
+    ? latestCompleted?.resultVisible == null
+      ? rankingCounted
+      : String(latestCompleted?.resultVisible).toLowerCase() === "true" || latestCompleted?.resultVisible === true || Number(latestCompleted?.resultVisible) === 1
+    : false;
+
+  return {
+    hasCompleted: completed.length > 0,
+    hasInProgress: inProgress.length > 0,
+    hasTaken: completed.length > 0 || inProgress.length > 0,
+    resultVisible,
+    rankingCounted,
+    pointsAwarded,
+    scorePercent: latestCompleted ? Number(latestCompleted?.scorePercent || 0) : 0,
+    correctCount,
+    wrongCount,
+    totalQuestions,
+  };
 }
 
 function getPromoVisual(type, colors) {
@@ -392,6 +451,7 @@ export default function ExamScreen() {
   const [expandedOnlineSubjectId, setExpandedOnlineSubjectId] = useState(null);
   const [promoNowTs, setPromoNowTs] = useState(Date.now());
   const [promoCardIndex, setPromoCardIndex] = useState(0);
+  const [onlineExamAttemptState, setOnlineExamAttemptState] = useState({});
   const loadLeadersRef = useRef(null);
   const loadPackagesRef = useRef(null);
   const loadSubjectsFastRef = useRef(null);
@@ -413,6 +473,30 @@ export default function ExamScreen() {
     const id = setInterval(() => setPromoNowTs(Date.now()), 1000);
     return () => clearInterval(id);
   }, [activeFilter]);
+
+  const loadOnlineExamAttemptState = useCallback(async (studentId) => {
+    if (!studentId) {
+      setOnlineExamAttemptState({});
+      return;
+    }
+
+    try {
+      const attemptsRoot = (await getValue([
+        `Platform1/attempts/company/${studentId}`,
+        `attempts/company/${studentId}`,
+      ])) || {};
+
+      const next = {};
+      Object.keys(attemptsRoot || {}).forEach((examKey) => {
+        const examAttempts = attemptsRoot?.[examKey] || {};
+        next[String(examKey)] = summarizeAttemptEntries(examAttempts);
+      });
+
+      setOnlineExamAttemptState(next);
+    } catch {
+      setOnlineExamAttemptState({});
+    }
+  }, []);
 
   const fetchAll = useCallback(async () => {
     setLoading(true);
@@ -449,11 +533,12 @@ export default function ExamScreen() {
         loadLeadersRef.current?.(effectiveGrade),
         loadPackagesRef.current?.(effectiveGrade),
         loadSubjectsFastRef.current?.({ studentId: sid, schoolKey }),
+        loadOnlineExamAttemptState(sid),
       ]);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [loadOnlineExamAttemptState]);
 
   useEffect(() => { fetchAll(); }, [fetchAll]);
 
@@ -1040,19 +1125,84 @@ export default function ExamScreen() {
     setProfileLoading(false);
   }, []);
 
-  const openUpcomingExamPreview = useCallback((subjectName, exam) => {
+  const openUpcomingExamPreview = useCallback((subjectName, exam, variant = "upcoming", attemptState = null) => {
     if (!exam) return;
 
     setSelectedUpcomingExam({
+      variant,
       subjectName: subjectName || "Subject",
-      name: exam?.name || "Upcoming Exam",
+      name: exam?.name || (variant === "pending" ? "Exam pending" : variant === "scored" ? "Exam result" : variant === "taken" ? "Exam already taken" : "Upcoming Exam"),
       startTs: Number(exam?.startTs || 0),
       endTs: Number(exam?.endTs || 0),
       roundId: exam?.roundId || "",
       examId: exam?.examId || "",
+      pointsAwarded: Number(attemptState?.pointsAwarded || 0),
+      scorePercent: Number(attemptState?.scorePercent || 0),
+      correctCount: Number(attemptState?.correctCount || 0),
+      wrongCount: Number(attemptState?.wrongCount || 0),
+      totalQuestions: Number(attemptState?.totalQuestions || 0),
+      resultVisible: !!attemptState?.resultVisible,
     });
     setUpcomingExamModalVisible(true);
   }, []);
+
+  const handleOnlineExamPress = useCallback(async (subjectName, exam, cachedAttemptState = null) => {
+    if (!exam) return;
+
+    const startTs = Number(exam?.startTs || 0);
+
+    if (startTs > promoNowTs) {
+      openUpcomingExamPreview(subjectName, exam, "upcoming");
+      return;
+    }
+
+    if (cachedAttemptState?.hasCompleted) {
+      const previewVariant = !cachedAttemptState?.resultVisible || !cachedAttemptState?.rankingCounted
+        ? "pending"
+        : "scored";
+      openUpcomingExamPreview(subjectName, exam, previewVariant, cachedAttemptState);
+      return;
+    }
+
+    if (!exam?.roundId || !exam?.examId) return;
+
+    try {
+      const sid =
+        (await AsyncStorage.getItem("studentNodeKey")) ||
+        (await AsyncStorage.getItem("studentId")) ||
+        (await AsyncStorage.getItem("username")) ||
+        null;
+
+      if (sid) {
+        const attemptsNode = (await getValue([
+          `Platform1/attempts/company/${sid}/${exam.examId}`,
+          `attempts/company/${sid}/${exam.examId}`,
+        ])) || {};
+
+        const liveAttemptState = summarizeAttemptEntries(attemptsNode);
+
+        if (liveAttemptState.hasCompleted) {
+          const previewVariant = !liveAttemptState?.resultVisible || !liveAttemptState?.rankingCounted
+            ? "pending"
+            : "scored";
+          openUpcomingExamPreview(subjectName, exam, previewVariant, liveAttemptState);
+          return;
+        }
+      }
+    } catch {}
+
+    router.push({
+      pathname: "/examCenter",
+      params: {
+        roundId: exam.roundId,
+        examId: exam.examId,
+        questionBankId: exam.questionBankId || "",
+        mode: "start",
+        returnTo: "exam",
+        returnExamFilter: "online",
+      },
+    });
+  }, [openUpcomingExamPreview, promoNowTs, router]);
 
   const topRankGroups = useMemo(() => {
     const grouped = [];
@@ -1458,42 +1608,70 @@ export default function ExamScreen() {
                     <View style={styles.onlineExamDropWrap}>
                       {item.exams.length ? (
                         item.exams.map((exam, idx) => {
-                          const isUpcoming = Number(exam?.startTs || 0) > promoNowTs;
-                          const canOpenExam = !!exam?.roundId && !!exam?.examId && !isUpcoming;
+                          const startTs = Number(exam?.startTs || 0);
+                          const endTs = Number(exam?.endTs || 0);
+
+                          const hasSetup = !!exam?.roundId && !!exam?.examId;
+                          const attemptState = onlineExamAttemptState[String(exam?.examId || "")] || {};
+                          const hasCompletedAttempt = !!attemptState?.hasCompleted;
+                          const hasInProgressAttempt = !!attemptState?.hasInProgress;
+                          const hasVisibleResult = !!attemptState?.resultVisible;
+                          const hasRankedResult = !!attemptState?.rankingCounted;
+                          const earnedPoints = Number(attemptState?.pointsAwarded || 0);
+
+                          const isUpcoming = startTs > promoNowTs;
+                          const isPending = hasCompletedAttempt && (!hasVisibleResult || !hasRankedResult);
+                          const isScored = hasCompletedAttempt && hasVisibleResult && hasRankedResult;
+                          const isExpired = !hasCompletedAttempt && !hasInProgressAttempt && !!endTs && endTs < promoNowTs;
+                          const isLive = hasSetup && !isUpcoming && !isExpired && !isPending && !isScored && (!!startTs ? startTs <= promoNowTs : true) && (!endTs || endTs >= promoNowTs);
+
+                          const canOpenExam = hasSetup && !isUpcoming && !isExpired && !hasCompletedAttempt;
+                          const canShowPreview = isUpcoming || isPending || isScored;
+
                           const metaText = isUpcoming
-                            ? `Opens in ${formatInlineCountdown(Number(exam.startTs || 0) - promoNowTs)}`
-                            : !exam?.roundId || !exam?.examId
+                            ? `Opens in ${formatInlineCountdown(startTs - promoNowTs)}`
+                            : isPending
+                            ? "Point pending"
+                            : isScored
+                            ? `${earnedPoints} ${earnedPoints === 1 ? "point" : "points"}`
+                            : isExpired
+                            ? "Expired"
+                            : !hasSetup
                             ? "Exam setup unavailable"
-                            : "Tap to start exam";
+                            : endTs
+                            ? `Ends in ${formatInlineCountdown(endTs - promoNowTs)}`
+                            : "Live now";
+
+                          const statusPill = isUpcoming
+                            ? "UPCOMING"
+                            : isPending
+                            ? "PENDING"
+                            : isScored
+                            ? `${earnedPoints} ${earnedPoints === 1 ? "PT" : "PTS"}`
+                            : isExpired
+                            ? "EXPIRED"
+                            : !hasSetup
+                            ? "UNAVAILABLE"
+                            : "LIVE";
 
                           return (
                             <TouchableOpacity
                               key={`${item.id}-exam-${idx}`}
                               style={[
                                 styles.onlineExamDropItem,
-                                (!exam?.roundId || !exam?.examId) && !isUpcoming && styles.onlineExamDropItemDisabled,
+                                !hasSetup && !canShowPreview && !isExpired && styles.onlineExamDropItemDisabled,
                                 isUpcoming && styles.onlineExamDropItemUpcoming,
+                                isLive && styles.onlineExamDropItemLive,
+                                isPending && styles.onlineExamDropItemPending,
+                                isScored && styles.onlineExamDropItemScored,
+                                isExpired && styles.onlineExamDropItemExpired,
                               ]}
                               activeOpacity={0.9}
                               onPress={() => {
-                                if (isUpcoming) {
-                                  openUpcomingExamPreview(item.name, exam);
-                                  return;
-                                }
-                                if (!canOpenExam) return;
-                                router.push({
-                                  pathname: "/examCenter",
-                                  params: {
-                                    roundId: exam.roundId,
-                                    examId: exam.examId,
-                                    questionBankId: exam.questionBankId || "",
-                                    mode: "start",
-                                    returnTo: "exam",
-                                    returnExamFilter: "online",
-                                  },
-                                });
+                                if (!canOpenExam && !canShowPreview) return;
+                                handleOnlineExamPress(item.name, exam, attemptState);
                               }}
-                              disabled={!canOpenExam && !isUpcoming}
+                              disabled={!canOpenExam && !canShowPreview}
                             >
                               <View style={styles.onlineExamDropMain}>
                                 <View style={styles.onlineExamOrderBadge}>
@@ -1506,12 +1684,44 @@ export default function ExamScreen() {
                                     style={[
                                       styles.onlineExamDropMeta,
                                       isUpcoming && styles.onlineExamDropMetaUpcoming,
+                                      isLive && styles.onlineExamDropMetaLive,
+                                      isPending && styles.onlineExamDropMetaPending,
+                                      isScored && styles.onlineExamDropMetaScored,
+                                      isExpired && styles.onlineExamDropMetaExpired,
                                     ]}
                                   >
                                     {metaText}
                                   </Text>
                                 </View>
                               </View>
+
+                              {statusPill ? (
+                                <View
+                                  style={[
+                                    styles.onlineExamStatusPill,
+                                    statusPill === "UPCOMING" && styles.onlineExamStatusPillUpcoming,
+                                    statusPill === "LIVE" && styles.onlineExamStatusPillLive,
+                                    statusPill === "PENDING" && styles.onlineExamStatusPillPending,
+                                    (statusPill === "1 PT" || /PTS$/.test(statusPill)) && styles.onlineExamStatusPillScored,
+                                    statusPill === "EXPIRED" && styles.onlineExamStatusPillExpired,
+                                    statusPill === "UNAVAILABLE" && styles.onlineExamStatusPillUnavailable,
+                                  ]}
+                                >
+                                  <Text
+                                    style={[
+                                      styles.onlineExamStatusText,
+                                      statusPill === "UPCOMING" && styles.onlineExamStatusTextUpcoming,
+                                      statusPill === "LIVE" && styles.onlineExamStatusTextLive,
+                                      statusPill === "PENDING" && styles.onlineExamStatusTextPending,
+                                      (statusPill === "1 PT" || /PTS$/.test(statusPill)) && styles.onlineExamStatusTextScored,
+                                      statusPill === "EXPIRED" && styles.onlineExamStatusTextExpired,
+                                      statusPill === "UNAVAILABLE" && styles.onlineExamStatusTextUnavailable,
+                                    ]}
+                                  >
+                                    {statusPill}
+                                  </Text>
+                                </View>
+                              ) : null}
                             </TouchableOpacity>
                           );
                         })
@@ -1674,8 +1884,18 @@ export default function ExamScreen() {
             <View style={styles.upcomingExamModalGlow} />
 
             <View style={styles.upcomingExamModalBadge}>
-              <Ionicons name="alarm-outline" size={14} color={PRIMARY} />
-              <Text style={styles.upcomingExamModalBadgeText}>Upcoming exam</Text>
+              <Ionicons
+                name={selectedUpcomingExam?.variant === "taken" || selectedUpcomingExam?.variant === "pending" ? "checkmark-circle-outline" : "alarm-outline"}
+                size={14}
+                color={PRIMARY}
+              />
+              <Text style={styles.upcomingExamModalBadgeText}>
+                {selectedUpcomingExam?.variant === "pending"
+                  ? "Pending result"
+                  : selectedUpcomingExam?.variant === "taken"
+                  ? "Exam taken"
+                  : "Upcoming exam"}
+              </Text>
             </View>
 
             <Text style={styles.upcomingExamModalTitle}>
@@ -1685,35 +1905,63 @@ export default function ExamScreen() {
               {(selectedUpcomingExam?.subjectName || "General Subject")} • National Competitive Exam
             </Text>
 
-            <View style={styles.upcomingExamModalInfoRow}>
-              <Ionicons name="calendar-outline" size={14} color={PRIMARY} />
-              <Text style={styles.upcomingExamModalInfoText}>
-                Opens {formatPromoDate(selectedUpcomingExam?.startTs || 0)}
-              </Text>
-            </View>
+            {selectedUpcomingExam?.variant === "taken" || selectedUpcomingExam?.variant === "pending" || selectedUpcomingExam?.variant === "scored" ? (
+              <>
+                <View style={styles.upcomingExamModalNote}>
+                  <Ionicons name="information-circle-outline" size={15} color={PRIMARY} />
+                  <Text style={styles.upcomingExamModalNoteText}>
+                    {selectedUpcomingExam?.variant === "pending"
+                      ? "You took this exam. Exam point pending."
+                      : selectedUpcomingExam?.variant === "scored"
+                      ? `You got ${Number(selectedUpcomingExam?.pointsAwarded || 0)} ${Number(selectedUpcomingExam?.pointsAwarded || 0) === 1 ? "point" : "points"}.`
+                      : "You already took this exam. Exam point pending."}
+                  </Text>
+                </View>
 
-            {selectedUpcomingExam?.startTs ? (
-              <View style={styles.upcomingExamModalCountdownRow}>
-                {formatCountdownParts(
-                  Math.max(0, Number(selectedUpcomingExam?.startTs || 0) - promoNowTs)
-                ).map((part) => (
-                  <View
-                    key={`${selectedUpcomingExam?.examId || selectedUpcomingExam?.roundId || part.label}-${part.label}`}
-                    style={styles.upcomingExamModalCountdownBlock}
-                  >
-                    <Text style={styles.upcomingExamModalCountdownValue}>{part.value}</Text>
-                    <Text style={styles.upcomingExamModalCountdownLabel}>{part.label}</Text>
+                <View style={{ flexDirection: "row", gap: 10, marginTop: 12 }}>
+                  <View style={{ flex: 1, borderWidth: 1, borderColor: colors.successBorder, backgroundColor: colors.successSurface, borderRadius: 14, paddingVertical: 10, alignItems: "center" }}>
+                    <Text style={{ color: colors.muted, fontSize: 11, fontWeight: "700" }}>Correct</Text>
+                    <Text style={{ color: colors.success, fontSize: 18, fontWeight: "900", marginTop: 4 }}>{Number(selectedUpcomingExam?.correctCount || 0)}</Text>
                   </View>
-                ))}
-              </View>
-            ) : null}
+                  <View style={{ flex: 1, borderWidth: 1, borderColor: colors.dangerBorder, backgroundColor: colors.dangerSurface, borderRadius: 14, paddingVertical: 10, alignItems: "center" }}>
+                    <Text style={{ color: colors.muted, fontSize: 11, fontWeight: "700" }}>Wrong</Text>
+                    <Text style={{ color: colors.danger, fontSize: 18, fontWeight: "900", marginTop: 4 }}>{Number(selectedUpcomingExam?.wrongCount || 0)}</Text>
+                  </View>
+                </View>
+              </>
+            ) : (
+              <>
+                <View style={styles.upcomingExamModalInfoRow}>
+                  <Ionicons name="calendar-outline" size={14} color={PRIMARY} />
+                  <Text style={styles.upcomingExamModalInfoText}>
+                    Opens {formatPromoDate(selectedUpcomingExam?.startTs || 0)}
+                  </Text>
+                </View>
 
-            <View style={styles.upcomingExamModalNote}>
-              <Ionicons name="sparkles-outline" size={15} color={PRIMARY} />
-              <Text style={styles.upcomingExamModalNoteText}>
-                This exam will open soon. When the countdown ends, come back here and start it from the subject list.
-              </Text>
-            </View>
+                {selectedUpcomingExam?.startTs ? (
+                  <View style={styles.upcomingExamModalCountdownRow}>
+                    {formatCountdownParts(
+                      Math.max(0, Number(selectedUpcomingExam?.startTs || 0) - promoNowTs)
+                    ).map((part) => (
+                      <View
+                        key={`${selectedUpcomingExam?.examId || selectedUpcomingExam?.roundId || part.label}-${part.label}`}
+                        style={styles.upcomingExamModalCountdownBlock}
+                      >
+                        <Text style={styles.upcomingExamModalCountdownValue}>{part.value}</Text>
+                        <Text style={styles.upcomingExamModalCountdownLabel}>{part.label}</Text>
+                      </View>
+                    ))}
+                  </View>
+                ) : null}
+
+                <View style={styles.upcomingExamModalNote}>
+                  <Ionicons name="sparkles-outline" size={15} color={PRIMARY} />
+                  <Text style={styles.upcomingExamModalNoteText}>
+                    This exam will open soon. When the countdown ends, come back here and start it from the subject list.
+                  </Text>
+                </View>
+              </>
+            )}
 
             <TouchableOpacity style={styles.closeBtn} onPress={() => setUpcomingExamModalVisible(false)}>
               <Text style={styles.closeBtnText}>Close</Text>
@@ -1829,6 +2077,7 @@ export default function ExamScreen() {
     practiceExamPackages,
     promoCardIndex,
     promoNowTs,
+    onlineExamAttemptState,
     profileLoading,
     profileModalVisible,
     handlePromoScrollEnd,
@@ -1837,6 +2086,7 @@ export default function ExamScreen() {
     selectedProfile,
     studentGrade,
     styles,
+    colors,
     subjects,
     topTieCandidates,
     topTiePickerVisible,
@@ -1850,7 +2100,8 @@ export default function ExamScreen() {
     heroProfilesTranslateY,
     handleTopRankPress,
     openTopProfile,
-    openUpcomingExamPreview,
+    handleOnlineExamPress,
+    promoCarouselCardWidth,
   ]);
 
   if (loading) {
@@ -2812,6 +3063,27 @@ function createStyles(colors) {
     borderColor: colors.primary,
     backgroundColor: colors.soft,
   },
+  onlineExamDropItemLive: {
+    borderColor: colors.warningBorder,
+    backgroundColor: colors.warningSurface,
+  },
+  onlineExamDropItemPending: {
+    borderColor: colors.infoBorder,
+    backgroundColor: colors.infoSurface,
+  },
+  onlineExamDropItemScored: {
+    borderColor: colors.successBorder,
+    backgroundColor: colors.successSurface,
+  },
+  onlineExamDropItemFailed: {
+    borderColor: colors.dangerBorder,
+    backgroundColor: colors.dangerSurface,
+  },
+  onlineExamDropItemExpired: {
+    borderColor: colors.border,
+    backgroundColor: colors.surfaceMuted,
+    opacity: 0.7,
+  },
   onlineExamDropMain: {
     flex: 1,
     flexDirection: "row",
@@ -2852,6 +3124,89 @@ function createStyles(colors) {
   onlineExamDropMetaUpcoming: {
     color: PRIMARY,
     fontWeight: "800",
+  },
+  onlineExamDropMetaLive: {
+    color: colors.warningText,
+    fontWeight: "800",
+  },
+  onlineExamDropMetaPending: {
+    color: colors.primary,
+    fontWeight: "800",
+  },
+  onlineExamDropMetaScored: {
+    color: colors.success,
+    fontWeight: "800",
+  },
+  onlineExamDropMetaFailed: {
+    color: colors.danger,
+    fontWeight: "800",
+  },
+  onlineExamDropMetaExpired: {
+    color: colors.muted,
+    fontWeight: "800",
+  },
+  onlineExamStatusPill: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.inputBackground,
+  },
+  onlineExamStatusPillUpcoming: {
+    borderColor: colors.infoBorder,
+    backgroundColor: colors.infoSurface,
+  },
+  onlineExamStatusPillLive: {
+    borderColor: colors.warningBorder,
+    backgroundColor: colors.warningSurface,
+  },
+  onlineExamStatusPillPending: {
+    borderColor: colors.infoBorder,
+    backgroundColor: colors.infoSurface,
+  },
+  onlineExamStatusPillScored: {
+    borderColor: colors.successBorder,
+    backgroundColor: colors.successSurface,
+  },
+  onlineExamStatusPillFail: {
+    borderColor: colors.dangerBorder,
+    backgroundColor: colors.dangerSurface,
+  },
+  onlineExamStatusPillExpired: {
+    borderColor: colors.border,
+    backgroundColor: colors.surfaceMuted,
+  },
+  onlineExamStatusPillUnavailable: {
+    borderColor: colors.border,
+    backgroundColor: colors.inputBackground,
+  },
+  onlineExamStatusText: {
+    fontSize: 10,
+    fontWeight: "900",
+    letterSpacing: 0.5,
+    color: colors.muted,
+  },
+  onlineExamStatusTextUpcoming: {
+    color: colors.primary,
+  },
+  onlineExamStatusTextLive: {
+    color: colors.warningText,
+  },
+  onlineExamStatusTextPending: {
+    color: colors.primary,
+  },
+  onlineExamStatusTextScored: {
+    color: colors.success,
+  },
+  onlineExamStatusTextFail: {
+    color: colors.danger,
+  },
+  onlineExamStatusTextExpired: {
+    color: colors.muted,
+  },
+  onlineExamStatusTextUnavailable: {
+    color: colors.muted,
   },
   onlineExamDropEmptyRow: {
     paddingVertical: 10,

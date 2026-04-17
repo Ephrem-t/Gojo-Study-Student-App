@@ -41,6 +41,7 @@ const MAX_NOTES_PER_CHAPTER = 5;
 
 const BOOKS_DIR = `${FileSystem.documentDirectory}books/`;
 const DOWNLOAD_INDEX_KEY = "downloaded_books_index_v1";
+const BOOK_CATALOG_CACHE_KEY = "book_catalog_cache_v1";
 const BOOK_SETTINGS_KEY = "book_settings_v1";
 const READER_PROGRESS_KEY = "book_reader_progress_v1";
 const READER_BOOKMARKS_KEY = "book_reader_bookmarks_v1";
@@ -92,6 +93,113 @@ function normalizeGradeKey(g) {
   if (!g) return null;
   const s = String(g).toLowerCase().replace("grade", "").trim();
   return `grade${s}`;
+}
+
+function normalizeOfflineEntityKey(value, fallback = "item") {
+  const normalized = String(value || fallback || "item")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+
+  return normalized || fallback;
+}
+
+function sortSubjectUnits(a, b) {
+  const leftOrder = Number(a?.order || 0);
+  const rightOrder = Number(b?.order || 0);
+
+  if (leftOrder && rightOrder && leftOrder !== rightOrder) {
+    return leftOrder - rightOrder;
+  }
+
+  if (leftOrder && !rightOrder) return -1;
+  if (!leftOrder && rightOrder) return 1;
+
+  return String(a?.title || "").localeCompare(String(b?.title || ""));
+}
+
+function mapBooksCatalogToSubjects(booksObj) {
+  return Object.keys(booksObj || {})
+    .map((subjectKey) => {
+      const subjectValue = booksObj[subjectKey] || {};
+      const unitsObj = subjectValue.units || {};
+
+      const units = Object.keys(unitsObj)
+        .map((unitKey, index) => {
+          const unitValue = unitsObj[unitKey] || {};
+          return {
+            unitKey,
+            order: Number(String(unitKey).replace(/\D/g, "")) || index + 1,
+            title: unitValue.title || titleize(unitKey),
+            pdfUrl: unitValue.pdfUrl || null,
+          };
+        })
+        .sort(sortSubjectUnits);
+
+      return {
+        subjectKey,
+        subjectName: titleize(subjectKey),
+        title: subjectValue.title || titleize(subjectKey),
+        coverUrl: String(
+          subjectValue.coverUrl ||
+          subjectValue.cover ||
+          subjectValue.image ||
+          subjectValue.coverImage ||
+          ""
+        ).trim() || null,
+        language: subjectValue.language || "",
+        region: subjectValue.region || "",
+        units,
+        totalUnits: units.length,
+      };
+    })
+    .sort((left, right) => String(left.subjectName || left.title || "").localeCompare(String(right.subjectName || right.title || "")));
+}
+
+function buildOfflineSubjectsFromDownloads(files = []) {
+  if (!Array.isArray(files) || files.length === 0) return [];
+
+  const sortedFiles = [...files].sort((left, right) => {
+    const subjectCompare = String(left.subjectName || "Downloaded chapters").localeCompare(String(right.subjectName || "Downloaded chapters"));
+    if (subjectCompare !== 0) return subjectCompare;
+    return sortSubjectUnits(left, right);
+  });
+
+  const subjects = new Map();
+
+  sortedFiles.forEach((file, index) => {
+    const subjectName = String(file.subjectName || "Downloaded chapters").trim() || "Downloaded chapters";
+    const subjectKey = normalizeOfflineEntityKey(file.subjectKey || subjectName, `downloaded_subject_${index + 1}`);
+
+    const subject = subjects.get(subjectKey) || {
+      subjectKey,
+      subjectName,
+      title: subjectName,
+      coverUrl: file.coverUrl || null,
+      language: file.language || "",
+      region: file.region || "",
+      units: [],
+    };
+
+    subject.units.push({
+      unitKey: normalizeOfflineEntityKey(file.unitKey || file.name || file.title, `${subjectKey}_unit_${subject.units.length + 1}`),
+      order: Number(file.unitOrder || file.order || subject.units.length + 1) || subject.units.length + 1,
+      title: file.title || file.name || `Chapter ${subject.units.length + 1}`,
+      pdfUrl: file.url || null,
+      localUri: file.uri || null,
+    });
+
+    subjects.set(subjectKey, subject);
+  });
+
+  return Array.from(subjects.values())
+    .map((subject) => ({
+      ...subject,
+      units: subject.units.sort(sortSubjectUnits),
+      totalUnits: subject.units.length,
+    }))
+    .sort((left, right) => String(left.subjectName || left.title || "").localeCompare(String(right.subjectName || right.title || "")));
 }
 
 function getSubjectIcon(subjectName) {
@@ -319,6 +427,8 @@ export default function BooksScreen() {
   const readerProgressRef = useRef({});
   const readerProgressSaveTimeoutRef = useRef(null);
   const readerBookmarksRef = useRef({});
+  const downloadedFilesListRef = useRef([]);
+  const hasLoadedBooksRef = useRef(false);
   const viewerLocalUriRef = useRef(null);
   const pdfViewRef = useRef(null);
   const readerTextIndexRef = useRef(null);
@@ -658,6 +768,10 @@ export default function BooksScreen() {
     };
   }, [viewer.visible]);
 
+  useEffect(() => {
+    downloadedFilesListRef.current = downloadedFilesList;
+  }, [downloadedFilesList]);
+
   const downloadedUriSet = useMemo(() => {
   return new Set(downloadedFilesList.map((f) => f.uri));
 }, [downloadedFilesList]);
@@ -703,14 +817,49 @@ export default function BooksScreen() {
     await AsyncStorage.setItem(DOWNLOAD_INDEX_KEY, JSON.stringify(idx || {}));
   }, []);
 
+  const loadBookCatalogCache = useCallback(async () => {
+    try {
+      const raw = await AsyncStorage.getItem(BOOK_CATALOG_CACHE_KEY);
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
+    }
+  }, []);
+
+  const saveBookCatalogForGrade = useCallback(async (gradeKey, subjectList) => {
+    if (!gradeKey || !Array.isArray(subjectList)) return;
+
+    const cache = await loadBookCatalogCache();
+    cache[gradeKey] = {
+      updatedAt: Date.now(),
+      subjects: subjectList,
+    };
+
+    await AsyncStorage.setItem(BOOK_CATALOG_CACHE_KEY, JSON.stringify(cache));
+  }, [loadBookCatalogCache]);
+
+  const getBookCatalogForGrade = useCallback(async (gradeKey) => {
+    if (!gradeKey) return [];
+
+    const cache = await loadBookCatalogCache();
+    return Array.isArray(cache?.[gradeKey]?.subjects) ? cache[gradeKey].subjects : [];
+  }, [loadBookCatalogCache]);
+
   const registerDownloadMetadata = useCallback(async (url, meta) => {
     const filename = getLocalFilename(url);
     if (!filename) return;
     const idx = await loadDownloadIndex();
+    const normalizedUnitOrder = Number(meta.unitOrder || meta.order || 0);
     idx[filename] = {
       url,
       title: meta.title || filename,
       subjectName: meta.subjectName || null,
+      subjectKey: meta.subjectKey || null,
+      unitKey: meta.unitKey || null,
+      unitOrder: normalizedUnitOrder > 0 ? normalizedUnitOrder : null,
+      coverUrl: meta.coverUrl || null,
+      language: meta.language || "",
+      region: meta.region || "",
       downloadedAt: Date.now(),
     };
     await saveDownloadIndex(idx);
@@ -758,11 +907,19 @@ export default function BooksScreen() {
         title: meta.title || name,
         url: meta.url || null,
         subjectName: meta.subjectName || null,
+        subjectKey: meta.subjectKey || null,
+        unitKey: meta.unitKey || null,
+        unitOrder: Number(meta.unitOrder || 0) || 0,
+        coverUrl: meta.coverUrl || null,
+        language: meta.language || "",
+        region: meta.region || "",
+        downloadedAt: meta.downloadedAt || 0,
       });
     }
 
     list.sort((a, b) => (b.modificationTime || 0) - (a.modificationTime || 0));
     setDownloadedFilesList(list);
+    return list;
   }, [ensureBooksDir, loadDownloadIndex, removeDownloadMetadata]);
 
   const deleteLocalPdfCopy = useCallback(async (
@@ -1505,91 +1662,75 @@ export default function BooksScreen() {
     }
   }, []);
 
+  const applyLoadedSubjects = useCallback((list) => {
+    const safeList = Array.isArray(list) ? list : [];
+    setSubjects(safeList);
+    setBrokenCoverMap({});
+
+  }, []);
+
+  useEffect(() => {
+    if (!settings.autoExpandSubjects) return;
+
+    const expandedMap = {};
+    subjects.forEach((subject) => {
+      expandedMap[subject.subjectKey] = true;
+    });
+    setExpanded(expandedMap);
+  }, [settings.autoExpandSubjects, subjects]);
+
   const loadBooks = useCallback(async () => {
-    setLoading(true);
+    const shouldShowLoader = !hasLoadedBooksRef.current;
+    let offlineSubjects = buildOfflineSubjectsFromDownloads(downloadedFilesListRef.current);
+
+    if (shouldShowLoader) {
+      setLoading(true);
+    }
+
     try {
       await ensureBooksDir();
-      await refreshDownloadedFiles();
+      const downloadedFiles = await refreshDownloadedFiles();
+      offlineSubjects = buildOfflineSubjectsFromDownloads(downloadedFiles);
       await loadSettings();
 
       const ctx = await loadStudentContext();
-      if (!ctx?.grade) {
-        setSubjects([]);
-        setLoading(false);
-        return;
+      const gradeKey = normalizeGradeKey(ctx?.grade);
+      const cachedSubjects = await getBookCatalogForGrade(gradeKey);
+      let nextSubjects = cachedSubjects.length ? cachedSubjects : offlineSubjects;
+
+      if (ctx?.grade && gradeKey) {
+        try {
+          const snap = await get(ref(database, `Platform1/TextBooks/${gradeKey}`));
+
+          if (snap.exists()) {
+            nextSubjects = mapBooksCatalogToSubjects(snap.val() || {});
+            await saveBookCatalogForGrade(gradeKey, nextSubjects);
+          }
+        } catch (err) {
+          console.warn("TextBooks remote load error:", err);
+        }
+
+        await loadNotes(ctx);
       }
 
-      const gradeKey = normalizeGradeKey(ctx.grade);
-      const snap = await get(ref(database, `Platform1/TextBooks/${gradeKey}`));
-
-      if (!snap.exists()) {
-        setSubjects([]);
-        setLoading(false);
-        return;
-      }
-
-      const booksObj = snap.val() || {};
-      const list = Object.keys(booksObj).map((subjectKey) => {
-        const b = booksObj[subjectKey] || {};
-        const unitsObj = b.units || {};
-
-        const units = Object.keys(unitsObj)
-          .map((uk, idx) => {
-            const u = unitsObj[uk] || {};
-            return {
-              unitKey: uk,
-              order: Number(String(uk).replace(/\D/g, "")) || idx + 1,
-              title: u.title || titleize(uk),
-              pdfUrl: u.pdfUrl || null,
-            };
-          })
-          .sort((a, b2) => a.order - b2.order);
-
-        return {
-          subjectKey,
-          subjectName: titleize(subjectKey),
-          title: b.title || titleize(subjectKey),
-          coverUrl:
-            String(
-              b.coverUrl || b.cover || b.image || b.coverImage || ""
-            ).trim() || null,
-          language: b.language || "",
-          region: b.region || "",
-          units,
-          totalUnits: units.length,
-        };
-      });
-
-      setSubjects(list);
-  setBrokenCoverMap({});
-
-      if (settings.autoExpandSubjects) {
-        const expandedMap = {};
-        list.forEach((s) => {
-          expandedMap[s.subjectKey] = true;
-        });
-        setExpanded(expandedMap);
-      }
-
-      await loadNotes(ctx);
+      applyLoadedSubjects(nextSubjects);
     } catch (err) {
       console.warn("TextBooks load error:", err);
-      setSubjects([]);
+      applyLoadedSubjects(offlineSubjects);
     } finally {
+      hasLoadedBooksRef.current = true;
       setLoading(false);
     }
   }, [
+    applyLoadedSubjects,
     ensureBooksDir,
+    getBookCatalogForGrade,
     refreshDownloadedFiles,
     loadSettings,
     loadStudentContext,
-    settings.autoExpandSubjects,
     loadNotes,
+    saveBookCatalogForGrade,
   ]);
-
-  useEffect(() => {
-    loadBooks();
-  }, [loadBooks]);
 
   useFocusEffect(
     useCallback(() => {
@@ -1628,8 +1769,8 @@ export default function BooksScreen() {
       filtered = filtered
         .map((subject) => {
           const units = subject.units.filter((u) => {
-            const path = getLocalPathForUrl(u.pdfUrl);
-            return downloadedFilesList.some((f) => f.uri === path);
+            const path = u.localUri || getLocalPathForUrl(u.pdfUrl);
+            return path ? downloadedFilesList.some((f) => f.uri === path) : false;
           });
           return { ...subject, units, totalUnits: units.length };
         })
@@ -1750,9 +1891,26 @@ export default function BooksScreen() {
     }
   }, [loadNotes, noteSheet.subject, noteSheet.unit, schoolCode, studentGrade, studentId]);
 
-  const openUnit = useCallback(async (unit, subjectName) => {
+  const openUnit = useCallback(async (unit, subject) => {
+    const subjectName = typeof subject === "string"
+      ? subject
+      : subject?.subjectName || subject?.title || unit.subjectName || "";
     const url = unit.pdfUrl;
-    if (!url) return Alert.alert("No PDF", "This unit has no pdfUrl.");
+
+    if (unit.localUri && downloadedUriSet.has(unit.localUri)) {
+      openLocalPdfInViewer(unit.localUri, unit.title, subjectName);
+      return;
+    }
+
+    if (!url) {
+      if (unit.localUri) {
+        openLocalPdfInViewer(unit.localUri, unit.title, subjectName);
+        return;
+      }
+
+      Alert.alert("Offline only", "This chapter is not available from the internet right now, but saved chapters will still open offline.");
+      return;
+    }
 
     if (downloadingMap[url]) {
       Alert.alert("Download in progress", "Wait for this chapter to finish downloading before opening it.");
@@ -1776,7 +1934,16 @@ export default function BooksScreen() {
 
     if (!localUri) {
       try {
-        localUri = await downloadToLocal(url, { title: unit.title, subjectName });
+        localUri = await downloadToLocal(url, {
+          title: unit.title,
+          subjectName,
+          subjectKey: typeof subject === "object" ? subject?.subjectKey || null : unit.subjectKey || null,
+          unitKey: unit.unitKey || null,
+          unitOrder: unit.order || null,
+          coverUrl: typeof subject === "object" ? subject?.coverUrl || null : null,
+          language: typeof subject === "object" ? subject?.language || "" : "",
+          region: typeof subject === "object" ? subject?.region || "" : "",
+        });
       } catch {
         Alert.alert("Download failed", "This chapter could not be saved to your phone. Please try downloading it again.");
         return;
@@ -1786,9 +1953,21 @@ export default function BooksScreen() {
     openLocalPdfInViewer(localUri, unit.title, subjectName);
   }, [downloadToLocal, downloadedUriSet, downloadingMap, getLocalPathForUrl, openLocalPdfInViewer]);
 
-  const downloadOrCancel = useCallback(async (unit, subjectName) => {
+  const downloadOrCancel = useCallback(async (unit, subject) => {
+    const subjectName = typeof subject === "string"
+      ? subject
+      : subject?.subjectName || subject?.title || unit.subjectName || "";
     const url = unit.pdfUrl;
-    if (!url) return Alert.alert("No PDF", "This unit has no pdfUrl.");
+
+    if (!url) {
+      if (unit.localUri) {
+        Alert.alert("Saved chapter", "This chapter is already downloaded and can be opened offline from the chapter row.");
+        return;
+      }
+
+      Alert.alert("No PDF", "This unit has no pdfUrl.");
+      return;
+    }
 
     if (downloadingMap[url]) {
       return Alert.alert("Cancel download?", "", [
@@ -1798,7 +1977,16 @@ export default function BooksScreen() {
     }
 
     try {
-      await downloadToLocal(url, { title: unit.title, subjectName });
+      await downloadToLocal(url, {
+        title: unit.title,
+        subjectName,
+        subjectKey: typeof subject === "object" ? subject?.subjectKey || null : unit.subjectKey || null,
+        unitKey: unit.unitKey || null,
+        unitOrder: unit.order || null,
+        coverUrl: typeof subject === "object" ? subject?.coverUrl || null : null,
+        language: typeof subject === "object" ? subject?.language || "" : "",
+        region: typeof subject === "object" ? subject?.region || "" : "",
+      });
       Alert.alert("Done", "Unit downloaded.");
     } catch {
       Alert.alert("Failed", "Download failed.");
@@ -2115,20 +2303,21 @@ export default function BooksScreen() {
 
   function UnitRow({ unit, subject, index }) {
     const url = unit.pdfUrl;
-    const isDownloading = !!downloadingMap[url];
+    const isDownloading = !!(url && downloadingMap[url]);
     const progress = Math.round((downloadProgress[url] || 0) * 100);
     const noteKey = `${subject.subjectKey}__${unit.unitKey}`;
     const chapterNotes = notesMap[noteKey] || [];
     const hasNote = chapterNotes.length > 0;
 
-    const downloaded = !!url && downloadedUriSet.has(getLocalPathForUrl(url));
+    const resolvedLocalUri = unit.localUri || (url ? getLocalPathForUrl(url) : null);
+    const downloaded = !!resolvedLocalUri && downloadedUriSet.has(resolvedLocalUri);
 
     return (
       <View style={[styles.unitRow, settings.compactMode && styles.unitRowCompact]}>
         <TouchableOpacity
           style={styles.unitMainTap}
           activeOpacity={0.75}
-          onPress={() => openUnit(unit, subject.subjectName)}
+          onPress={() => openUnit(unit, subject)}
         >
           <View style={styles.unitOrderBadge}>
             <Text style={styles.unitOrderText}>{unit.order || index + 1}</Text>
@@ -2164,7 +2353,7 @@ export default function BooksScreen() {
             </TouchableOpacity>
 
             <TouchableOpacity
-              onPress={() => downloadOrCancel(unit, subject.subjectName)}
+              onPress={() => downloadOrCancel(unit, subject)}
               style={[styles.iconDownload, downloaded ? styles.iconDownloaded : null]}
             >
               <Ionicons
@@ -2576,7 +2765,7 @@ export default function BooksScreen() {
         </View>
       </Modal>
 
-      <Modal visible={viewer.visible} animationType="slide" onRequestClose={closeViewer}>
+      <Modal visible={viewer.visible} animationType="none" onRequestClose={closeViewer}>
         <SafeAreaView style={styles.readerContainer}>
           <View style={readerBodyWrapStyle}>
             {viewer.localUri && NativePdfView ? (
@@ -2584,7 +2773,7 @@ export default function BooksScreen() {
                 <NativePdfView
                   ref={pdfViewRef}
                   key={`${viewer.localUri}-${viewer.reloadKey}-${viewer.readerMode}`}
-                  source={{ uri: viewer.localUri, cache: true }}
+                  source={{ uri: viewer.localUri, cache: false }}
                   page={viewer.initialPage}
                   style={styles.readerWebView}
                   fitPolicy={0}
@@ -2593,6 +2782,7 @@ export default function BooksScreen() {
                   spacing={viewer.readerMode === READER_MODE_PAGED ? 0 : 12}
                   horizontal={viewer.readerMode === READER_MODE_PAGED}
                   enablePaging={viewer.readerMode === READER_MODE_PAGED}
+                  enableAntialiasing
                   enableAnnotationRendering
                   onLoadProgress={(progress) => setViewerLoadProgress(Number(progress || 0))}
                   onLoadComplete={handleViewerLoadComplete}

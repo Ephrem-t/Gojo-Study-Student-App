@@ -78,15 +78,45 @@ function getBadgeAndPoints(examMeta, percent) {
   }
   return { badge, points };
 }
-function inWindow(roundMeta) {
-  const now = Date.now();
-  const start = toMsTs(roundMeta?.startTimestamp);
-  const end = toMsTs(roundMeta?.endTimestamp);
-  if (!start && !end) return true;
-  if (start && now < start) return false;
-  if (end && now > end) return false;
-  return true;
+function getRoundWindow(roundMeta = {}, now = Date.now()) {
+  const start = toMsTs(
+    roundMeta?.startTimestamp ??
+    roundMeta?.releaseTimestamp ??
+    roundMeta?.startAt ??
+    roundMeta?.startsAt ??
+    0
+  );
+  const end = toMsTs(
+    roundMeta?.endTimestamp ??
+    roundMeta?.endAt ??
+    roundMeta?.endsAt ??
+    0
+  );
+  const status = String(roundMeta?.status || "").toLowerCase();
+
+  const beforeStart = !!start && now < start;
+  const afterEnd = !!end && now > end;
+  const explicitLive = ["live", "active", "open", "ongoing"].includes(status);
+
+  if (explicitLive && !afterEnd) {
+    return { ok: true, start, end, reason: "", hasWindow: !!(start || end) };
+  }
+
+  if (!start && !end) {
+    return { ok: true, start: 0, end: 0, reason: "", hasWindow: false };
+  }
+
+  if (beforeStart) {
+    return { ok: false, start, end, reason: "This exam is not live yet.", hasWindow: true };
+  }
+
+  if (afterEnd) {
+    return { ok: false, start, end, reason: "This live exam has ended.", hasWindow: true };
+  }
+
+  return { ok: true, start, end, reason: "", hasWindow: true };
 }
+
 function shuffleArray(arr) {
   const a = arr.slice();
   for (let i = a.length - 1; i > 0; i--) {
@@ -295,17 +325,34 @@ const gradeLabel = useMemo(() => {
     }
   }, []);
 
-  const findRoundMetaById = useCallback(async (rid) => {
+  const findRoundMetaById = useCallback(async (rid, targetExamId = null, targetQuestionBankId = null) => {
     const pkgs = await getValue([`Platform1/companyExams/packages`, `companyExams/packages`]);
     if (!pkgs) return null;
+
+    let fallbackMatch = null;
+
     for (const pkgKey of Object.keys(pkgs)) {
       const subjects = (pkgs[pkgKey] || {}).subjects || {};
       for (const sk of Object.keys(subjects)) {
         const rounds = (subjects[sk] || {}).rounds || {};
-        if (rounds[rid]) return { ...(rounds[rid] || {}), id: rid, packageId: pkgKey, subjectKey: sk };
+        if (!rounds[rid]) continue;
+
+        const candidate = { ...(rounds[rid] || {}), id: rid, packageId: pkgKey, subjectKey: sk };
+        const candidateExamId = String(candidate?.examId || "");
+        const candidateQuestionBankId = String(candidate?.questionBankId || "");
+
+        if (
+          (targetExamId && candidateExamId === String(targetExamId)) ||
+          (targetQuestionBankId && candidateQuestionBankId === String(targetQuestionBankId))
+        ) {
+          return candidate;
+        }
+
+        if (!fallbackMatch) fallbackMatch = candidate;
       }
     }
-    return null;
+
+    return fallbackMatch;
   }, []);
 
   const submitExam = useCallback(async () => {
@@ -457,8 +504,19 @@ const gradeLabel = useMemo(() => {
             setGlobalLastConsumedAt(computedLastConsumed || null);
           }
         } else {
+          const starterLives = {
+            currentLives: defaultMaxLives,
+            maxLives: defaultMaxLives,
+            refillIntervalMs: defaultRefillMs,
+            lastConsumedAt: 0,
+          };
+
+          await safeUpdate({
+            [`Platform1/studentLives/${sid}`]: starterLives,
+          }).catch(() => {});
+
           if (!cancelled) {
-            setGlobalLives(null);
+            setGlobalLives(defaultMaxLives);
             setGlobalMaxLives(defaultMaxLives);
             setGlobalRefillMs(defaultRefillMs);
             setGlobalLastConsumedAt(null);
@@ -466,7 +524,7 @@ const gradeLabel = useMemo(() => {
         }
       }
 
-      const rMeta = await findRoundMetaById(roundId);
+      const rMeta = await findRoundMetaById(roundId, examId, questionBankIdParam);
       if (!cancelled) setRoundMeta(rMeta || null);
 
       const exam = await getValue([
@@ -755,19 +813,52 @@ useEffect(() => {
   const attemptsUsedForUI = Number.isFinite(effectiveAttemptsUsed)
     ? effectiveAttemptsUsed
     : Number(attemptsUsed || 0);
-  const attemptsLeft = Math.max(0, Number(examMeta?.maxAttempts || 1) - attemptsUsedForUI);
+  const maxAttemptsAllowed = isCompetitive ? 1 : Number(examMeta?.maxAttempts || 1);
+  const attemptsLeft = Math.max(0, maxAttemptsAllowed - attemptsUsedForUI);
+
+  const consumeCompetitiveExamHeart = useCallback(async () => {
+    if (!studentId) return true;
+
+    const currentLives = Number(globalLives ?? 0);
+    if (currentLives <= 0) {
+      setOutOfLivesModalVisible(true);
+      return false;
+    }
+
+    const livesPath = `Platform1/studentLives/${studentId}`;
+    const now = Date.now();
+
+    try {
+      await runTransactionSafe(`${livesPath}/currentLives`, (curr) => Math.max(0, Number(curr ?? currentLives) - 1));
+      await safeUpdate({ [`${livesPath}/lastConsumedAt`]: now }).catch(() => {});
+
+      const updated = await get(ref(database, livesPath)).catch(() => null);
+      if (updated?.exists()) {
+        const val = updated.val() || {};
+        setGlobalLives(Number(val.currentLives ?? val.current ?? Math.max(0, currentLives - 1)));
+        setGlobalLastConsumedAt(toMsTs(val.lastConsumedAt ?? val.lastConsumed ?? now));
+      } else {
+        setGlobalLives(Math.max(0, currentLives - 1));
+        setGlobalLastConsumedAt(now);
+      }
+      return true;
+    } catch (e) {
+      console.warn("consumeCompetitiveExamHeart failed", e);
+      return true;
+    }
+  }, [studentId, globalLives]);
 
   const startExam = useCallback(async () => {
     if (!examMeta) return Alert.alert("Cannot start", "Exam metadata unavailable.");
 
-    const maxAttempts = Number(examMeta?.maxAttempts || 1);
+    const maxAttempts = isCompetitive ? 1 : Number(examMeta?.maxAttempts || 1);
     if (attemptsUsedForUI >= maxAttempts && !inProgressAttempt) return;
 
     if (examMeta?.scoringEnabled && (!questions || questions.length === 0)) {
       return Alert.alert("Cannot start", questionLoadError || "Question bank not loaded yet.");
     }
 
-    if (!isCompetitive && globalLives === 0) {
+    if (globalLives === 0) {
       setOutOfLivesModalVisible(true);
       return;
     }
@@ -775,6 +866,11 @@ useEffect(() => {
     const ids = questions.map((q) => q.id);
     if (!ids.length) return Alert.alert("No questions", "Question data not found for this exam.");
     if (inProgressAttempt && attemptId) return Alert.alert("Resume available", "You have an unfinished attempt. Use Resume Test.");
+
+    if (isCompetitive) {
+      const consumed = await consumeCompetitiveExamHeart();
+      if (!consumed) return;
+    }
 
     const qOrder = shuffleArray(ids);
     setOrder(qOrder);
@@ -798,7 +894,7 @@ useEffect(() => {
     }, 1000);
 
     setStage("exam");
-  }, [examMeta, attemptsUsedForUI, inProgressAttempt, questions, questionLoadError, isCompetitive, globalLives, attemptId, persistStartAttempt, submitExam]);
+  }, [examMeta, attemptsUsedForUI, inProgressAttempt, questions, questionLoadError, isCompetitive, globalLives, attemptId, persistStartAttempt, submitExam, consumeCompetitiveExamHeart]);
 
   const resumeExam = useCallback(() => {
     if (!inProgressAttempt || !attemptId) return Alert.alert("No attempt to resume");
@@ -862,17 +958,19 @@ useEffect(() => {
       return { ok: false, reason: "Question bank not loaded yet. Try again in a moment." };
     }
 
-    const maxAttempts = Number(examMeta?.maxAttempts || 1);
-    if (attemptsUsedForUI >= maxAttempts && !inProgressAttempt) return { ok: false, reason: "No attempts left for this exam." };
+    const maxAttempts = isCompetitive ? 1 : Number(examMeta?.maxAttempts || 1);
 
-    if (isCompetitive && lastCompletedAttempt && roundMeta?.endTimestamp) {
-      if (Date.now() < toMsTs(roundMeta.endTimestamp)) {
-        return { ok: false, reason: "You completed this competitive exam. Results will be available after the round ends." };
-      }
+    if (isCompetitive && lastCompletedAttempt && !inProgressAttempt) {
+      return { ok: false, reason: "You already took this exam. Wait until points are released." };
     }
 
-    if (roundMeta?.startTimestamp && roundMeta?.endTimestamp && !inWindow(roundMeta)) {
-      return { ok: false, reason: "This exam is outside the allowed time window." };
+    if (attemptsUsedForUI >= maxAttempts && !inProgressAttempt) {
+      return { ok: false, reason: isCompetitive ? "You already took this exam. Wait until points are released." : "No attempts left for this exam." };
+    }
+
+    const roundWindow = getRoundWindow(roundMeta);
+    if (roundWindow.hasWindow && !roundWindow.ok) {
+      return { ok: false, reason: roundWindow.reason || "This exam is outside the allowed time window." };
     }
 
     return { ok: true, reason: "" };
@@ -887,7 +985,6 @@ useEffect(() => {
 
   const passingPercent = Number(examMeta?.passingPercent ?? examMeta?.passPercent ?? examMeta?.passScore ?? NaN);
   const hasPassPercent = Number.isFinite(passingPercent);
-  const scoring = examMeta?.scoring || {};
 
   const instructionsList = useMemo(() => {
     const src = examMeta?.instructions ?? examMeta?.instruction ?? examMeta?.rules ?? [];
@@ -913,7 +1010,7 @@ useEffect(() => {
       <Modal visible={outOfLivesModalVisible} transparent animationType="none" onRequestClose={() => {}}>
         <View style={modalStyles.overlay}>
           <Animated.View style={[modalStyles.card, { transform: [{ scale: outModalAnim.interpolate({ inputRange: [0, 1], outputRange: [0.85, 1] }) }], opacity: outModalAnim }]}>
-            <Text style={modalStyles.title}>You're out of lives</Text>
+            <Text style={modalStyles.title}>You&apos;re out of lives</Text>
             <Text style={modalStyles.text}>You have no global lives left to continue practicing.</Text>
             <Text style={[modalStyles.countdown, { marginTop: 12 }]}>Next life in {formatMsToMMSS(nextHeartInMs)}</Text>
             <TouchableOpacity style={modalStyles.closeBtn} onPress={() => setOutOfLivesModalVisible(false)}>
@@ -978,8 +1075,8 @@ useEffect(() => {
                 <View style={styles.rulesRow}>
                   <View style={styles.rulesIconWrap}><Ionicons name="ticket-outline" size={20} color={C.primary} /></View>
                   <View style={styles.rulesTextWrap}>
-                    <Text style={styles.rulesNumber}>{Number(attemptsUsedForUI || 0)} / {Number(examMeta?.maxAttempts || 1)}</Text>
-                    <Text style={styles.rulesLabel}>Attempts used</Text>
+                    <Text style={styles.rulesNumber}>{Number(attemptsUsedForUI || 0)} / {maxAttemptsAllowed}</Text>
+                    <Text style={styles.rulesLabel}>{isCompetitive ? "Attempt used" : "Attempts used"}</Text>
                   </View>
                 </View>
 
@@ -1032,7 +1129,7 @@ useEffect(() => {
                     <>
                       <Text style={styles.noAttemptsSub}>
                         {isCompetitive
-                          ? "This round allows limited attempts and you have used all available attempts."
+                          ? "You already took this exam. Wait until points are released."
                           : "You used all attempts for this exam. Attempts refill by configured interval."}
                       </Text>
                       {!isCompetitive ? <Text style={styles.noAttemptsTimer}>Next attempt in {formatMsToMMSS(nextAttemptInMs)}</Text> : null}
@@ -1059,7 +1156,9 @@ useEffect(() => {
               )}
 
               {questionLoadError ? <Text style={styles.warning}>{questionLoadError}</Text> : null}
-              {!canStart.ok && !questionLoadError ? <Text style={styles.warning}>{canStart.reason}</Text> : null}
+              {!canStart.ok && !questionLoadError && !(isCompetitive && attemptsLeft <= 0 && !inProgressAttempt) ? (
+                <Text style={styles.warning}>{canStart.reason}</Text>
+              ) : null}
 
               {inProgressAttempt && attemptId ? (
                 <TouchableOpacity style={styles.primaryBtn} onPress={resumeExam}>
