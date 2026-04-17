@@ -364,6 +364,7 @@ const gradeLabel = useMemo(() => {
 
     const now = Date.now();
     const resultVisible = examMeta?.scoringEnabled ? now >= toMsTs(roundMeta?.resultReleaseTimestamp) : true;
+    const awardedPointsValue = isCompetitive ? "pending" : scored.points;
 
     if (studentId && examId && attemptId) {
       const usedBefore = Number(effectiveAttemptsUsed || attemptsUsed || 0);
@@ -374,7 +375,7 @@ const gradeLabel = useMemo(() => {
       patch[`Platform1/attempts/company/${studentId}/${examId}/${attemptId}/answers`] = answers;
       patch[`Platform1/attempts/company/${studentId}/${examId}/${attemptId}/scorePercent`] = computed.percent;
       patch[`Platform1/attempts/company/${studentId}/${examId}/${attemptId}/correctCount`] = computed.correct;
-      patch[`Platform1/attempts/company/${studentId}/${examId}/${attemptId}/pointsAwarded`] = scored.points;
+      patch[`Platform1/attempts/company/${studentId}/${examId}/${attemptId}/pointsAwarded`] = awardedPointsValue;
       patch[`Platform1/attempts/company/${studentId}/${examId}/${attemptId}/badge`] = scored.badge;
       patch[`Platform1/attempts/company/${studentId}/${examId}/${attemptId}/resultVisible`] = resultVisible;
 
@@ -428,7 +429,7 @@ const gradeLabel = useMemo(() => {
       correct: computed.correct,
       total: computed.total,
       badge: scored.badge,
-      points: scored.points,
+      points: awardedPointsValue,
       resultVisible,
     });
 

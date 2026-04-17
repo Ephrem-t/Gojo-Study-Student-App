@@ -164,7 +164,15 @@ function summarizeAttemptEntries(attemptsNode = {}) {
     : 0;
   const correctCount = latestCompleted ? Number(latestCompleted?.correctCount || 0) : 0;
   const wrongCount = Math.max(0, totalQuestions - correctCount);
-  const pointsAwarded = latestCompleted ? Number(latestCompleted?.pointsAwarded || 0) : 0;
+  const rawPointsAwarded = latestCompleted?.pointsAwarded;
+  const normalizedPointsAwarded = String(rawPointsAwarded ?? "").trim().toLowerCase();
+  const hasAwardedPoints = latestCompleted
+    ? rawPointsAwarded != null &&
+      normalizedPointsAwarded !== "" &&
+      normalizedPointsAwarded !== "pending" &&
+      Number.isFinite(Number(rawPointsAwarded))
+    : false;
+  const pointsAwarded = hasAwardedPoints ? Number(rawPointsAwarded) : 0;
   const rankingCounted = latestCompleted
     ? String(latestCompleted?.rankingCounted).toLowerCase() === "true" || latestCompleted?.rankingCounted === true || Number(latestCompleted?.rankingCounted) === 1
     : false;
@@ -181,6 +189,7 @@ function summarizeAttemptEntries(attemptsNode = {}) {
     resultVisible,
     rankingCounted,
     pointsAwarded,
+    hasAwardedPoints,
     scorePercent: latestCompleted ? Number(latestCompleted?.scorePercent || 0) : 0,
     correctCount,
     wrongCount,
@@ -1157,9 +1166,7 @@ export default function ExamScreen() {
     }
 
     if (cachedAttemptState?.hasCompleted) {
-      const previewVariant = !cachedAttemptState?.resultVisible || !cachedAttemptState?.rankingCounted
-        ? "pending"
-        : "scored";
+      const previewVariant = cachedAttemptState?.hasAwardedPoints ? "scored" : "pending";
       openUpcomingExamPreview(subjectName, exam, previewVariant, cachedAttemptState);
       return;
     }
@@ -1182,9 +1189,7 @@ export default function ExamScreen() {
         const liveAttemptState = summarizeAttemptEntries(attemptsNode);
 
         if (liveAttemptState.hasCompleted) {
-          const previewVariant = !liveAttemptState?.resultVisible || !liveAttemptState?.rankingCounted
-            ? "pending"
-            : "scored";
+          const previewVariant = liveAttemptState?.hasAwardedPoints ? "scored" : "pending";
           openUpcomingExamPreview(subjectName, exam, previewVariant, liveAttemptState);
           return;
         }
@@ -1615,13 +1620,12 @@ export default function ExamScreen() {
                           const attemptState = onlineExamAttemptState[String(exam?.examId || "")] || {};
                           const hasCompletedAttempt = !!attemptState?.hasCompleted;
                           const hasInProgressAttempt = !!attemptState?.hasInProgress;
-                          const hasVisibleResult = !!attemptState?.resultVisible;
-                          const hasRankedResult = !!attemptState?.rankingCounted;
+                          const hasAwardedPoints = !!attemptState?.hasAwardedPoints;
                           const earnedPoints = Number(attemptState?.pointsAwarded || 0);
 
                           const isUpcoming = startTs > promoNowTs;
-                          const isPending = hasCompletedAttempt && (!hasVisibleResult || !hasRankedResult);
-                          const isScored = hasCompletedAttempt && hasVisibleResult && hasRankedResult;
+                          const isPending = hasCompletedAttempt && !hasAwardedPoints;
+                          const isScored = hasCompletedAttempt && hasAwardedPoints;
                           const isExpired = !hasCompletedAttempt && !hasInProgressAttempt && !!endTs && endTs < promoNowTs;
                           const isLive = hasSetup && !isUpcoming && !isExpired && !isPending && !isScored && (!!startTs ? startTs <= promoNowTs : true) && (!endTs || endTs >= promoNowTs);
 
@@ -1885,12 +1889,18 @@ export default function ExamScreen() {
 
             <View style={styles.upcomingExamModalBadge}>
               <Ionicons
-                name={selectedUpcomingExam?.variant === "taken" || selectedUpcomingExam?.variant === "pending" ? "checkmark-circle-outline" : "alarm-outline"}
+                name={selectedUpcomingExam?.variant === "scored"
+                  ? "trophy-outline"
+                  : selectedUpcomingExam?.variant === "taken" || selectedUpcomingExam?.variant === "pending"
+                  ? "checkmark-circle-outline"
+                  : "alarm-outline"}
                 size={14}
                 color={PRIMARY}
               />
               <Text style={styles.upcomingExamModalBadgeText}>
-                {selectedUpcomingExam?.variant === "pending"
+                {selectedUpcomingExam?.variant === "scored"
+                  ? "Points awarded"
+                  : selectedUpcomingExam?.variant === "pending"
                   ? "Pending result"
                   : selectedUpcomingExam?.variant === "taken"
                   ? "Exam taken"

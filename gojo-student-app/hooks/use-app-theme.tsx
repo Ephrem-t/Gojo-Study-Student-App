@@ -11,7 +11,6 @@ import React, {
   useMemo,
   useState,
 } from "react";
-import { useColorScheme } from "react-native";
 
 import { Colors } from "../constants/theme";
 
@@ -31,8 +30,7 @@ type AppThemeContextValue = {
 const AppThemeContext = createContext<AppThemeContextValue | null>(null);
 
 export function AppThemeProvider({ children }: { children: React.ReactNode }) {
-  const systemColorScheme = useColorScheme();
-  const [appearance, setAppearanceState] = useState<AppearancePreference>("system");
+  const [appearance, setAppearanceState] = useState<AppearancePreference>("light");
 
   useEffect(() => {
     let mounted = true;
@@ -46,7 +44,7 @@ export function AppThemeProvider({ children }: { children: React.ReactNode }) {
           setAppearanceState(stored);
         }
       } catch {
-        // Ignore storage read failures and fall back to system appearance.
+        // Ignore storage read failures and keep the default light appearance.
       }
     })();
 
@@ -55,9 +53,8 @@ export function AppThemeProvider({ children }: { children: React.ReactNode }) {
     };
   }, []);
 
-  const resolvedAppearance = appearance === "system"
-    ? (systemColorScheme === "dark" ? "dark" : "light")
-    : appearance;
+  // Only explicit dark mode enables dark palette; legacy/system values resolve to light.
+  const resolvedAppearance = appearance === "dark" ? "dark" : "light";
 
   const colors = useMemo(
     () => (resolvedAppearance === "dark" ? Colors.dark : Colors.light),

@@ -55,7 +55,7 @@ export default function SettingScreen() {
     examReminders: true,
     messageAlerts: true,
     weeklySummary: false,
-    appearance: "system",
+    appearance: "light",
   }), []);
 
   const [pwdModal, setPwdModal] = useState(false);
