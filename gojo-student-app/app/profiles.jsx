@@ -15,6 +15,7 @@ import {
   PanResponder,
   Platform,
   RefreshControl,
+  InteractionManager,
 } from "react-native";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
@@ -23,9 +24,10 @@ import { useRouter } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import * as ImagePicker from "expo-image-picker";
 import { database, storage } from "../constants/firebaseConfig";
-import { ref, get, update, remove } from "firebase/database";
+import { ref, get, update, remove } from "../lib/offlineDatabase";
 import { ref as stRef, uploadBytes, getDownloadURL } from "firebase/storage";
 import { useAppTheme } from "../hooks/use-app-theme";
+import PageLoadingSkeleton from "../components/ui/page-loading-skeleton";
 import { resolveNoteColorTag } from "./lib/noteColors";
 
 const { width: SCREEN_WIDTH } = Dimensions.get("window");
@@ -33,9 +35,6 @@ const { width: SCREEN_WIDTH } = Dimensions.get("window");
 const PRIMARY = "#007AFB";
 const TEXT = "#0B2540";
 const MUTED = "#6B78A8";
-const BORDER = "#E7EEFF";
-const SOFT = "#EEF5FF";
-const SUCCESS = "#12B76A";
 const DANGER = "#EF4444";
 
 const AVATAR_PLACEHOLDER = require("../assets/images/avatar_placeholder.png");
@@ -71,20 +70,6 @@ async function uploadProfileImageAsync({ uri, userNodeKey, studentNodeKey }) {
   return getDownloadURL(storageRef);
 }
 
-function formatDate(dateStr) {
-  if (!dateStr) return "";
-  try {
-    const d = new Date(dateStr);
-    return d.toLocaleDateString(undefined, {
-      year: "numeric",
-      month: "short",
-      day: "numeric",
-    });
-  } catch {
-    return dateStr;
-  }
-}
-
 function formatNoteDate(value) {
   if (!value) return "Recently updated";
   try {
@@ -98,43 +83,8 @@ function formatNoteDate(value) {
   }
 }
 
-function upcomingWithinDays(events, days = 30) {
-  const now = new Date();
-  now.setHours(0, 0, 0, 0);
-
-  const max = new Date(now);
-  max.setDate(now.getDate() + days);
-
-  return (events || [])
-    .filter((e) => {
-      if (!e?.gregorianDate) return false;
-      const d = new Date(e.gregorianDate);
-      d.setHours(0, 0, 0, 0);
-      return d >= now && d <= max;
-    })
-    .sort((a, b) => new Date(a.gregorianDate || 0) - new Date(b.gregorianDate || 0));
-}
-
 function getTodayDayName() {
   return new Date().toLocaleDateString("en-US", { weekday: "long" });
-}
-
-function getCategoryColor(raw) {
-  const s = String(raw || "").toLowerCase();
-  if (s.includes("exam")) return "#DC2626";
-  if (s.includes("holiday")) return "#16A34A";
-  if (s.includes("academic")) return PRIMARY;
-  if (s.includes("event")) return "#0EA5E9";
-  return MUTED;
-}
-
-function getCategoryLabel(raw) {
-  const s = String(raw || "").toLowerCase();
-  if (s.includes("exam")) return "Exam";
-  if (s.includes("holiday")) return "Holiday";
-  if (s.includes("academic")) return "Academic";
-  if (s.includes("event")) return "Event";
-  return "General";
 }
 
 function extractGradeNumber(v) {
@@ -413,7 +363,6 @@ export default function ProfileScreen() {
     studentId: "",
   });
 
-  const [calendarEvents, setCalendarEvents] = useState([]);
   const [scheduleMap, setScheduleMap] = useState({});
   const [scheduleVisible, setScheduleVisible] = useState(false);
   const [expandedScheduleDays, setExpandedScheduleDays] = useState({});
@@ -431,8 +380,13 @@ export default function ProfileScreen() {
   const [confirmPwd, setConfirmPwd] = useState("");
   const [savingPwd, setSavingPwd] = useState(false);
 
-  const fetchAll = useCallback(async () => {
-    setLoading(true);
+  const fetchAll = useCallback(async (options = {}) => {
+    const background = Boolean(options?.background);
+
+    if (!background) {
+      setLoading(true);
+    }
+
     try {
       const sk = await AsyncStorage.getItem("schoolKey");
       const uKey = (await AsyncStorage.getItem("userNodeKey")) || null;
@@ -444,19 +398,23 @@ export default function ProfileScreen() {
       setSchoolKey(sk);
       setUserNodeKey(uKey);
       setStudentNodeKey(sKey);
-      setCountryRank(null);
-      setSchoolRank(null);
-      setNoteSections([]);
+
+      if (!background) {
+        setCountryRank(null);
+        setSchoolRank(null);
+        setNoteSections([]);
+      }
 
       let grade = "";
       let section = "";
       let studentId = "";
+      let userVal = null;
+      let studentVal = null;
 
       if (sk && uKey) {
         const us = await get(ref(database, `Platform1/Schools/${sk}/Users/${uKey}`));
-        const userVal = us.exists() ? us.val() : null;
+        userVal = us.exists() ? us.val() : null;
 
-        let studentVal = null;
         if (sKey) {
           const ss = await get(ref(database, `Platform1/Schools/${sk}/Students/${sKey}`));
           if (ss.exists()) studentVal = ss.val();
@@ -476,56 +434,40 @@ export default function ProfileScreen() {
           studentId,
         });
 
-        const rankInfo = await getCountryRankForStudent(grade, [
-          studentId,
-          sKey,
-          userVal?.username,
-          studentVal?.studentId,
-          uKey,
-        ]);
-        setCountryRank(rankInfo);
+        setLoading(false);
 
-        const schoolRankInfo = await getSchoolRankForStudent(grade, sk, [
+        const studentIdentityCandidates = [
           studentId,
           sKey,
           userVal?.username,
           studentVal?.studentId,
           uKey,
-        ]);
-        setSchoolRank(schoolRankInfo);
+        ];
+
+        const countryRankPromise = getCountryRankForStudent(grade, studentIdentityCandidates);
+        const schoolRankPromise = getSchoolRankForStudent(grade, sk, studentIdentityCandidates);
 
         setNotesLoading(true);
-        const groupedNotes = await getGroupedStudentNotes(sk, grade, [
-          sKey,
-          studentId,
-          userVal?.username,
-          studentVal?.studentId,
-          uKey,
+        const groupedNotesPromise = getGroupedStudentNotes(sk, grade, studentIdentityCandidates);
+
+        const schedulePromise = get(ref(database, `Platform1/Schools/${sk}/Schedules`)).catch(() => null);
+
+        const [rankInfo, schoolRankInfo, groupedNotes, schedSnap] = await Promise.all([
+          countryRankPromise,
+          schoolRankPromise,
+          groupedNotesPromise,
+          schedulePromise,
         ]);
+
+        setCountryRank(rankInfo);
+        setSchoolRank(schoolRankInfo);
         setNoteSections(groupedNotes);
         setExpandedNoteSubjects(
-          groupedNotes.reduce((acc, section) => {
-            acc[section.subjectKey] = false;
+          groupedNotes.reduce((acc, sectionItem) => {
+            acc[sectionItem.subjectKey] = false;
             return acc;
           }, {})
         );
-        setNotesLoading(false);
-      }
-
-      if (sk) {
-        const [evSnap, schedSnap] = await Promise.all([
-          get(ref(database, `Platform1/Schools/${sk}/CalendarEvents`)).catch(() => null),
-          get(ref(database, `Platform1/Schools/${sk}/Schedules`)).catch(() => null),
-        ]);
-
-        const arr = [];
-        if (evSnap?.exists()) {
-          evSnap.forEach((c) => {
-            arr.push({ id: c.key, ...(c.val() || {}) });
-          });
-        }
-        arr.sort((a, b) => new Date(a.gregorianDate || 0) - new Date(b.gregorianDate || 0));
-        setCalendarEvents(arr);
 
         const nextSchedule = {};
         if (schedSnap?.exists()) {
@@ -544,6 +486,8 @@ export default function ProfileScreen() {
           });
         }
         setScheduleMap(nextSchedule);
+      } else {
+        setLoading(false);
       }
     } catch (e) {
       console.warn("Profile fetch error:", e);
@@ -657,19 +601,24 @@ export default function ProfileScreen() {
   }, []);
 
   useEffect(() => {
-    fetchAll();
+    const task = InteractionManager.runAfterInteractions(() => {
+      fetchAll().catch(() => null);
+    });
+
+    return () => {
+      task?.cancel?.();
+    };
   }, [fetchAll]);
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
     try {
-      await fetchAll();
+      await fetchAll({ background: true });
     } finally {
       setRefreshing(false);
     }
   }, [fetchAll]);
 
-  const upcoming = useMemo(() => upcomingWithinDays(calendarEvents, 30), [calendarEvents]);
   const todayDay = getTodayDayName();
   const todaySchedule = scheduleMap[todayDay] || [];
   const usernameHandle = useMemo(() => {
@@ -845,11 +794,7 @@ export default function ProfileScreen() {
   });
 
   if (loading) {
-    return (
-      <SafeAreaView style={[styles.safe, styles.center]}>
-        <ActivityIndicator size="large" color={PRIMARY} />
-      </SafeAreaView>
-    );
+    return <PageLoadingSkeleton variant="profile" style={styles.safe} />;
   }
 
   return (

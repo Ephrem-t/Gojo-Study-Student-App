@@ -5,7 +5,6 @@ import {
   StyleSheet,
   FlatList,
   TouchableOpacity,
-  ActivityIndicator,
   Image,
   StatusBar,
   ScrollView,
@@ -14,7 +13,7 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { ref, get } from "firebase/database";
+import { ref, get } from "../lib/offlineDatabase";
 import { database } from "../constants/firebaseConfig";
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
@@ -24,11 +23,13 @@ import { getUserVal } from "./lib/userHelpers";
 import { useAppTheme } from "../hooks/use-app-theme";
 import useUserProfileCard from "../hooks/use-user-profile-card";
 import { extractProfileImage, normalizeProfileImageUri } from "./lib/profileImage";
+import { persistChatsCache, readChatsCache, readChatsCacheFetchedAt } from "../lib/chatCache";
+import PageLoadingSkeleton from "../components/ui/page-loading-skeleton";
 
 const AVATAR_PLACEHOLDER = require("../assets/images/avatar_placeholder.png");
 
 const FILTERS = ["Parents", "Teachers", "Management", "Support"];
-const debounceWindowMs = 15 * 1000;
+const debounceWindowMs = 60 * 1000;
 
 function shortText(s, n = 60) {
   if (!s && s !== 0) return "";
@@ -53,6 +54,7 @@ function fmtTime12(ts) {
 export default function ChatsScreen() {
   const router = useRouter();
   const { colors, statusBarStyle } = useAppTheme();
+  const MUTED = colors.muted;
   const styles = useMemo(() => createStyles(colors), [colors]);
   const { openUserProfile, profileCardModal } = useUserProfileCard();
 
@@ -70,8 +72,6 @@ export default function ChatsScreen() {
     teacherNodeKeys: null,
   });
   const lastFetchedAtRef = useRef(0);
-
-  const makeDeterministicChatId = (a, b) => `${a}_${b}`;
 
   async function getDbRef(subPath) {
     const sk = (await AsyncStorage.getItem("schoolKey")) || null;
@@ -99,16 +99,13 @@ export default function ChatsScreen() {
 
   const loadCacheAndShow = async () => {
     try {
-      const raw = await AsyncStorage.getItem("chatsCache");
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          setContacts(parsed);
-          setLoadingInitial(false);
-          const fetchedAt = Number((await AsyncStorage.getItem("chatsCacheFetchedAt")) || 0);
-          lastFetchedAtRef.current = fetchedAt;
-          return true;
-        }
+      const parsed = await readChatsCache();
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        setContacts(parsed);
+        setLoadingInitial(false);
+        const fetchedAt = await readChatsCacheFetchedAt();
+        lastFetchedAtRef.current = fetchedAt;
+        return true;
       }
     } catch {}
     return false;
@@ -407,9 +404,9 @@ export default function ChatsScreen() {
       setContacts(fresh);
 
       try {
-        await AsyncStorage.setItem("chatsCache", JSON.stringify(fresh));
-        await AsyncStorage.setItem("chatsCacheFetchedAt", String(Date.now()));
-        lastFetchedAtRef.current = Date.now();
+        const fetchedAt = Date.now();
+        await persistChatsCache(fresh, fetchedAt);
+        lastFetchedAtRef.current = fetchedAt;
       } catch {}
     } catch (err) {
       console.warn("loadData error", err);
@@ -423,7 +420,7 @@ export default function ChatsScreen() {
     (async () => {
       await loadCacheAndShow();
       try {
-        const fetchedAt = Number((await AsyncStorage.getItem("chatsCacheFetchedAt")) || 0);
+        const fetchedAt = await readChatsCacheFetchedAt();
         if (!fetchedAt || Date.now() - fetchedAt > debounceWindowMs) loadData({ background: true });
         else lastFetchedAtRef.current = fetchedAt;
       } catch {
@@ -459,53 +456,10 @@ export default function ChatsScreen() {
   const onOpenChat = async (contact) => {
     if (!contact) return;
 
-    let contactUserId = contact.userId || "";
-    if (!contactUserId) {
-      try {
-        const p = await getUserVal(contact.key);
-        contactUserId = p?.userId || contact.key;
-      } catch {
-        contactUserId = contact.key;
-      }
-    }
-
-    let myUserId = await AsyncStorage.getItem("userId");
-    if (!myUserId) {
-      const nk =
-        (await AsyncStorage.getItem("userNodeKey")) ||
-        (await AsyncStorage.getItem("studentNodeKey")) ||
-        (await AsyncStorage.getItem("studentId")) ||
-        null;
-      if (nk) {
-        try {
-          const u = await getUserVal(nk);
-          myUserId = u?.userId || nk;
-        } catch {
-          myUserId = nk;
-        }
-      }
-    }
-
-    let existingChatId = "";
-    if (myUserId && contactUserId) {
-      try {
-        const c1 = makeDeterministicChatId(myUserId, contactUserId);
-        const c2 = makeDeterministicChatId(contactUserId, myUserId);
-        const s1 = await get(await getDbRef(`Chats/${c1}`));
-        if (s1.exists()) existingChatId = c1;
-        else {
-          const s2 = await get(await getDbRef(`Chats/${c2}`));
-          if (s2.exists()) existingChatId = c2;
-        }
-      } catch (e) {
-        console.warn("onOpenChat find existing chat error", e);
-      }
-    }
-
     setOpenedChat({
-      chatId: existingChatId || "",
+      chatId: contact.chatId || "",
       contactKey: contact.key || "",
-      contactUserId: contactUserId || "",
+      contactUserId: contact.userId || "",
       contactName: contact.name || "",
       contactImage: normalizeProfileImageUri(contact.profileImage) || "",
     });
@@ -592,7 +546,7 @@ export default function ChatsScreen() {
         ) : null}
 
         {loadingInitial && contacts.length === 0 ? (
-          <View style={styles.center}><ActivityIndicator size="large" color={colors.primary} /></View>
+          <PageLoadingSkeleton variant="chat" showHeader={false} style={{ flex: 1, backgroundColor: colors.background }} />
         ) : searchActive && !shouldShowSearchResults ? (
           <View style={styles.emptyWrap}>
             <Text style={styles.emptyTitle}>Search chats</Text>

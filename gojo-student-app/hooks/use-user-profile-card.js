@@ -1,8 +1,6 @@
 import React, { useCallback, useMemo, useState } from "react";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useRouter } from "expo-router";
-import { get, ref } from "firebase/database";
-import { database } from "../constants/firebaseConfig";
 import UserProfileCardModal from "../components/user-profile-card-modal";
 import { setOpenedChat } from "../app/lib/chatStore";
 import { extractProfileImage, normalizeProfileImageUri } from "../app/lib/profileImage";
@@ -147,33 +145,16 @@ export default function useUserProfileCard() {
     }
   }, []);
 
-  const handleMessageProfile = useCallback(async () => {
-    if (!profile?.contactUserId) return;
+  const handleMessageProfile = useCallback(() => {
+    const contactKey = profile?.contactKey || profile?.contactUserId || "";
+    const contactUserId = profile?.contactUserId || "";
 
-    const myUserId = await resolveCurrentUserId();
-    let existingChatId = "";
-
-    if (myUserId) {
-      try {
-        const chatA = `${myUserId}_${profile.contactUserId}`;
-        const chatB = `${profile.contactUserId}_${myUserId}`;
-        const schoolKey = await AsyncStorage.getItem("schoolKey");
-        const basePath = schoolKey ? `Platform1/Schools/${schoolKey}/Chats` : "Chats";
-        const firstSnap = await get(ref(database, `${basePath}/${chatA}`));
-        if (firstSnap.exists()) existingChatId = chatA;
-        else {
-          const secondSnap = await get(ref(database, `${basePath}/${chatB}`));
-          if (secondSnap.exists()) existingChatId = chatB;
-        }
-      } catch (error) {
-        console.warn("find existing profile chat failed:", error);
-      }
-    }
+    if (!contactKey && !contactUserId) return;
 
     setOpenedChat({
-      chatId: existingChatId || "",
-      contactKey: profile.contactKey || profile.contactUserId || "",
-      contactUserId: profile.contactUserId || "",
+      chatId: "",
+      contactKey,
+      contactUserId,
       contactName: profile.name || "",
       contactImage: normalizeProfileImageUri(profile.avatar) || "",
     });

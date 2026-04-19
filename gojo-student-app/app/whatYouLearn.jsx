@@ -17,9 +17,11 @@ import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context"
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { ref, get, set, remove } from "firebase/database";
+import { ref, get, set, remove } from "../lib/offlineDatabase";
 import { database } from "../constants/firebaseConfig";
 import { useAppTheme } from "../hooks/use-app-theme";
+import { resolveSchoolKeyFromStudentId } from "./lib/dbHelpers";
+import PageLoadingSkeleton from "../components/ui/page-loading-skeleton";
 
 const PRIMARY = "#0B72FF";
 const SUBJECT_ICON_MAP = [
@@ -382,17 +384,12 @@ async function resolveSchoolKeyFast(studentId) {
   } catch {}
 
   try {
-    const schoolsSnap = await get(ref(database, "Platform1/Schools"));
-    const schools = schoolsSnap?.exists() ? schoolsSnap.val() || {} : {};
-
-    for (const schoolKey of Object.keys(schools)) {
-      const studentSnap = await get(ref(database, `Platform1/Schools/${schoolKey}/Students/${studentId}`));
-      if (studentSnap?.exists()) {
-        try {
-          await AsyncStorage.setItem("schoolKey", schoolKey);
-        } catch {}
-        return schoolKey;
-      }
+    const resolvedSchoolKey = await resolveSchoolKeyFromStudentId(studentId);
+    if (resolvedSchoolKey) {
+      try {
+        await AsyncStorage.setItem("schoolKey", resolvedSchoolKey);
+      } catch {}
+      return resolvedSchoolKey;
     }
   } catch {}
 
@@ -1333,9 +1330,7 @@ export default function WhatYouLearnScreen() {
 
   if (loading) {
     return (
-      <SafeAreaView style={styles.center}>
-        <ActivityIndicator color={PRIMARY} size="large" />
-      </SafeAreaView>
+      <PageLoadingSkeleton variant="list" style={styles.screen} />
     );
   }
 

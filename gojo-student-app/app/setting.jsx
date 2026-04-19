@@ -1,10 +1,8 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
-  Animated,
   BackHandler,
-  Easing,
   Linking,
   Modal,
   ScrollView,
@@ -14,7 +12,6 @@ import {
   TextInput,
   TouchableOpacity,
   View,
-  Dimensions,
 } from "react-native";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
@@ -22,9 +19,10 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useRouter } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import { database } from "../constants/firebaseConfig";
-import { get, ref, update } from "firebase/database";
+import { get, ref, update } from "../lib/offlineDatabase";
 import { useAppTheme } from "../hooks/use-app-theme";
 import PasscodePanel from "../components/passcode-panel";
+import PageLoadingSkeleton from "../components/ui/page-loading-skeleton";
 import {
   APP_LOCK_AUTO_LOCK_OPTIONS,
   APP_LOCK_PASSCODE_LENGTH,
@@ -37,9 +35,6 @@ import {
   resolveAppLockAccountKey,
   saveStoredAppLock,
 } from "../constants/appLock";
-
-const { width: SCREEN_WIDTH } = Dimensions.get("window");
-
 const TERMS_URL = "https://example.com/terms";
 const PRIVACY_URL = "https://example.com/privacy";
 
@@ -48,9 +43,6 @@ export default function SettingScreen() {
   const insets = useSafeAreaInsets();
   const { resolvedAppearance, colors, statusBarStyle, setAppearance } = useAppTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
-  const slideX = useRef(new Animated.Value(SCREEN_WIDTH)).current;
-  const fadeAnim = useRef(new Animated.Value(0)).current;
-  const closingRef = useRef(false);
   const defaultPreferences = useMemo(() => ({
     examReminders: true,
     messageAlerts: true,
@@ -60,6 +52,7 @@ export default function SettingScreen() {
 
   const [pwdModal, setPwdModal] = useState(false);
   const [savingPwd, setSavingPwd] = useState(false);
+  const [profileLoading, setProfileLoading] = useState(true);
   const [schoolKey, setSchoolKey] = useState(null);
   const [userNodeKey, setUserNodeKey] = useState(null);
   const [currentUserId, setCurrentUserId] = useState(null);
@@ -98,23 +91,6 @@ export default function SettingScreen() {
         : "Enter 4 digits that you will use to unlock your Gojo app on this phone."
       : "Enter the same 4 digits again to confirm.";
 
-  useEffect(() => {
-    Animated.parallel([
-      Animated.timing(slideX, {
-        toValue: 0,
-        duration: 300,
-        easing: Easing.out(Easing.cubic),
-        useNativeDriver: true,
-      }),
-      Animated.timing(fadeAnim, {
-        toValue: 1,
-        duration: 220,
-        easing: Easing.out(Easing.quad),
-        useNativeDriver: true,
-      }),
-    ]).start();
-  }, [fadeAnim, slideX]);
-
   const navigateAwayFromSettings = useCallback(() => {
     if (router.canGoBack()) {
       router.back();
@@ -124,42 +100,14 @@ export default function SettingScreen() {
     router.replace("/profiles");
   }, [router]);
 
-  const closeScreen = useCallback((nextAction) => {
-    if (closingRef.current) return;
-    closingRef.current = true;
-
-    Animated.parallel([
-      Animated.timing(slideX, {
-        toValue: SCREEN_WIDTH,
-        duration: 240,
-        easing: Easing.in(Easing.cubic),
-        useNativeDriver: true,
-      }),
-      Animated.timing(fadeAnim, {
-        toValue: 0,
-        duration: 180,
-        easing: Easing.in(Easing.quad),
-        useNativeDriver: true,
-      }),
-    ]).start(({ finished }) => {
-      closingRef.current = false;
-      if (!finished) return;
-      if (typeof nextAction === "function") {
-        nextAction();
-        return;
-      }
-      navigateAwayFromSettings();
-    });
-  }, [fadeAnim, navigateAwayFromSettings, slideX]);
-
   useEffect(() => {
     const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
-      closeScreen();
+      navigateAwayFromSettings();
       return true;
     });
 
     return () => subscription.remove();
-  }, [closeScreen]);
+  }, [navigateAwayFromSettings]);
 
   useEffect(() => {
     let active = true;
@@ -221,6 +169,10 @@ export default function SettingScreen() {
         }
       } catch (error) {
         console.warn("Settings profile load error:", error);
+      } finally {
+        if (active) {
+          setProfileLoading(false);
+        }
       }
     }
 
@@ -546,93 +498,102 @@ export default function SettingScreen() {
         style: "destructive",
         onPress: async () => {
           await clearSessionStorage();
-
-          closeScreen(() => router.replace("/"));
+          router.replace("/");
         },
       },
     ]);
-  }, [clearSessionStorage, closeScreen, router]);
+  }, [clearSessionStorage, router]);
+
+  if (profileLoading) {
+    return (
+      <View style={styles.screen}>
+        <SafeAreaView style={styles.safeArea}>
+          <StatusBar style={statusBarStyle} backgroundColor={colors.screen} />
+          <PageLoadingSkeleton variant="list" showHeader={false} style={styles.screen} />
+        </SafeAreaView>
+      </View>
+    );
+  }
 
   return (
     <View style={styles.screen}>
-      <Animated.View style={[styles.screen, { opacity: fadeAnim, transform: [{ translateX: slideX }] }]}>
-        <SafeAreaView style={styles.safeArea}>
-          <StatusBar style={statusBarStyle} backgroundColor={colors.screen} />
-          <View style={[styles.topBarWrap, { paddingTop: Math.max(6, insets.top > 0 ? 6 : 10) }]}>
-            <View style={styles.topBar}>
-              <TouchableOpacity style={styles.topBarAction} onPress={() => closeScreen()} activeOpacity={0.85}>
-                <View style={styles.backBtn}>
-                  <Ionicons name="chevron-back" size={19} color={colors.text} />
-                </View>
-                <Text style={styles.topBarTitle}>Settings</Text>
-              </TouchableOpacity>
-            </View>
+      <SafeAreaView style={styles.safeArea}>
+        <StatusBar style={statusBarStyle} backgroundColor={colors.screen} />
+        <View style={[styles.topBarWrap, { paddingTop: Math.max(6, insets.top > 0 ? 6 : 10) }]}>
+          <View style={styles.topBar}>
+            <TouchableOpacity style={styles.topBarAction} onPress={navigateAwayFromSettings} activeOpacity={0.85}>
+              <View style={styles.backBtn}>
+                <Ionicons name="chevron-back" size={19} color={colors.text} />
+              </View>
+              <Text style={styles.topBarTitle}>Settings</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+
+        <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent}>
+          <Text style={styles.sectionLabel}>Appearance</Text>
+          <View style={styles.groupCard}>
+            <SettingSwitchRow
+              icon="moon-outline"
+              label="Dark Mode"
+              caption="Switch the app between light and dark"
+              value={isDarkMode}
+              onValueChange={(value) => updateAppearancePreference(value ? "dark" : "light")}
+              colors={colors}
+              styles={styles}
+            />
           </View>
 
-          <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent}>
-            <Text style={styles.sectionLabel}>Appearance</Text>
-            <View style={styles.groupCard}>
-              <SettingSwitchRow
-                icon="moon-outline"
-                label="Dark Mode"
-                caption="Switch the app between light and dark"
-                value={isDarkMode}
-                onValueChange={(value) => updateAppearancePreference(value ? "dark" : "light")}
-                colors={colors}
-                styles={styles}
-              />
-            </View>
-
-            <Text style={styles.sectionLabel}>App Settings</Text>
-            <View style={styles.groupCard}>
-              <SettingSwitchRow
-                icon="notifications-outline"
-                label="Exam Reminders"
-                caption="Get reminded before tests and deadlines"
-                value={preferences.examReminders}
-                onValueChange={(value) => updatePreference("examReminders", value)}
-                colors={colors}
-                styles={styles}
-              />
-              <Divider styles={styles} />
-              <SettingSwitchRow
-                icon="chatbubble-ellipses-outline"
-                label="Message Alerts"
-                caption="Show alerts for new school and class messages"
-                value={preferences.messageAlerts}
-                onValueChange={(value) => updatePreference("messageAlerts", value)}
-                colors={colors}
-                styles={styles}
-              />
-              <Divider styles={styles} />
-              <SettingSwitchRow
-                icon="stats-chart-outline"
-                label="Weekly Summary"
-                caption="Keep a weekly study recap ready in the app"
-                value={preferences.weeklySummary}
-                onValueChange={(value) => updatePreference("weeklySummary", value)}
-                colors={colors}
-                styles={styles}
-              />
-              <Divider styles={styles} />
-              <SettingRow
-                icon="refresh-outline"
-                label="Reset App Settings"
-                caption="Restore the default app preferences"
-                onPress={resetAppSettings}
-                colors={colors}
-                styles={styles}
-              />
-              <Divider styles={styles} />
-              <SettingRow
-                icon="information-circle-outline"
-                label="About Gojo Study"
-                caption="See what this app section controls"
-                onPress={openAboutApp}
-                colors={colors}
-                styles={styles}
-              />
-            </View>
+          <Text style={styles.sectionLabel}>App Settings</Text>
+          <View style={styles.groupCard}>
+            <SettingSwitchRow
+              icon="notifications-outline"
+              label="Exam Reminders"
+              caption="Get reminded before tests and deadlines"
+              value={preferences.examReminders}
+              onValueChange={(value) => updatePreference("examReminders", value)}
+              colors={colors}
+              styles={styles}
+            />
+            <Divider styles={styles} />
+            <SettingSwitchRow
+              icon="chatbubble-ellipses-outline"
+              label="Message Alerts"
+              caption="Show alerts for new school and class messages"
+              value={preferences.messageAlerts}
+              onValueChange={(value) => updatePreference("messageAlerts", value)}
+              colors={colors}
+              styles={styles}
+            />
+            <Divider styles={styles} />
+            <SettingSwitchRow
+              icon="stats-chart-outline"
+              label="Weekly Summary"
+              caption="Keep a weekly study recap ready in the app"
+              value={preferences.weeklySummary}
+              onValueChange={(value) => updatePreference("weeklySummary", value)}
+              colors={colors}
+              styles={styles}
+            />
+            <Divider styles={styles} />
+            <SettingRow
+              icon="refresh-outline"
+              label="Reset App Settings"
+              caption="Restore the default app preferences"
+              onPress={resetAppSettings}
+              colors={colors}
+              styles={styles}
+            />
+            <Divider styles={styles} />
+            <SettingRow
+              icon="information-circle-outline"
+              label="About Gojo Study"
+              caption="See what this app section controls"
+              onPress={openAboutApp}
+              colors={colors}
+              styles={styles}
+            />
+          </View>
 
             <Text style={styles.sectionLabel}>Student Tools</Text>
             <View style={styles.groupCard}>
@@ -720,7 +681,7 @@ export default function SettingScreen() {
                 icon="person-outline"
                 label="Profile"
                 caption="Go back to your profile page"
-                onPress={() => closeScreen()}
+                onPress={navigateAwayFromSettings}
                 colors={colors}
                 styles={styles}
               />
@@ -768,115 +729,114 @@ export default function SettingScreen() {
                 styles={styles}
               />
             </View>
-          </ScrollView>
+        </ScrollView>
 
-          <Modal visible={pwdModal} transparent animationType="fade" onRequestClose={() => setPwdModal(false)}>
-            <View style={styles.modalBg}>
-              <View style={styles.modalCard}>
-                <Text style={styles.modalTitle}>Change Password</Text>
+        <Modal visible={pwdModal} transparent animationType="fade" onRequestClose={() => setPwdModal(false)}>
+          <View style={styles.modalBg}>
+            <View style={styles.modalCard}>
+              <Text style={styles.modalTitle}>Change Password</Text>
 
-                <TextInput
-                  value={newPwd}
-                  onChangeText={setNewPwd}
-                  placeholder="New password"
-                  placeholderTextColor={colors.muted}
-                  secureTextEntry
-                  style={styles.input}
-                />
-                <TextInput
-                  value={confirmPwd}
-                  onChangeText={setConfirmPwd}
-                  placeholder="Confirm password"
-                  placeholderTextColor={colors.muted}
-                  secureTextEntry
-                  style={styles.input}
-                />
-
-                <View style={styles.modalActions}>
-                  <TouchableOpacity
-                    style={[styles.modalBtn, styles.cancelBtn]}
-                    onPress={() => setPwdModal(false)}
-                    disabled={savingPwd}
-                  >
-                    <Text style={styles.cancelText}>Cancel</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    style={[styles.modalBtn, styles.saveBtn]}
-                    onPress={savePassword}
-                    disabled={savingPwd}
-                  >
-                    {savingPwd ? <ActivityIndicator color={colors.white} /> : <Text style={styles.saveText}>Save</Text>}
-                  </TouchableOpacity>
-                </View>
-              </View>
-            </View>
-          </Modal>
-
-          <Modal
-            visible={passcodeModalVisible}
-            transparent
-            animationType="fade"
-            onRequestClose={closePasscodeModal}
-          >
-            <View style={styles.modalBg}>
-              <PasscodePanel
-                colors={colors}
-                title={passcodeModalTitle}
-                subtitle={passcodeModalSubtitle}
-                value={passcodeEntry}
-                errorText={passcodeError}
-                busy={passcodeSaving}
-                onDigitPress={handlePasscodeDigit}
-                onBackspace={handlePasscodeBackspace}
-                secondaryLabel="Cancel"
-                onSecondaryPress={closePasscodeModal}
-                footerNote="When passcode lock is on, a lock icon appears on the home page header so you can lock Gojo Study instantly on this phone."
+              <TextInput
+                value={newPwd}
+                onChangeText={setNewPwd}
+                placeholder="New password"
+                placeholderTextColor={colors.muted}
+                secureTextEntry
+                style={styles.input}
               />
-            </View>
-          </Modal>
+              <TextInput
+                value={confirmPwd}
+                onChangeText={setConfirmPwd}
+                placeholder="Confirm password"
+                placeholderTextColor={colors.muted}
+                secureTextEntry
+                style={styles.input}
+              />
 
-          <Modal
-            visible={autoLockModalVisible}
-            transparent
-            animationType="fade"
-            onRequestClose={closeAutoLockModal}
-          >
-            <View style={styles.modalBg}>
-              <View style={styles.modalCard}>
-                <Text style={styles.modalTitle}>Auto-Lock</Text>
-                <Text style={styles.selectionSubtitle}>Choose when Gojo Study should lock after you leave the app.</Text>
-
-                <View style={styles.selectionList}>
-                  {APP_LOCK_AUTO_LOCK_OPTIONS.map((option) => {
-                    const selected = option.value === appLock.autoLockDelayMs;
-
-                    return (
-                      <TouchableOpacity
-                        key={option.value}
-                        activeOpacity={0.86}
-                        style={[styles.selectionOption, selected && styles.selectionOptionActive]}
-                        onPress={() => updateAutoLockDelay(option.value)}
-                      >
-                        <View>
-                          <Text style={styles.selectionOptionTitle}>{option.label}</Text>
-                          <Text style={styles.selectionOptionCaption}>Lock after being away for {option.label.toLowerCase()}</Text>
-                        </View>
-                        {selected ? <Ionicons name="checkmark-circle" size={20} color={colors.primary} /> : null}
-                      </TouchableOpacity>
-                    );
-                  })}
-                </View>
-
-                <View style={styles.modalActions}>
-                  <TouchableOpacity style={[styles.modalBtn, styles.cancelBtn]} onPress={closeAutoLockModal}>
-                    <Text style={styles.cancelText}>Close</Text>
-                  </TouchableOpacity>
-                </View>
+              <View style={styles.modalActions}>
+                <TouchableOpacity
+                  style={[styles.modalBtn, styles.cancelBtn]}
+                  onPress={() => setPwdModal(false)}
+                  disabled={savingPwd}
+                >
+                  <Text style={styles.cancelText}>Cancel</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.modalBtn, styles.saveBtn]}
+                  onPress={savePassword}
+                  disabled={savingPwd}
+                >
+                  {savingPwd ? <ActivityIndicator color={colors.white} /> : <Text style={styles.saveText}>Save</Text>}
+                </TouchableOpacity>
               </View>
             </View>
-          </Modal>
-        </SafeAreaView>
-      </Animated.View>
+          </View>
+        </Modal>
+
+        <Modal
+          visible={passcodeModalVisible}
+          transparent
+          animationType="fade"
+          onRequestClose={closePasscodeModal}
+        >
+          <View style={styles.modalBg}>
+            <PasscodePanel
+              colors={colors}
+              title={passcodeModalTitle}
+              subtitle={passcodeModalSubtitle}
+              value={passcodeEntry}
+              errorText={passcodeError}
+              busy={passcodeSaving}
+              onDigitPress={handlePasscodeDigit}
+              onBackspace={handlePasscodeBackspace}
+              secondaryLabel="Cancel"
+              onSecondaryPress={closePasscodeModal}
+              footerNote="When passcode lock is on, a lock icon appears on the home page header so you can lock Gojo Study instantly on this phone."
+            />
+          </View>
+        </Modal>
+
+        <Modal
+          visible={autoLockModalVisible}
+          transparent
+          animationType="fade"
+          onRequestClose={closeAutoLockModal}
+        >
+          <View style={styles.modalBg}>
+            <View style={styles.modalCard}>
+              <Text style={styles.modalTitle}>Auto-Lock</Text>
+              <Text style={styles.selectionSubtitle}>Choose when Gojo Study should lock after you leave the app.</Text>
+
+              <View style={styles.selectionList}>
+                {APP_LOCK_AUTO_LOCK_OPTIONS.map((option) => {
+                  const selected = option.value === appLock.autoLockDelayMs;
+
+                  return (
+                    <TouchableOpacity
+                      key={option.value}
+                      activeOpacity={0.86}
+                      style={[styles.selectionOption, selected && styles.selectionOptionActive]}
+                      onPress={() => updateAutoLockDelay(option.value)}
+                    >
+                      <View>
+                        <Text style={styles.selectionOptionTitle}>{option.label}</Text>
+                        <Text style={styles.selectionOptionCaption}>Lock after being away for {option.label.toLowerCase()}</Text>
+                      </View>
+                      {selected ? <Ionicons name="checkmark-circle" size={20} color={colors.primary} /> : null}
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+
+              <View style={styles.modalActions}>
+                <TouchableOpacity style={[styles.modalBtn, styles.cancelBtn]} onPress={closeAutoLockModal}>
+                  <Text style={styles.cancelText}>Close</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        </Modal>
+      </SafeAreaView>
     </View>
   );
 }

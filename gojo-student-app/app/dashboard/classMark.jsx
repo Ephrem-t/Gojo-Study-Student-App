@@ -5,7 +5,6 @@ import {
   StyleSheet,
   FlatList,
   TouchableOpacity,
-  ActivityIndicator,
   LayoutAnimation,
   UIManager,
   Platform,
@@ -24,12 +23,13 @@ import { useRouter } from "expo-router";
 import { useBottomTabBarHeight } from "@react-navigation/bottom-tabs";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { ref, get, query, orderByChild, equalTo } from "firebase/database";
+import { ref, get, query, orderByChild, equalTo } from "../../lib/offlineDatabase";
 import { database } from "../../constants/firebaseConfig";
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { Svg, Circle, Rect, Line, Path, Text as SvgText, G } from "react-native-svg";
 import { setOpenedChat } from "../lib/chatStore";
 import { useAppTheme } from "../../hooks/use-app-theme";
+import PageLoadingSkeleton from "../../components/ui/page-loading-skeleton";
 
 // school-aware helper (adjust path if your helper lives elsewhere)
 import { getUserVal } from "../lib/userHelpers";
@@ -1400,57 +1400,14 @@ export default function ClassMarkScreen() {
   const onAskTeacher = useCallback(async () => {
     try {
       const contactKey = teacherProfile?.userNodeKey || teacherProfile?.userId || "";
-      let contactUserId = teacherProfile?.userId || "";
-
-      if (!contactUserId && contactKey) {
-        try {
-          const u = await getUserVal(contactKey);
-          contactUserId = u?.userId || contactKey;
-        } catch {
-          contactUserId = contactKey;
-        }
-      }
+      const contactUserId = teacherProfile?.userId || "";
 
       if (!contactKey && !contactUserId) {
         return;
       }
 
-      let myUserId = await AsyncStorage.getItem("userId");
-      if (!myUserId) {
-        const nk =
-          (await AsyncStorage.getItem("userNodeKey")) ||
-          (await AsyncStorage.getItem("studentNodeKey")) ||
-          (await AsyncStorage.getItem("studentId")) ||
-          null;
-        if (nk) {
-          try {
-            const u = await getUserVal(nk);
-            myUserId = u?.userId || nk;
-          } catch {
-            myUserId = nk;
-          }
-        }
-      }
-
-      let existingChatId = "";
-      if (myUserId && contactUserId) {
-        const makeDeterministicChatId = (a, b) => `${a}_${b}`;
-        try {
-          const c1 = makeDeterministicChatId(myUserId, contactUserId);
-          const c2 = makeDeterministicChatId(contactUserId, myUserId);
-          const s1 = await get(ref(database, `Chats/${c1}`));
-          if (s1.exists()) existingChatId = c1;
-          else {
-            const s2 = await get(ref(database, `Chats/${c2}`));
-            if (s2.exists()) existingChatId = c2;
-          }
-        } catch (e) {
-          console.warn("onAskTeacher find existing chat error", e);
-        }
-      }
-
       setOpenedChat({
-        chatId: existingChatId || "",
+        chatId: "",
         contactKey: contactKey || "",
         contactUserId: contactUserId || "",
         contactName: teacherProfile?.name || "Teacher",
@@ -1698,7 +1655,7 @@ export default function ClassMarkScreen() {
     );
   };
 
-  if (loading) return (<View style={styles.center}><ActivityIndicator size="large" color={PRIMARY} /></View>);
+  if (loading) return <PageLoadingSkeleton variant="stats" showHeader={false} style={{ flex: 1, backgroundColor: colors.background }} />;
 
   // Empty state when no courses found (friendly message)
   if (!courses || courses.length === 0) {
@@ -2114,7 +2071,7 @@ function createStyles(colors) {
   },
   searchEmptyWrap: {
     marginTop: 16,
-    marginBottom: 6,
+    marginBottom: 6, 
     marginHorizontal: 12,
     borderWidth: 1,
     borderColor: colors.border,

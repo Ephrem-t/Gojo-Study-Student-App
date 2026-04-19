@@ -17,12 +17,19 @@ import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { useRouter, useLocalSearchParams } from "expo-router";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { ref, get } from "firebase/database";
+import { ref, get } from "../../lib/offlineDatabase";
 import { database } from "../../constants/firebaseConfig";
 import { useAppTheme } from "../../hooks/use-app-theme";
+import PageLoadingSkeleton from "../../components/ui/page-loading-skeleton";
 import { queryUserByUsernameInSchool, queryUserByChildInSchool } from "../lib/userHelpers";
-import { getValue, getSnapshot } from "../lib/dbHelpers";
+import { getValue, getSnapshot, resolveSchoolKeyFromStudentId } from "../lib/dbHelpers";
 import { extractProfileImage } from "../lib/profileImage";
+import {
+  readCompanyExamPackageCatalog,
+  writeCompanyExamPackageCatalog,
+} from "../../lib/practiceExamStore";
+import { readScreenCache, writeScreenCache } from "../../lib/appOfflineCache";
+import { seedExamCenterWarmRoute } from "../../lib/examRouteWarmCache";
 
 const { width: SCREEN_W } = Dimensions.get("window");
 
@@ -40,6 +47,8 @@ const STICKY_TOP_AVATAR_SIZE = 38;
 const STICKY_TOP_DEFAULT_STEP = 20;
 const STICKY_TOP_MIN_STEP = 10;
 const STICKY_TOP_MAX_WIDTH = 110;
+const EXAM_REVIEW_CACHE_PREFIX = "examReviewCache:v1";
+const QUESTION_BANK_CACHE_PREFIX = "questionBankCache:v1";
 const EXAM_FILTERS = [
   { key: "online", label: "Online Exam" },
   { key: "gojo", label: "Practice Exams" },
@@ -166,13 +175,6 @@ function summarizeAttemptEntries(attemptsNode = {}) {
   const wrongCount = Math.max(0, totalQuestions - correctCount);
   const rawPointsAwarded = latestCompleted?.pointsAwarded;
   const normalizedPointsAwarded = String(rawPointsAwarded ?? "").trim().toLowerCase();
-  const hasAwardedPoints = latestCompleted
-    ? rawPointsAwarded != null &&
-      normalizedPointsAwarded !== "" &&
-      normalizedPointsAwarded !== "pending" &&
-      Number.isFinite(Number(rawPointsAwarded))
-    : false;
-  const pointsAwarded = hasAwardedPoints ? Number(rawPointsAwarded) : 0;
   const rankingCounted = latestCompleted
     ? String(latestCompleted?.rankingCounted).toLowerCase() === "true" || latestCompleted?.rankingCounted === true || Number(latestCompleted?.rankingCounted) === 1
     : false;
@@ -181,6 +183,14 @@ function summarizeAttemptEntries(attemptsNode = {}) {
       ? rankingCounted
       : String(latestCompleted?.resultVisible).toLowerCase() === "true" || latestCompleted?.resultVisible === true || Number(latestCompleted?.resultVisible) === 1
     : false;
+  const hasAwardedPoints = latestCompleted
+    ? resultVisible &&
+      rawPointsAwarded != null &&
+      normalizedPointsAwarded !== "" &&
+      normalizedPointsAwarded !== "pending" &&
+      Number.isFinite(Number(rawPointsAwarded))
+    : false;
+  const pointsAwarded = hasAwardedPoints ? Number(rawPointsAwarded) : 0;
 
   return {
     hasCompleted: completed.length > 0,
@@ -195,6 +205,29 @@ function summarizeAttemptEntries(attemptsNode = {}) {
     wrongCount,
     totalQuestions,
   };
+}
+
+function isOnlineCompetitiveExamLive(exam, attemptState, nowTs) {
+  const startTs = Number(exam?.startTs || 0);
+  const endTs = Number(exam?.endTs || 0);
+  const hasSetup = !!exam?.roundId && !!exam?.examId;
+  const hasCompletedAttempt = !!attemptState?.hasCompleted;
+  const hasInProgressAttempt = !!attemptState?.hasInProgress;
+  const resultReleased = !!attemptState?.resultVisible;
+  const hasAwardedPoints = !!attemptState?.hasAwardedPoints && resultReleased;
+  const isUpcoming = startTs > nowTs;
+  const isPending = hasCompletedAttempt && !hasAwardedPoints;
+  const isScored = hasCompletedAttempt && hasAwardedPoints;
+  const isExpired = !hasCompletedAttempt && !hasInProgressAttempt && !!endTs && endTs < nowTs;
+
+  return hasSetup && !isUpcoming && !isExpired && !isPending && !isScored && (!!startTs ? startTs <= nowTs : true) && (!endTs || endTs >= nowTs);
+}
+
+function isOnlineCompetitiveExamPending(attemptState) {
+  const hasCompletedAttempt = !!attemptState?.hasCompleted;
+  const resultReleased = !!attemptState?.resultVisible;
+  const hasAwardedPoints = !!attemptState?.hasAwardedPoints && resultReleased;
+  return hasCompletedAttempt && !hasAwardedPoints;
 }
 
 function getPromoVisual(type, colors) {
@@ -224,6 +257,74 @@ function getSubjectVisual(subjectName = "") {
   );
 }
 
+function getExamReviewCacheKey(studentId, examId) {
+  return `${EXAM_REVIEW_CACHE_PREFIX}:${String(studentId || "anon")}:${String(examId || "")}`;
+}
+
+function getQuestionBankCacheKey(qbId) {
+  return `${QUESTION_BANK_CACHE_PREFIX}:${String(qbId || "")}`;
+}
+
+async function getQuestionBankQuestionsForReview(qbId) {
+  if (!qbId) return [];
+
+  try {
+    const cached = await AsyncStorage.getItem(getQuestionBankCacheKey(qbId));
+    if (cached) {
+      const parsed = JSON.parse(cached);
+      if (Array.isArray(parsed?.questions) && parsed.questions.length) {
+        return parsed.questions;
+      }
+    }
+  } catch {}
+
+  try {
+    const direct = [
+      `Platform1/questionBanks/${qbId}`,
+      `Platform1/questionBanks/questionBanks/${qbId}`,
+      `Platform1/companyExams/questionBanks/${qbId}`,
+      `companyExams/questionBanks/${qbId}`,
+      `questionBanks/${qbId}`,
+      `questionBanks/questionBanks/${qbId}`,
+    ];
+
+    let qb = await getValue(direct);
+
+    if (!qb?.questions) {
+      const parents = [
+        `Platform1/questionBanks`,
+        `Platform1/questionBanks/questionBanks`,
+        `questionBanks`,
+        `questionBanks/questionBanks`,
+        `Platform1/companyExams/questionBanks`,
+        `companyExams/questionBanks`,
+        `Platform1`,
+      ];
+
+      for (const p of parents) {
+        const node = await getValue([p]);
+        if (!node) continue;
+        if (node[qbId]?.questions) { qb = node[qbId]; break; }
+        if (node.questionBanks?.[qbId]?.questions) { qb = node.questionBanks[qbId]; break; }
+        if (node.questionBanks?.questionBanks?.[qbId]?.questions) { qb = node.questionBanks.questionBanks[qbId]; break; }
+      }
+    }
+
+    if (qb?.questions) {
+      const questions = Object.entries(qb.questions).map(([id, q]) => ({ id, ...q }));
+      try {
+        await AsyncStorage.setItem(
+          getQuestionBankCacheKey(qbId),
+          JSON.stringify({ savedAt: Date.now(), qbId, questions })
+        );
+      } catch {}
+      return questions;
+    }
+  } catch {}
+
+  return [];
+}
+
 async function resolveSchoolKeyFast(studentId) {
   if (!studentId) return null;
 
@@ -233,16 +334,12 @@ async function resolveSchoolKeyFast(studentId) {
   } catch {}
 
   try {
-    const schoolsSnap = await getSnapshot([`Platform1/Schools`]);
-    const schools = schoolsSnap?.val ? schoolsSnap.val() || {} : {};
-    for (const schoolKey of Object.keys(schools)) {
-      const sSnap = await get(ref(database, `Platform1/Schools/${schoolKey}/Students/${studentId}`));
-      if (sSnap?.exists()) {
-        try {
-          await AsyncStorage.setItem("schoolKey", schoolKey);
-        } catch {}
-        return schoolKey;
-      }
+    const resolvedSchoolKey = await resolveSchoolKeyFromStudentId(studentId);
+    if (resolvedSchoolKey) {
+      try {
+        await AsyncStorage.setItem("schoolKey", resolvedSchoolKey);
+      } catch {}
+      return resolvedSchoolKey;
     }
   } catch {}
 
@@ -461,12 +558,35 @@ export default function ExamScreen() {
   const [promoNowTs, setPromoNowTs] = useState(Date.now());
   const [promoCardIndex, setPromoCardIndex] = useState(0);
   const [onlineExamAttemptState, setOnlineExamAttemptState] = useState({});
+  const [downloadedReviewMap, setDownloadedReviewMap] = useState({});
+  const [reviewDownloadProgress, setReviewDownloadProgress] = useState({});
   const loadLeadersRef = useRef(null);
   const loadPackagesRef = useRef(null);
   const loadSubjectsFastRef = useRef(null);
   const promoListRef = useRef(null);
   const scrollY = useRef(new Animated.Value(0)).current;
   const screenData = useMemo(() => [{ id: "exam-content" }], []);
+
+  const hydrateCachedDashboard = useCallback(async () => {
+    const sid =
+      (await AsyncStorage.getItem("studentNodeKey")) ||
+      (await AsyncStorage.getItem("studentId")) ||
+      (await AsyncStorage.getItem("username")) ||
+      "anonymous";
+
+    const cached = await readScreenCache("exam-dashboard", [sid]);
+    if (!cached) return false;
+
+    setLeaders(Array.isArray(cached.leaders) ? cached.leaders : []);
+    setPackages(Array.isArray(cached.packages) ? cached.packages : []);
+    setSubjects(Array.isArray(cached.subjects) ? cached.subjects : []);
+    setStudentGrade(cached.studentGrade || null);
+    setLeaderCountry(cached.leaderCountry || "Ethiopia");
+    setOnlineExamAttemptState(cached.onlineExamAttemptState || {});
+    setDownloadedReviewMap(cached.downloadedReviewMap || {});
+    setLoading(false);
+    return true;
+  }, []);
 
   useEffect(() => {
     const nextFilter = String(routeParams?.activeFilter || "").toLowerCase();
@@ -486,6 +606,7 @@ export default function ExamScreen() {
   const loadOnlineExamAttemptState = useCallback(async (studentId) => {
     if (!studentId) {
       setOnlineExamAttemptState({});
+      setDownloadedReviewMap({});
       return;
     }
 
@@ -501,14 +622,28 @@ export default function ExamScreen() {
         next[String(examKey)] = summarizeAttemptEntries(examAttempts);
       });
 
+      const downloadedEntries = await Promise.all(
+        Object.keys(next || {}).map(async (examKey) => {
+          try {
+            const cached = await AsyncStorage.getItem(getExamReviewCacheKey(studentId, examKey));
+            return [String(examKey), !!cached];
+          } catch {
+            return [String(examKey), false];
+          }
+        })
+      );
+
       setOnlineExamAttemptState(next);
+      setDownloadedReviewMap(Object.fromEntries(downloadedEntries));
     } catch {
       setOnlineExamAttemptState({});
+      setDownloadedReviewMap({});
     }
   }, []);
 
-  const fetchAll = useCallback(async () => {
-    setLoading(true);
+  const fetchAll = useCallback(async (options = {}) => {
+    const silent = Boolean(options?.silent);
+    if (!silent) setLoading(true);
     try {
       const sid =
         (await AsyncStorage.getItem("studentNodeKey")) ||
@@ -544,18 +679,63 @@ export default function ExamScreen() {
         loadSubjectsFastRef.current?.({ studentId: sid, schoolKey }),
         loadOnlineExamAttemptState(sid),
       ]);
+    } catch (error) {
+      console.warn("Exam dashboard load error:", error);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }, [loadOnlineExamAttemptState]);
 
-  useEffect(() => { fetchAll(); }, [fetchAll]);
+  useEffect(() => {
+    let active = true;
+
+    (async () => {
+      const hadCache = await hydrateCachedDashboard();
+      if (!active) return;
+      await fetchAll({ silent: hadCache });
+    })();
+
+    return () => {
+      active = false;
+    };
+  }, [fetchAll, hydrateCachedDashboard]);
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
     await fetchAll();
     setRefreshing(false);
   }, [fetchAll]);
+
+  useEffect(() => {
+    if (loading) return;
+
+    (async () => {
+      const sid =
+        (await AsyncStorage.getItem("studentNodeKey")) ||
+        (await AsyncStorage.getItem("studentId")) ||
+        (await AsyncStorage.getItem("username")) ||
+        "anonymous";
+
+      await writeScreenCache("exam-dashboard", [sid], {
+        leaders,
+        packages,
+        subjects,
+        studentGrade,
+        leaderCountry,
+        onlineExamAttemptState,
+        downloadedReviewMap,
+      });
+    })();
+  }, [
+    loading,
+    leaders,
+    packages,
+    subjects,
+    studentGrade,
+    leaderCountry,
+    onlineExamAttemptState,
+    downloadedReviewMap,
+  ]);
 
   const loadLeaders = useCallback(async (grade) => {
     try {
@@ -617,7 +797,11 @@ export default function ExamScreen() {
   const loadPackages = useCallback(async (grade) => {
     try {
       const pkgVal = await getValue([`Platform1/companyExams/packages`, `companyExams/packages`]);
-      if (!pkgVal) return setPackages([]);
+      if (!pkgVal) {
+        const cachedPackages = await readCompanyExamPackageCatalog(grade);
+        setPackages(cachedPackages);
+        return;
+      }
 
       const arr = [];
       Object.keys(pkgVal).forEach((key) => {
@@ -645,9 +829,12 @@ export default function ExamScreen() {
         });
       });
 
-      setPackages(arr.filter((p) => p.active));
+      const activePackages = arr.filter((p) => p.active);
+      setPackages(activePackages);
+      await writeCompanyExamPackageCatalog(grade, activePackages);
     } catch {
-      setPackages([]);
+      const cachedPackages = await readCompanyExamPackageCatalog(grade);
+      setPackages(cachedPackages);
     }
   }, []);
 
@@ -890,6 +1077,130 @@ export default function ExamScreen() {
       }))
       .sort((a, b) => a.name.localeCompare(b.name));
   }, [onlineExamPackages]);
+
+  const getOnlineExamWarmHints = useCallback((exam) => {
+    const fallbackRoundId = String(exam?.roundId || "").trim();
+    const fallbackExamId = String(exam?.examId || "").trim();
+    const fallbackQuestionBankId = String(exam?.questionBankId || "").trim();
+    const fallbackRoundMeta = {
+      id: fallbackRoundId,
+      roundId: fallbackRoundId,
+      examId: fallbackExamId,
+      questionBankId: fallbackQuestionBankId,
+      name: exam?.name || "Exam",
+      startTimestamp: Number(exam?.startTs || 0),
+      endTimestamp: Number(exam?.endTs || 0),
+    };
+    const fallbackExamMeta = {
+      id: fallbackExamId,
+      name: exam?.name || "Exam",
+      questionBankId: fallbackQuestionBankId,
+      scoringEnabled: true,
+      rankingEnabled: true,
+      maxAttempts: 1,
+    };
+
+    for (const pkg of onlineExamPackages) {
+      const subjectsData = pkg?.subjectsData || {};
+      for (const subjectKey of Object.keys(subjectsData)) {
+        const subjectRow = subjectsData[subjectKey] || {};
+        const rounds = subjectRow?.rounds || {};
+
+        for (const rid of Object.keys(rounds)) {
+          const round = rounds[rid] || {};
+          const roundExamId = String(round?.examId || "").trim();
+          const roundQuestionBankId = String(round?.questionBankId || "").trim();
+          const matchesTarget =
+            (fallbackRoundId && String(rid) === fallbackRoundId) ||
+            (fallbackExamId && roundExamId === fallbackExamId) ||
+            (fallbackQuestionBankId && roundQuestionBankId === fallbackQuestionBankId);
+
+          if (!matchesTarget) continue;
+
+          const roundMeta = {
+            ...round,
+            id: rid,
+            roundId: rid,
+            packageId: pkg.id,
+            subjectKey,
+            examId: roundExamId || fallbackExamId,
+            questionBankId: roundQuestionBankId || fallbackQuestionBankId,
+            name: round?.name || round?.examName || fallbackExamMeta.name,
+          };
+          const examMeta = {
+            ...fallbackExamMeta,
+            name: roundMeta.name || fallbackExamMeta.name,
+            questionBankId: roundMeta.questionBankId || fallbackQuestionBankId,
+            totalQuestions: round?.totalQuestions ?? round?.questionCount,
+            timeLimit: round?.timeLimit,
+            instructions: round?.instructions ?? round?.rules,
+          };
+
+          return { roundMeta, examMeta };
+        }
+      }
+    }
+
+    return {
+      roundMeta: fallbackRoundMeta,
+      examMeta: fallbackExamMeta,
+    };
+  }, [onlineExamPackages]);
+
+  const warmExamCenterRoute = useCallback((exam) => {
+    if (!exam?.roundId || !exam?.examId) return;
+
+    const warmSeed = getOnlineExamWarmHints(exam);
+    const resolvedQuestionBankId =
+      warmSeed?.roundMeta?.questionBankId ||
+      warmSeed?.examMeta?.questionBankId ||
+      exam?.questionBankId ||
+      "";
+
+    seedExamCenterWarmRoute({
+      roundId: exam.roundId,
+      examId: exam.examId,
+      data: {
+        ...warmSeed,
+        isCompetitive: true,
+      },
+    });
+
+    void (async () => {
+      try {
+        const [appExamConfig, remoteExamMeta, prefetchedQuestions] = await Promise.all([
+          getValue([`Platform1/appConfig/exams`, `appConfig/exams`]),
+          getValue([
+            `Platform1/companyExams/exams/${exam.examId}`,
+            `companyExams/exams/${exam.examId}`,
+            `Platform1/exams/${exam.examId}`,
+            `exams/${exam.examId}`,
+          ]),
+          resolvedQuestionBankId ? getQuestionBankQuestionsForReview(resolvedQuestionBankId) : Promise.resolve([]),
+        ]);
+
+        seedExamCenterWarmRoute({
+          roundId: exam.roundId,
+          examId: exam.examId,
+          data: {
+            isCompetitive: true,
+            appExamConfig: appExamConfig || null,
+            examMeta: {
+              ...(warmSeed?.examMeta || {}),
+              ...(remoteExamMeta || {}),
+              id: exam.examId,
+              name: remoteExamMeta?.name || warmSeed?.examMeta?.name || exam?.name || "Exam",
+              questionBankId:
+                remoteExamMeta?.questionBankId ||
+                warmSeed?.examMeta?.questionBankId ||
+                resolvedQuestionBankId,
+            },
+            questions: Array.isArray(prefetchedQuestions) ? prefetchedQuestions : [],
+          },
+        });
+      } catch {}
+    })();
+  }, [getOnlineExamWarmHints]);
 
   const practiceExamPackages = useMemo(
     () => packages.filter((p) => p.type === "practice"),
@@ -1145,17 +1456,118 @@ export default function ExamScreen() {
       endTs: Number(exam?.endTs || 0),
       roundId: exam?.roundId || "",
       examId: exam?.examId || "",
+      questionBankId: exam?.questionBankId || "",
       pointsAwarded: Number(attemptState?.pointsAwarded || 0),
       scorePercent: Number(attemptState?.scorePercent || 0),
       correctCount: Number(attemptState?.correctCount || 0),
       wrongCount: Number(attemptState?.wrongCount || 0),
       totalQuestions: Number(attemptState?.totalQuestions || 0),
       resultVisible: !!attemptState?.resultVisible,
+      downloaded: !!downloadedReviewMap[String(exam?.examId || "")],
     });
     setUpcomingExamModalVisible(true);
-  }, []);
+  }, [downloadedReviewMap]);
 
-  const handleOnlineExamPress = useCallback(async (subjectName, exam, cachedAttemptState = null) => {
+  const openReleasedExamReview = useCallback((exam, subjectName = "") => {
+    if (!exam?.roundId || !exam?.examId) return;
+
+    const examKey = String(exam.examId);
+    warmExamCenterRoute(exam);
+    setUpcomingExamModalVisible(false);
+    router.push({
+      pathname: "/examCenter",
+      params: {
+        roundId: exam.roundId,
+        examId: exam.examId,
+        questionBankId: exam.questionBankId || "",
+        mode: "review",
+        reviewSubject: subjectName || "",
+        returnTo: "exam",
+        returnExamFilter: "online",
+      },
+    });
+
+    if (downloadedReviewMap[examKey]) return;
+
+    void (async () => {
+      setReviewDownloadProgress((prev) => ({ ...prev, [examKey]: 5 }));
+
+      try {
+        const sid =
+          (await AsyncStorage.getItem("studentNodeKey")) ||
+          (await AsyncStorage.getItem("studentId")) ||
+          (await AsyncStorage.getItem("username")) ||
+          null;
+
+        if (!sid) {
+          setReviewDownloadProgress((prev) => ({ ...prev, [examKey]: 0 }));
+          return;
+        }
+
+        const reviewCacheKey = getExamReviewCacheKey(sid, examKey);
+        const existing = await AsyncStorage.getItem(reviewCacheKey);
+        if (existing) {
+          setDownloadedReviewMap((prev) => ({ ...prev, [examKey]: true }));
+          setReviewDownloadProgress((prev) => ({ ...prev, [examKey]: 100 }));
+          return;
+        }
+
+        setReviewDownloadProgress((prev) => ({ ...prev, [examKey]: 18 }));
+        const attemptsNode = (await getValue([
+          `Platform1/attempts/company/${sid}/${examKey}`,
+          `attempts/company/${sid}/${examKey}`,
+        ])) || {};
+
+        let entries = attemptsNode || {};
+        if (attemptsNode && (attemptsNode.attemptStatus || attemptsNode.startTime || attemptsNode.scorePercent != null)) {
+          entries = { legacy_single_attempt: attemptsNode };
+        }
+
+        const completedKeys = Object.keys(entries || {}).filter(
+          (key) => String(entries[key]?.attemptStatus || "").toLowerCase() === "completed"
+        );
+        completedKeys.sort(
+          (a, b) => Number(entries[b]?.endTime || entries[b]?.startTime || 0) - Number(entries[a]?.endTime || entries[a]?.startTime || 0)
+        );
+
+        const latestKey = completedKeys[0] || Object.keys(entries || {})[0] || null;
+        const latestAttempt = latestKey ? entries[latestKey] || {} : {};
+
+        setReviewDownloadProgress((prev) => ({ ...prev, [examKey]: 52 }));
+        const questions = await getQuestionBankQuestionsForReview(exam?.questionBankId || latestAttempt?.questionBankId || "");
+
+        setReviewDownloadProgress((prev) => ({ ...prev, [examKey]: 84 }));
+        await AsyncStorage.setItem(
+          reviewCacheKey,
+          JSON.stringify({
+            savedAt: Date.now(),
+            roundMeta: { id: exam.roundId, name: exam.name || "Round Exam" },
+            examMeta: {
+              name: exam.name || "Round Exam",
+              questionBankId: exam.questionBankId || latestAttempt?.questionBankId || "",
+              scoringEnabled: true,
+            },
+            isCompetitive: true,
+            feedbackMode: "end",
+            questions,
+            reviewAttempt: {
+              id: latestKey,
+              ...latestAttempt,
+              questionOrder: latestAttempt?.questionOrder || {},
+              answers: latestAttempt?.answers || {},
+            },
+          })
+        );
+
+        setDownloadedReviewMap((prev) => ({ ...prev, [examKey]: true }));
+        setReviewDownloadProgress((prev) => ({ ...prev, [examKey]: 100 }));
+      } catch {
+        setReviewDownloadProgress((prev) => ({ ...prev, [examKey]: 0 }));
+      }
+    })();
+  }, [downloadedReviewMap, router, warmExamCenterRoute]);
+
+  const handleOnlineExamPress = useCallback((subjectName, exam, cachedAttemptState = null) => {
     if (!exam) return;
 
     const startTs = Number(exam?.startTs || 0);
@@ -1173,29 +1585,7 @@ export default function ExamScreen() {
 
     if (!exam?.roundId || !exam?.examId) return;
 
-    try {
-      const sid =
-        (await AsyncStorage.getItem("studentNodeKey")) ||
-        (await AsyncStorage.getItem("studentId")) ||
-        (await AsyncStorage.getItem("username")) ||
-        null;
-
-      if (sid) {
-        const attemptsNode = (await getValue([
-          `Platform1/attempts/company/${sid}/${exam.examId}`,
-          `attempts/company/${sid}/${exam.examId}`,
-        ])) || {};
-
-        const liveAttemptState = summarizeAttemptEntries(attemptsNode);
-
-        if (liveAttemptState.hasCompleted) {
-          const previewVariant = liveAttemptState?.hasAwardedPoints ? "scored" : "pending";
-          openUpcomingExamPreview(subjectName, exam, previewVariant, liveAttemptState);
-          return;
-        }
-      }
-    } catch {}
-
+    warmExamCenterRoute(exam);
     router.push({
       pathname: "/examCenter",
       params: {
@@ -1207,7 +1597,7 @@ export default function ExamScreen() {
         returnExamFilter: "online",
       },
     });
-  }, [openUpcomingExamPreview, promoNowTs, router]);
+  }, [openUpcomingExamPreview, promoNowTs, router, warmExamCenterRoute]);
 
   const topRankGroups = useMemo(() => {
     const grouped = [];
@@ -1576,10 +1966,24 @@ export default function ExamScreen() {
           ) : (
             <View style={styles.onlineListWrap}>
               {onlineExamSubjects.map((item) => {
+                const pendingExamCount = item.exams.filter((exam) => {
+                  const attemptState = onlineExamAttemptState[String(exam?.examId || "")] || {};
+                  return isOnlineCompetitiveExamPending(attemptState);
+                }).length;
+                const liveExamCount = item.exams.filter((exam) => {
+                  const attemptState = onlineExamAttemptState[String(exam?.examId || "")] || {};
+                  return isOnlineCompetitiveExamLive(exam, attemptState, promoNowTs);
+                }).length;
                 const upcomingExamCount = item.exams.filter((exam) => Number(exam?.startTs || 0) > promoNowTs).length;
 
                 return (
-                <View key={item.id} style={styles.onlineListItemWrap}>
+                <View
+                  key={item.id}
+                  style={[
+                    styles.onlineListItemWrap,
+                    expandedOnlineSubjectId === item.id && styles.onlineListItemWrapExpanded,
+                  ]}
+                >
                   <TouchableOpacity
                     style={[styles.onlineListItem, expandedOnlineSubjectId === item.id && styles.onlineListItemExpanded]}
                     activeOpacity={0.9}
@@ -1602,9 +2006,25 @@ export default function ExamScreen() {
                       </View>
                     </View>
 
-                    {upcomingExamCount > 0 ? (
-                      <View style={styles.onlineListCountBadge}>
-                        <Text style={styles.onlineListCountText}>{upcomingExamCount > 99 ? "99+" : upcomingExamCount}</Text>
+                    {pendingExamCount > 0 || liveExamCount > 0 || upcomingExamCount > 0 ? (
+                      <View style={styles.onlineListIndicators}>
+                        {pendingExamCount > 0 ? (
+                          <View style={[styles.onlineExamStatusPill, styles.onlineExamStatusPillPending]}>
+                            <Text style={[styles.onlineExamStatusText, styles.onlineExamStatusTextPending]}>PENDING</Text>
+                          </View>
+                        ) : null}
+
+                        {liveExamCount > 0 ? (
+                          <View style={[styles.onlineExamStatusPill, styles.onlineExamStatusPillLive]}>
+                            <Text style={[styles.onlineExamStatusText, styles.onlineExamStatusTextLive]}>LIVE</Text>
+                          </View>
+                        ) : null}
+
+                        {pendingExamCount === 0 && liveExamCount === 0 && upcomingExamCount > 0 ? (
+                          <View style={styles.onlineListCountBadge}>
+                            <Text style={styles.onlineListCountText}>{upcomingExamCount > 99 ? "99+" : upcomingExamCount}</Text>
+                          </View>
+                        ) : null}
                       </View>
                     ) : null}
                   </TouchableOpacity>
@@ -1620,14 +2040,17 @@ export default function ExamScreen() {
                           const attemptState = onlineExamAttemptState[String(exam?.examId || "")] || {};
                           const hasCompletedAttempt = !!attemptState?.hasCompleted;
                           const hasInProgressAttempt = !!attemptState?.hasInProgress;
-                          const hasAwardedPoints = !!attemptState?.hasAwardedPoints;
+                          const resultReleased = !!attemptState?.resultVisible;
+                          const hasAwardedPoints = !!attemptState?.hasAwardedPoints && resultReleased;
                           const earnedPoints = Number(attemptState?.pointsAwarded || 0);
 
                           const isUpcoming = startTs > promoNowTs;
                           const isPending = hasCompletedAttempt && !hasAwardedPoints;
                           const isScored = hasCompletedAttempt && hasAwardedPoints;
+                          const isDownloaded = !!downloadedReviewMap[String(exam?.examId || "")];
+                          const downloadPct = Number(reviewDownloadProgress[String(exam?.examId || "")] || 0);
                           const isExpired = !hasCompletedAttempt && !hasInProgressAttempt && !!endTs && endTs < promoNowTs;
-                          const isLive = hasSetup && !isUpcoming && !isExpired && !isPending && !isScored && (!!startTs ? startTs <= promoNowTs : true) && (!endTs || endTs >= promoNowTs);
+                          const isLive = isOnlineCompetitiveExamLive(exam, attemptState, promoNowTs);
 
                           const canOpenExam = hasSetup && !isUpcoming && !isExpired && !hasCompletedAttempt;
                           const canShowPreview = isUpcoming || isPending || isScored;
@@ -1635,7 +2058,7 @@ export default function ExamScreen() {
                           const metaText = isUpcoming
                             ? `Opens in ${formatInlineCountdown(startTs - promoNowTs)}`
                             : isPending
-                            ? "Point pending"
+                            ? "Finished • waiting for point distribution"
                             : isScored
                             ? `${earnedPoints} ${earnedPoints === 1 ? "point" : "points"}`
                             : isExpired
@@ -1699,33 +2122,61 @@ export default function ExamScreen() {
                                 </View>
                               </View>
 
-                              {statusPill ? (
-                                <View
-                                  style={[
-                                    styles.onlineExamStatusPill,
-                                    statusPill === "UPCOMING" && styles.onlineExamStatusPillUpcoming,
-                                    statusPill === "LIVE" && styles.onlineExamStatusPillLive,
-                                    statusPill === "PENDING" && styles.onlineExamStatusPillPending,
-                                    (statusPill === "1 PT" || /PTS$/.test(statusPill)) && styles.onlineExamStatusPillScored,
-                                    statusPill === "EXPIRED" && styles.onlineExamStatusPillExpired,
-                                    statusPill === "UNAVAILABLE" && styles.onlineExamStatusPillUnavailable,
-                                  ]}
-                                >
-                                  <Text
+                              <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                                {isScored ? (
+                                  <View
                                     style={[
-                                      styles.onlineExamStatusText,
-                                      statusPill === "UPCOMING" && styles.onlineExamStatusTextUpcoming,
-                                      statusPill === "LIVE" && styles.onlineExamStatusTextLive,
-                                      statusPill === "PENDING" && styles.onlineExamStatusTextPending,
-                                      (statusPill === "1 PT" || /PTS$/.test(statusPill)) && styles.onlineExamStatusTextScored,
-                                      statusPill === "EXPIRED" && styles.onlineExamStatusTextExpired,
-                                      statusPill === "UNAVAILABLE" && styles.onlineExamStatusTextUnavailable,
+                                      styles.onlineExamStatusPill,
+                                      {
+                                        minWidth: 34,
+                                        paddingHorizontal: downloadPct > 0 && downloadPct < 100 ? 8 : 0,
+                                        alignItems: "center",
+                                        justifyContent: "center",
+                                        borderColor: isDownloaded ? colors.successBorder : colors.infoBorder,
+                                        backgroundColor: isDownloaded ? colors.successSurface : colors.infoSurface,
+                                      },
                                     ]}
                                   >
-                                    {statusPill}
-                                  </Text>
-                                </View>
-                              ) : null}
+                                    {downloadPct > 0 && downloadPct < 100 ? (
+                                      <Text style={[styles.onlineExamStatusText, { color: PRIMARY }]}>{downloadPct}%</Text>
+                                    ) : (
+                                      <Ionicons
+                                        name={isDownloaded ? "checkmark" : "download-outline"}
+                                        size={15}
+                                        color={isDownloaded ? colors.success : PRIMARY}
+                                      />
+                                    )}
+                                  </View>
+                                ) : null}
+
+                                {statusPill ? (
+                                  <View
+                                    style={[
+                                      styles.onlineExamStatusPill,
+                                      statusPill === "UPCOMING" && styles.onlineExamStatusPillUpcoming,
+                                      statusPill === "LIVE" && styles.onlineExamStatusPillLive,
+                                      statusPill === "PENDING" && styles.onlineExamStatusPillPending,
+                                      (statusPill === "1 PT" || /PTS$/.test(statusPill)) && styles.onlineExamStatusPillScored,
+                                      statusPill === "EXPIRED" && styles.onlineExamStatusPillExpired,
+                                      statusPill === "UNAVAILABLE" && styles.onlineExamStatusPillUnavailable,
+                                    ]}
+                                  >
+                                    <Text
+                                      style={[
+                                        styles.onlineExamStatusText,
+                                        statusPill === "UPCOMING" && styles.onlineExamStatusTextUpcoming,
+                                        statusPill === "LIVE" && styles.onlineExamStatusTextLive,
+                                        statusPill === "PENDING" && styles.onlineExamStatusTextPending,
+                                        (statusPill === "1 PT" || /PTS$/.test(statusPill)) && styles.onlineExamStatusTextScored,
+                                        statusPill === "EXPIRED" && styles.onlineExamStatusTextExpired,
+                                        statusPill === "UNAVAILABLE" && styles.onlineExamStatusTextUnavailable,
+                                      ]}
+                                    >
+                                      {statusPill}
+                                    </Text>
+                                  </View>
+                                ) : null}
+                              </View>
                             </TouchableOpacity>
                           );
                         })
@@ -1834,6 +2285,8 @@ export default function ExamScreen() {
                           subject: item.subject,
                           grade: item.grade,
                           section: item.section,
+                          warmAssessmentCount: String(item.assessmentCount || 0),
+                          warmPendingAssessmentCount: String(item.pendingAssessmentCount || 0),
                           returnTo: "exam",
                           returnExamFilter: "school",
                         },
@@ -1920,24 +2373,61 @@ export default function ExamScreen() {
                 <View style={styles.upcomingExamModalNote}>
                   <Ionicons name="information-circle-outline" size={15} color={PRIMARY} />
                   <Text style={styles.upcomingExamModalNoteText}>
-                    {selectedUpcomingExam?.variant === "pending"
-                      ? "You took this exam. Exam point pending."
-                      : selectedUpcomingExam?.variant === "scored"
-                      ? `You got ${Number(selectedUpcomingExam?.pointsAwarded || 0)} ${Number(selectedUpcomingExam?.pointsAwarded || 0) === 1 ? "point" : "points"}.`
-                      : "You already took this exam. Exam point pending."}
+                    {selectedUpcomingExam?.resultVisible
+                      ? selectedUpcomingExam?.variant === "scored"
+                        ? `You got ${Number(selectedUpcomingExam?.pointsAwarded || 0)} ${Number(selectedUpcomingExam?.pointsAwarded || 0) === 1 ? "point" : "points"}.`
+                        : "Your result is available now."
+                      : "You finished this exam. Please wait until all students submit and points are distributed."}
                   </Text>
                 </View>
 
-                <View style={{ flexDirection: "row", gap: 10, marginTop: 12 }}>
-                  <View style={{ flex: 1, borderWidth: 1, borderColor: colors.successBorder, backgroundColor: colors.successSurface, borderRadius: 14, paddingVertical: 10, alignItems: "center" }}>
-                    <Text style={{ color: colors.muted, fontSize: 11, fontWeight: "700" }}>Correct</Text>
-                    <Text style={{ color: colors.success, fontSize: 18, fontWeight: "900", marginTop: 4 }}>{Number(selectedUpcomingExam?.correctCount || 0)}</Text>
+                {selectedUpcomingExam?.resultVisible ? (
+                  <View style={{ flexDirection: "row", gap: 10, marginTop: 12 }}>
+                    <View style={{ flex: 1, borderWidth: 1, borderColor: colors.successBorder, backgroundColor: colors.successSurface, borderRadius: 14, paddingVertical: 10, alignItems: "center" }}>
+                      <Text style={{ color: colors.muted, fontSize: 11, fontWeight: "700" }}>Correct</Text>
+                      <Text style={{ color: colors.success, fontSize: 18, fontWeight: "900", marginTop: 4 }}>{Number(selectedUpcomingExam?.correctCount || 0)}</Text>
+                    </View>
+                    <View style={{ flex: 1, borderWidth: 1, borderColor: colors.dangerBorder, backgroundColor: colors.dangerSurface, borderRadius: 14, paddingVertical: 10, alignItems: "center" }}>
+                      <Text style={{ color: colors.muted, fontSize: 11, fontWeight: "700" }}>Wrong</Text>
+                      <Text style={{ color: colors.danger, fontSize: 18, fontWeight: "900", marginTop: 4 }}>{Number(selectedUpcomingExam?.wrongCount || 0)}</Text>
+                    </View>
                   </View>
-                  <View style={{ flex: 1, borderWidth: 1, borderColor: colors.dangerBorder, backgroundColor: colors.dangerSurface, borderRadius: 14, paddingVertical: 10, alignItems: "center" }}>
-                    <Text style={{ color: colors.muted, fontSize: 11, fontWeight: "700" }}>Wrong</Text>
-                    <Text style={{ color: colors.danger, fontSize: 18, fontWeight: "900", marginTop: 4 }}>{Number(selectedUpcomingExam?.wrongCount || 0)}</Text>
-                  </View>
-                </View>
+                ) : null}
+
+                {selectedUpcomingExam?.resultVisible ? (() => {
+                  const modalExamKey = String(selectedUpcomingExam?.examId || "");
+                  const modalDownloaded = !!downloadedReviewMap[modalExamKey];
+                  const modalDownloadPct = Number(reviewDownloadProgress[modalExamKey] || 0);
+                  const isDownloading = modalDownloadPct > 0 && modalDownloadPct < 100;
+
+                  return (
+                    <TouchableOpacity
+                      style={[
+                        styles.closeBtn,
+                        {
+                          marginTop: 12,
+                          backgroundColor: "transparent",
+                          borderWidth: 1.5,
+                          borderColor: modalDownloaded ? colors.success : PRIMARY,
+                          flexDirection: "row",
+                          gap: 8,
+                          opacity: isDownloading ? 0.85 : 1,
+                        },
+                      ]}
+                      onPress={() => openReleasedExamReview(selectedUpcomingExam, selectedUpcomingExam?.subjectName || "")}
+                      disabled={isDownloading}
+                    >
+                      <Ionicons
+                        name={isDownloading ? "sync-outline" : modalDownloaded ? "checkmark-circle" : "open-outline"}
+                        size={16}
+                        color={modalDownloaded ? colors.success : PRIMARY}
+                      />
+                      <Text style={[styles.closeBtnText, { color: modalDownloaded ? colors.success : PRIMARY }]}>
+                        {isDownloading ? `Preparing ${modalDownloadPct}%` : modalDownloaded ? "Review Answers" : "Open Review"}
+                      </Text>
+                    </TouchableOpacity>
+                  );
+                })() : null}
               </>
             ) : (
               <>
@@ -2088,6 +2578,8 @@ export default function ExamScreen() {
     promoCardIndex,
     promoNowTs,
     onlineExamAttemptState,
+    downloadedReviewMap,
+    reviewDownloadProgress,
     profileLoading,
     profileModalVisible,
     handlePromoScrollEnd,
@@ -2111,15 +2603,12 @@ export default function ExamScreen() {
     handleTopRankPress,
     openTopProfile,
     handleOnlineExamPress,
+    openReleasedExamReview,
     promoCarouselCardWidth,
   ]);
 
   if (loading) {
-    return (
-      <SafeAreaView edges={["top", "left", "right"]} style={[styles.screen, styles.center]}>
-        <ActivityIndicator color={PRIMARY} />
-      </SafeAreaView>
-    );
+    return <PageLoadingSkeleton variant="exam" showHeader={false} style={styles.screen} />;
   }
 
   return (
@@ -2931,6 +3420,12 @@ function createStyles(colors) {
     shadowRadius: 10,
     elevation: 1,
   },
+  onlineListItemWrapExpanded: {
+    borderColor: colors.primary,
+    shadowColor: PRIMARY,
+    shadowOpacity: 0.05,
+    elevation: 2,
+  },
   onlineListItem: {
     paddingHorizontal: 16,
     paddingVertical: 15,
@@ -3026,6 +3521,12 @@ function createStyles(colors) {
     backgroundColor: colors.inputBackground,
     alignItems: "center",
     justifyContent: "center",
+    marginLeft: 10,
+  },
+  onlineListIndicators: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
     marginLeft: 10,
   },
   onlineListCountBadge: {

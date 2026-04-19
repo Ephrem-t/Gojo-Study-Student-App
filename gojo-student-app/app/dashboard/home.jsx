@@ -24,20 +24,21 @@ import {
   query,
   orderByChild,
   limitToLast,
-  equalTo,
   endAt,
   onValue,
   off,
   get,
   update,
   runTransaction,
-} from "firebase/database";
+} from "../../lib/offlineDatabase";
 import { database } from "../../constants/firebaseConfig";
 import { queryUserByUsernameInSchool, queryUserByChildInSchool } from "../lib/userHelpers";
 import { useAppTheme } from "../../hooks/use-app-theme";
 import useUserProfileCard from "../../hooks/use-user-profile-card";
 import { extractProfileImage, normalizeProfileImageUri } from "../lib/profileImage";
 import { getSavedPostsLocation, toggleSavedPostEntry } from "../lib/savedPosts";
+import { readScreenCache, writeScreenCache } from "../../lib/appOfflineCache";
+import PageLoadingSkeleton from "../../components/ui/page-loading-skeleton";
 
 /**
  * Home feed with pagination ("load more") for older posts.
@@ -51,27 +52,17 @@ const DESCRIPTION_PREVIEW_LENGTH = 140;
 const SCREEN_WIDTH = Dimensions.get("window").width;
 const IMAGE_HEIGHT = Math.round(SCREEN_WIDTH * 0.9 * 0.65);
 
+function getScreenCacheScope(value) {
+  const normalized = String(value || "").trim();
+  return normalized || "global";
+}
+
 function getFileExtensionFromUrl(url) {
   if (!url) return "jpg";
   const cleanUrl = url.split("?")[0] || "";
   const ext = cleanUrl.split(".").pop()?.toLowerCase();
   if (!ext || ext.length > 5) return "jpg";
   return ext;
-}
-
-function getMimeTypeFromExtension(ext) {
-  switch (ext) {
-    case "png":
-      return "image/png";
-    case "webp":
-      return "image/webp";
-    case "gif":
-      return "image/gif";
-    case "heic":
-      return "image/heic";
-    default:
-      return "image/jpeg";
-  }
 }
 
 function timeAgo(iso) {
@@ -159,6 +150,39 @@ export default function HomeScreen() {
   const postsQueryRef = useRef(null);
   const savedPostsQueryRef = useRef(null);
   const hasUserScrolledFeedRef = useRef(false);
+  const savedPostsReadyRef = useRef(false);
+
+  useEffect(() => {
+    let mounted = true;
+
+    (async () => {
+      const schoolKey = await AsyncStorage.getItem("schoolKey");
+      const scope = getScreenCacheScope(schoolKey);
+      const [cachedFeed, cachedSavedPosts] = await Promise.all([
+        readScreenCache("home-feed", [scope]),
+        readScreenCache("home-saved-posts", [scope]),
+      ]);
+
+      if (!mounted) return;
+
+      if (cachedFeed) {
+        adminCacheRef.current = cachedFeed.adminCache || {};
+        setPostsLatest(Array.isArray(cachedFeed.postsLatest) ? cachedFeed.postsLatest : []);
+        setPostsOlder(Array.isArray(cachedFeed.postsOlder) ? cachedFeed.postsOlder : []);
+        setHasMore(cachedFeed.hasMore !== false);
+        setLoading(false);
+      }
+
+      if (cachedSavedPosts?.savedPostsMap && typeof cachedSavedPosts.savedPostsMap === "object") {
+        savedPostsReadyRef.current = true;
+        setSavedPostsMap(cachedSavedPosts.savedPostsMap);
+      }
+    })();
+
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   const loadUserContext = useCallback(async () => {
     const uid = await AsyncStorage.getItem("userId");
@@ -384,6 +408,7 @@ export default function HomeScreen() {
     (async () => {
       const location = await getSavedPostsLocation();
       if (!location?.basePath) {
+        savedPostsReadyRef.current = true;
         if (mounted) setSavedPostsMap({});
         return;
       }
@@ -395,9 +420,11 @@ export default function HomeScreen() {
         savedRef,
         (snap) => {
           if (!mounted) return;
+          savedPostsReadyRef.current = true;
           setSavedPostsMap(snap.exists() ? snap.val() || {} : {});
         },
         () => {
+          savedPostsReadyRef.current = true;
           if (mounted) setSavedPostsMap({});
         }
       );
@@ -409,6 +436,31 @@ export default function HomeScreen() {
       if (savedPostsQueryRef.current) off(savedPostsQueryRef.current);
     };
   }, []);
+
+  useEffect(() => {
+    if (loading) return;
+
+    (async () => {
+      const schoolKey = await AsyncStorage.getItem("schoolKey");
+      await writeScreenCache("home-feed", [getScreenCacheScope(schoolKey)], {
+        postsLatest,
+        postsOlder,
+        hasMore,
+        adminCache: adminCacheRef.current,
+      });
+    })();
+  }, [loading, postsLatest, postsOlder, hasMore]);
+
+  useEffect(() => {
+    if (!savedPostsReadyRef.current) return;
+
+    (async () => {
+      const schoolKey = await AsyncStorage.getItem("schoolKey");
+      await writeScreenCache("home-saved-posts", [getScreenCacheScope(schoolKey)], {
+        savedPostsMap,
+      });
+    })();
+  }, [savedPostsMap]);
 
   const onRefresh = async () => {
     setRefreshing(true);
@@ -694,7 +746,7 @@ export default function HomeScreen() {
   }, [combinedPosts, postMenuPostId, closePostMenu]);
 
   function PostCard({ item }) {
-    const { postId, data, admin, likesMap = {}, seenMap = {} } = item;
+    const { postId, data, admin, likesMap = {} } = item;
     const likesCount = data.likeCount || Object.keys(likesMap || {}).length;
     const isLiked = userId ? !!likesMap[userId] : false;
     const isSaved = !!savedPostsMap[postId];
@@ -822,11 +874,7 @@ export default function HomeScreen() {
   );
 
   if (loading) {
-    return (
-      <View style={styles.center}>
-        <ActivityIndicator size="large" color={colors.primary} />
-      </View>
-    );
+    return <PageLoadingSkeleton variant="feed" showHeader={false} style={{ flex: 1, backgroundColor: colors.feedBackground }} />;
   }
 
   if (!combinedPosts || combinedPosts.length === 0) {

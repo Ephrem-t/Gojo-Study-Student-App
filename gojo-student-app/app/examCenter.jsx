@@ -4,7 +4,6 @@ import {
   Text,
   StyleSheet,
   TouchableOpacity,
-  ActivityIndicator,
   SafeAreaView,
   ScrollView,
   Platform,
@@ -18,11 +17,22 @@ import {
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useRouter, useLocalSearchParams } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { ref, get } from "firebase/database";
+import { ref, get } from "../lib/offlineDatabase";
 import { database } from "../constants/firebaseConfig";
 import { Ionicons } from "@expo/vector-icons";
 import { useAppTheme } from "../hooks/use-app-theme";
+import PageLoadingSkeleton from "../components/ui/page-loading-skeleton";
+import { readScreenCache, writeScreenCache } from "../lib/appOfflineCache";
 import { getValue, pushAndSet, runTransactionSafe, safeUpdate } from "./lib/dbHelpers";
+import {
+  createLocalAttemptId,
+  ensurePracticeLives,
+  readPracticeExamBundle,
+  readPracticeExamProgress,
+  updatePracticeExamProgress,
+  writePracticeLives,
+} from "../lib/practiceExamStore";
+import { peekExamCenterWarmRoute } from "../lib/examRouteWarmCache";
 
 const C = {
   primary: "#0B72FF",
@@ -31,9 +41,78 @@ const C = {
   danger: "#EF4444",
 };
 const HEART_COLOR = "#EF4444";
-const DEFAULT_HEART_REFILL_MS = 20 * 60 * 1000;
+const DEFAULT_HEART_REFILL_MS = 30 * 60 * 1000;
 const DEFAULT_MAX_LIVES = 5;
 const WRONGS_PER_LIFE_FALLBACK = 2;
+const EXAM_REVIEW_CACHE_PREFIX = "examReviewCache:v1";
+const QUESTION_BANK_CACHE_PREFIX = "questionBankCache:v1";
+const DEFAULT_APP_EXAM_CONFIG = {
+  attempts: {
+    defaultRefillIntervalMs: 0,
+    maxCarryRefills: 999,
+    practiceRefillEnabled: false,
+  },
+  lives: {
+    defaultMaxLives: DEFAULT_MAX_LIVES,
+    defaultRefillIntervalMs: DEFAULT_HEART_REFILL_MS,
+    fallbackWrongsPerLife: WRONGS_PER_LIFE_FALLBACK,
+  },
+  ui: {},
+};
+
+function mergeAppExamConfig(config = null) {
+  return {
+    ...DEFAULT_APP_EXAM_CONFIG,
+    ...(config || {}),
+    attempts: {
+      ...DEFAULT_APP_EXAM_CONFIG.attempts,
+      ...(config?.attempts || {}),
+      defaultRefillIntervalMs: 0,
+      practiceRefillEnabled: false,
+    },
+    lives: {
+      ...DEFAULT_APP_EXAM_CONFIG.lives,
+      ...(config?.lives || {}),
+    },
+    ui: {
+      ...DEFAULT_APP_EXAM_CONFIG.ui,
+      ...(config?.ui || {}),
+    },
+  };
+}
+
+function getReviewCacheKey(studentId, examId) {
+  return `${EXAM_REVIEW_CACHE_PREFIX}:${String(studentId || "anon")}:${String(examId || "")}`;
+}
+
+function getQuestionBankCacheKey(qbId) {
+  return `${QUESTION_BANK_CACHE_PREFIX}:${String(qbId || "")}`;
+}
+
+async function readJsonCache(key) {
+  try {
+    const raw = await AsyncStorage.getItem(key);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeJsonCache(key, value) {
+  try {
+    await AsyncStorage.setItem(key, JSON.stringify(value));
+  } catch {}
+}
+
+async function readStoredStudentId() {
+  try {
+    const pairs = await AsyncStorage.multiGet(["studentNodeKey", "studentId", "username"]);
+    const session = Object.fromEntries(pairs);
+    return session.studentNodeKey || session.studentId || session.username || null;
+  } catch {
+    return null;
+  }
+}
 
 function toMsTs(v) {
   const n = Number(v || 0);
@@ -51,6 +130,16 @@ function normalizeQuestionOrder(qOrder) {
   }
   return [];
 }
+
+function getHighestCompletedScorePercent(entries = {}) {
+  return Object.values(entries || {}).reduce((highest, attempt) => {
+    if (String(attempt?.attemptStatus || "").toLowerCase() !== "completed") return highest;
+    const parsedScorePercent = Number(attempt?.scorePercent);
+    if (!Number.isFinite(parsedScorePercent)) return highest;
+    return Math.max(highest, parsedScorePercent);
+  }, 0);
+}
+
 function scoreExam(questions, order, answers) {
   const qOrder = order.length ? order : questions.map((q) => q.id);
   const map = {};
@@ -78,6 +167,24 @@ function getBadgeAndPoints(examMeta, percent) {
   }
   return { badge, points };
 }
+
+function getResolvedPracticePassPercent(examMeta = null) {
+  const parsed = Number(
+    examMeta?.passingPercent ??
+    examMeta?.passPercent ??
+    examMeta?.passScore ??
+    NaN
+  );
+
+  if (!Number.isFinite(parsed)) return 50;
+  return Math.max(50, parsed);
+}
+
+function normalizePackageGradeCacheToken(value) {
+  if (!value) return null;
+  return String(value).trim().toLowerCase().replace(/^grade/i, "") || null;
+}
+
 function getRoundWindow(roundMeta = {}, now = Date.now()) {
   const start = toMsTs(
     roundMeta?.startTimestamp ??
@@ -137,11 +244,16 @@ function formatMsToMMSS(ms) {
   const ss = Math.floor(s % 60).toString().padStart(2, "0");
   return `${mm}:${ss}`;
 }
+function normalizeHeartRefillMs(value, fallback = DEFAULT_HEART_REFILL_MS) {
+  const parsed = Number(value ?? fallback);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.max(DEFAULT_HEART_REFILL_MS, parsed);
+}
 function computeRefillState({ currentLives, maxLives, lastConsumedAt, refillMs, now = Date.now() }) {
   const current = Number(currentLives ?? 0);
   const max = Number(maxLives ?? 5);
   const last = Number(lastConsumedAt ?? 0);
-  const interval = Number(refillMs ?? 0);
+  const interval = normalizeHeartRefillMs(refillMs, 0);
 
   if (!interval || interval <= 0) return { currentLives: current, lastConsumedAt: last, recovered: 0, nextInMs: 0 };
   if (current >= max) return { currentLives: current, lastConsumedAt: last, recovered: 0, nextInMs: 0 };
@@ -156,6 +268,56 @@ function computeRefillState({ currentLives, maxLives, lastConsumedAt, refillMs, 
   return { currentLives: newCurrent, lastConsumedAt: newLast, recovered, nextInMs };
 }
 
+function buildQueuedHeartConsumption({ currentLives, maxLives, lastConsumedAt, refillMs, now = Date.now() }) {
+  const resolvedMaxLives = Math.max(1, Number(maxLives ?? DEFAULT_MAX_LIVES));
+  const normalizedState = computeRefillState({
+    currentLives,
+    maxLives: resolvedMaxLives,
+    lastConsumedAt,
+    refillMs,
+    now,
+  });
+  const availableLives = Math.max(0, Number(normalizedState.currentLives || 0));
+
+  if (availableLives <= 0) return null;
+
+  return {
+    currentLives: Math.max(0, availableLives - 1),
+    maxLives: resolvedMaxLives,
+    lastConsumedAt: availableLives >= resolvedMaxLives
+      ? now
+      : Number(normalizedState.lastConsumedAt || now),
+  };
+}
+
+function computeAttemptRefillState({ attemptsUsed, lastAttemptTimestamp, refillMs, now = Date.now() }) {
+  const usedRaw = Math.max(0, Number(attemptsUsed || 0));
+  const lastTs = Number(lastAttemptTimestamp || 0);
+  const interval = Number(refillMs || 0);
+
+  if (!interval || interval <= 0 || !lastTs) {
+    return {
+      effectiveAttemptsUsed: usedRaw,
+      anchorTs: lastTs,
+      recovered: 0,
+      nextInMs: 0,
+    };
+  }
+
+  const elapsed = Math.max(0, now - lastTs);
+  const recovered = Math.floor(elapsed / interval);
+  const effectiveAttemptsUsed = Math.max(0, usedRaw - recovered);
+  const anchorTs = recovered > 0 ? lastTs + recovered * interval : lastTs;
+  const nextInMs = effectiveAttemptsUsed <= 0 ? 0 : Math.max(0, interval - ((now - anchorTs) % interval));
+
+  return {
+    effectiveAttemptsUsed,
+    anchorTs,
+    recovered,
+    nextInMs,
+  };
+}
+
 export default function ExamCenter() {
   const router = useRouter();
   const params = useLocalSearchParams();
@@ -168,6 +330,34 @@ export default function ExamCenter() {
   const examId = params.examId;
   const questionBankIdParam = params.questionBankId;
   const mode = params.mode || "start";
+  const isReviewOnlyMode = mode === "review" || mode === "result";
+  const practiceOfflineRequested = String(params.practiceOffline || "") === "1";
+  const warmRouteData = useMemo(
+    () => peekExamCenterWarmRoute({ roundId, examId }),
+    [roundId, examId]
+  );
+  const hasWarmRulesShell = mode === "start" && !!warmRouteData?.examMeta;
+
+  const syncPackageSubjectsReturnCache = useCallback(async (patch = {}) => {
+    const returnTo = String(params?.returnTo || "");
+    const returnPackageId = String(params?.returnPackageId || "").trim();
+    if (returnTo !== "packageSubjects" || !returnPackageId || !patch || typeof patch !== "object") {
+      return;
+    }
+
+    const cacheParts = [
+      returnPackageId,
+      normalizePackageGradeCacheToken(params?.returnStudentGrade) || "all",
+    ];
+
+    const snapshot = await readScreenCache("package-subjects", cacheParts);
+    if (!snapshot || typeof snapshot !== "object") return;
+
+    await writeScreenCache("package-subjects", cacheParts, {
+      ...snapshot,
+      ...patch,
+    });
+  }, [params?.returnPackageId, params?.returnStudentGrade, params?.returnTo]);
 
   const handleBackNavigation = useCallback(() => {
     const returnTo = String(params?.returnTo || "");
@@ -194,20 +384,20 @@ export default function ExamCenter() {
     router.back();
   }, [params, router]);
 
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(!hasWarmRulesShell);
   const [stage, setStage] = useState(mode === "review" ? "review" : "rules");
-  const [roundMeta, setRoundMeta] = useState(null);
-  const [examMeta, setExamMeta] = useState(null);
-  const [isCompetitive, setIsCompetitive] = useState(false);
+  const [roundMeta, setRoundMeta] = useState(() => warmRouteData?.roundMeta || null);
+  const [examMeta, setExamMeta] = useState(() => warmRouteData?.examMeta || null);
+  const [isCompetitive, setIsCompetitive] = useState(() => !!warmRouteData?.isCompetitive);
 
-  const [questions, setQuestions] = useState([]);
+  const [questions, setQuestions] = useState(() => (Array.isArray(warmRouteData?.questions) ? warmRouteData.questions : []));
   const [questionLoadError, setQuestionLoadError] = useState(null);
 
   const [studentId, setStudentId] = useState(null);
   const [attemptNo, setAttemptNo] = useState(1);
   const [attemptsUsed, setAttemptsUsed] = useState(0);
   const [effectiveAttemptsUsed, setEffectiveAttemptsUsed] = useState(0);
-  const [nextAttemptInMs, setNextAttemptInMs] = useState(0);
+  const [attemptProgressAnchorTs, setAttemptProgressAnchorTs] = useState(0);
   const [attemptId, setAttemptId] = useState(null);
 
   const [inProgressAttempt, setInProgressAttempt] = useState(null);
@@ -218,9 +408,13 @@ export default function ExamCenter() {
   const [answers, setAnswers] = useState({});
   const [currentIndex, setCurrentIndex] = useState(0);
   const [selectedFeedback, setSelectedFeedback] = useState(null);
+  const [showAnswerRequiredWarning, setShowAnswerRequiredWarning] = useState(false);
 
   const [timeLeft, setTimeLeft] = useState(0);
   const timerRef = useRef(null);
+  const heartSyncTimeoutRef = useRef(null);
+  const attemptSyncTimeoutRef = useRef(null);
+  const bestScorePercentRef = useRef(0);
   const [result, setResult] = useState(null);
 
   const [globalLives, setGlobalLives] = useState(null);
@@ -243,46 +437,43 @@ export default function ExamCenter() {
   const [reviewIndex, setReviewIndex] = useState(0);
 
   const wrongCountRef = useRef(0);
+  const livesMutationVersionRef = useRef(0);
 
   // [v48] add near other useState/useRef declarations inside ExamCenter component:
 const resultPop = useRef(new Animated.Value(0)).current;
 const resultPulse = useRef(new Animated.Value(1)).current;
 const resultConfetti = useRef(new Animated.Value(0)).current;
+const practicePassPercent = useMemo(() => getResolvedPracticePassPercent(examMeta), [examMeta]);
 
 const isPass = useMemo(() => {
-  const pass = Number(examMeta?.passPercent ?? examMeta?.passingPercent ?? examMeta?.passScore ?? 0);
-  if (!pass) return Number(result?.percent || 0) >= 50;
-  return Number(result?.percent || 0) >= pass;
-}, [examMeta, result]);
+  return Number(result?.percent || 0) >= practicePassPercent;
+}, [practicePassPercent, result]);
 
 const gradeLabel = useMemo(() => {
   const p = Number(result?.percent || 0);
+  if (p < practicePassPercent) return "Fail";
   if (p >= 90) return "Excellent";
   if (p >= 75) return "Great job";
-  if (p >= 50) return "Good effort";
-  return "Keep practicing";
-}, [result]);
+  return "Pass";
+}, [practicePassPercent, result]);
 
-  const [appExamConfig, setAppExamConfig] = useState({
-    attempts: {
-      defaultRefillIntervalMs: 1200000,
-      maxCarryRefills: 999,
-      practiceRefillEnabled: true,
-    },
-    lives: {
-      defaultMaxLives: DEFAULT_MAX_LIVES,
-      defaultRefillIntervalMs: DEFAULT_HEART_REFILL_MS,
-      fallbackWrongsPerLife: WRONGS_PER_LIFE_FALLBACK,
-    },
-    ui: {},
-  });
+  const [appExamConfig, setAppExamConfig] = useState(() => mergeAppExamConfig(warmRouteData?.appExamConfig || null));
+  const [offlinePracticeBundle, setOfflinePracticeBundle] = useState(null);
+  const isOfflinePracticeMode = practiceOfflineRequested && !!offlinePracticeBundle;
 
   const loadQuestionBank = useCallback(async (qbId) => {
     setQuestionLoadError(null);
     if (!qbId) {
       setQuestionLoadError("Question bank id missing.");
       setQuestions([]);
-      return;
+      return [];
+    }
+
+    const cacheKey = getQuestionBankCacheKey(qbId);
+    const cached = await readJsonCache(cacheKey);
+    if (Array.isArray(cached?.questions) && cached.questions.length) {
+      setQuestions(cached.questions);
+      return cached.questions;
     }
 
     const direct = [
@@ -296,8 +487,10 @@ const gradeLabel = useMemo(() => {
 
     let qb = await getValue(direct);
     if (qb?.questions) {
-      setQuestions(Object.entries(qb.questions).map(([id, q]) => ({ id, ...q })));
-      return;
+      const normalizedQuestions = Object.entries(qb.questions).map(([id, q]) => ({ id, ...q }));
+      setQuestions(normalizedQuestions);
+      await writeJsonCache(cacheKey, { savedAt: Date.now(), qbId, questions: normalizedQuestions });
+      return normalizedQuestions;
     }
 
     const parents = [
@@ -318,11 +511,16 @@ const gradeLabel = useMemo(() => {
       if (node.questionBanks?.questionBanks?.[qbId]?.questions) { qb = node.questionBanks.questionBanks[qbId]; break; }
     }
 
-    if (qb?.questions) setQuestions(Object.entries(qb.questions).map(([id, q]) => ({ id, ...q })));
-    else {
-      setQuestions([]);
-      setQuestionLoadError(`Question bank not found for ${qbId}`);
+    if (qb?.questions) {
+      const normalizedQuestions = Object.entries(qb.questions).map(([id, q]) => ({ id, ...q }));
+      setQuestions(normalizedQuestions);
+      await writeJsonCache(cacheKey, { savedAt: Date.now(), qbId, questions: normalizedQuestions });
+      return normalizedQuestions;
     }
+
+    setQuestions([]);
+    setQuestionLoadError(`Question bank not found for ${qbId}`);
+    return [];
   }, []);
 
   const findRoundMetaById = useCallback(async (rid, targetExamId = null, targetQuestionBankId = null) => {
@@ -363,67 +561,178 @@ const gradeLabel = useMemo(() => {
     const scored = getBadgeAndPoints(examMeta, computed.percent);
 
     const now = Date.now();
-    const resultVisible = examMeta?.scoringEnabled ? now >= toMsTs(roundMeta?.resultReleaseTimestamp) : true;
+    const resultVisible = isCompetitive
+      ? false
+      : examMeta?.scoringEnabled
+      ? now >= toMsTs(roundMeta?.resultReleaseTimestamp)
+      : true;
     const awardedPointsValue = isCompetitive ? "pending" : scored.points;
-
+    const usedBefore = Math.max(Number(effectiveAttemptsUsed || 0), Number(attemptsUsed || 0));
+    const startedAttemptNo = Number(inProgressAttempt?.attemptNo || 0);
+    const usedAfter = Math.max(usedBefore, startedAttemptNo, attemptId ? 1 : 0);
+    const updatedBestScorePercent = Math.max(Number(bestScorePercentRef.current || 0), computed.percent);
+    const resolvedPassPercent = getResolvedPracticePassPercent(examMeta);
+    const didFailExam = computed.percent < resolvedPassPercent;
+    const localReviewAttempt = {
+      id: attemptId,
+      roundId,
+      examId,
+      attemptStatus: "completed",
+      endTime: Date.now(),
+      scorePercent: computed.percent,
+      correctCount: computed.correct,
+      totalQuestions: computed.total,
+      badge: scored.badge,
+      pointsAwarded: awardedPointsValue,
+      resultVisible,
+      questionOrder: finalOrder,
+      answers,
+    };
     if (studentId && examId && attemptId) {
-      const usedBefore = Number(effectiveAttemptsUsed || attemptsUsed || 0);
-      const usedAfter = usedBefore + 1;
-      const patch = {};
-      patch[`Platform1/attempts/company/${studentId}/${examId}/${attemptId}/endTime`] = now;
-      patch[`Platform1/attempts/company/${studentId}/${examId}/${attemptId}/attemptStatus`] = "completed";
-      patch[`Platform1/attempts/company/${studentId}/${examId}/${attemptId}/answers`] = answers;
-      patch[`Platform1/attempts/company/${studentId}/${examId}/${attemptId}/scorePercent`] = computed.percent;
-      patch[`Platform1/attempts/company/${studentId}/${examId}/${attemptId}/correctCount`] = computed.correct;
-      patch[`Platform1/attempts/company/${studentId}/${examId}/${attemptId}/pointsAwarded`] = awardedPointsValue;
-      patch[`Platform1/attempts/company/${studentId}/${examId}/${attemptId}/badge`] = scored.badge;
-      patch[`Platform1/attempts/company/${studentId}/${examId}/${attemptId}/resultVisible`] = resultVisible;
-
-      patch[`Platform1/studentProgress/${studentId}/company/${roundId}/${examId}/status`] = "completed";
-      patch[`Platform1/studentProgress/${studentId}/company/${roundId}/${examId}/attemptsUsed`] = usedAfter;
-      patch[`Platform1/studentProgress/${studentId}/company/${roundId}/${examId}/bestScorePercent`] = computed.percent;
-      patch[`Platform1/studentProgress/${studentId}/company/${roundId}/${examId}/lastAttemptId`] = attemptId;
-      patch[`Platform1/studentProgress/${studentId}/company/${roundId}/${examId}/lastSubmittedAt`] = now;
-      patch[`Platform1/studentProgress/${studentId}/company/${roundId}/${examId}/lastAttemptTimestamp`] = now;
-      await safeUpdate(patch).catch(() => {});
-
+      if (isOfflinePracticeMode) {
+        await updatePracticeExamProgress(studentId, examId, (current) => {
+          const attempts = { ...(current.attempts || {}) };
+          attempts[String(attemptId)] = {
+            ...(attempts[String(attemptId)] || {}),
+            ...localReviewAttempt,
+          };
+          return {
+            ...current,
+            status: "completed",
+            attemptsUsed: usedAfter,
+            lastScorePercent: updatedBestScorePercent,
+            bestScorePercent: Math.max(Number(current?.bestScorePercent || 0), updatedBestScorePercent),
+            lastAttemptId: attemptId,
+            lastSubmittedAt: now,
+            lastAttemptTimestamp: now,
+            attempts,
+          };
+        }).catch(() => {});
+      } else {
+        const patch = {};
+        patch[`Platform1/attempts/company/${studentId}/${examId}/${attemptId}/endTime`] = now;
+        patch[`Platform1/attempts/company/${studentId}/${examId}/${attemptId}/attemptStatus`] = "completed";
+        patch[`Platform1/attempts/company/${studentId}/${examId}/${attemptId}/answers`] = answers;
+        patch[`Platform1/attempts/company/${studentId}/${examId}/${attemptId}/scorePercent`] = computed.percent;
+        patch[`Platform1/attempts/company/${studentId}/${examId}/${attemptId}/correctCount`] = computed.correct;
+        patch[`Platform1/attempts/company/${studentId}/${examId}/${attemptId}/pointsAwarded`] = awardedPointsValue;
+        patch[`Platform1/attempts/company/${studentId}/${examId}/${attemptId}/badge`] = scored.badge;
+        patch[`Platform1/attempts/company/${studentId}/${examId}/${attemptId}/resultVisible`] = resultVisible;
+        patch[`Platform1/studentProgress/${studentId}/company/${roundId}/${examId}/status`] = "completed";
+        patch[`Platform1/studentProgress/${studentId}/company/${roundId}/${examId}/attemptsUsed`] = usedAfter;
+        patch[`Platform1/studentProgress/${studentId}/company/${roundId}/${examId}/lastScorePercent`] = updatedBestScorePercent;
+        patch[`Platform1/studentProgress/${studentId}/company/${roundId}/${examId}/bestScorePercent`] = updatedBestScorePercent;
+        patch[`Platform1/studentProgress/${studentId}/company/${roundId}/${examId}/lastAttemptId`] = attemptId;
+        patch[`Platform1/studentProgress/${studentId}/company/${roundId}/${examId}/lastSubmittedAt`] = now;
+        patch[`Platform1/studentProgress/${studentId}/company/${roundId}/${examId}/lastAttemptTimestamp`] = now;
+        await safeUpdate(patch).catch(() => {});
+      }
+      bestScorePercentRef.current = updatedBestScorePercent;
       setAttemptsUsed(usedAfter);
       setEffectiveAttemptsUsed(usedAfter);
       setAttemptNo(usedAfter + 1);
+      setAttemptProgressAnchorTs(now);
     }
 
-    try {
-      const pRaw = examMeta?.passingPercent ?? examMeta?.passPercent ?? examMeta?.passScore ?? null;
-      const passPercent = pRaw != null ? Number(pRaw) : null;
-      const wrongsPerLife = Number(appExamConfig?.lives?.fallbackWrongsPerLife || WRONGS_PER_LIFE_FALLBACK);
+    let lifePenaltyApplied = false;
 
+    try {
       if (!isCompetitive && studentId) {
-        const livesPath = `Platform1/studentLives/${studentId}`;
-        if (passPercent != null && !Number.isNaN(passPercent)) {
-          if (computed.percent < passPercent) {
-            await runTransactionSafe(`${livesPath}/currentLives`, (curr) => Math.max(0, Number(curr ?? 0) - 1));
-            await safeUpdate({ [`${livesPath}/lastConsumedAt`]: Date.now() }).catch(() => {});
+        if (isOfflinePracticeMode) {
+          const localLives = await ensurePracticeLives(studentId, appExamConfig?.lives || {});
+          if (didFailExam) {
+            livesMutationVersionRef.current += 1;
+            const now = Date.now();
+            const consumedLives = buildQueuedHeartConsumption({
+              currentLives: localLives.currentLives,
+              maxLives: localLives.maxLives || globalMaxLives || DEFAULT_MAX_LIVES,
+              lastConsumedAt: localLives.lastConsumedAt,
+              refillMs: localLives.refillIntervalMs || globalRefillMs || DEFAULT_HEART_REFILL_MS,
+              now,
+            });
+            if (!consumedLives) {
+              throw new Error("No lives available to deduct");
+            }
+            const nextLives = {
+              ...localLives,
+              currentLives: consumedLives.currentLives,
+              lastConsumedAt: consumedLives.lastConsumedAt,
+            };
+            const savedLives = await writePracticeLives(studentId, nextLives, appExamConfig?.lives || {});
+            const nextGlobalLives = Number(savedLives.currentLives || 0);
+            const nextGlobalLastConsumedAt = Number(savedLives.lastConsumedAt || 0) || null;
+            setGlobalLives(nextGlobalLives);
+            setGlobalLastConsumedAt(nextGlobalLastConsumedAt);
+            void syncPackageSubjectsReturnCache({
+              globalLives: nextGlobalLives,
+              globalMaxLives: Number(savedLives.maxLives || globalMaxLives || DEFAULT_MAX_LIVES),
+              globalRefillMs: Number(savedLives.refillIntervalMs || globalRefillMs || DEFAULT_HEART_REFILL_MS),
+              globalLastConsumedAt: nextGlobalLastConsumedAt,
+            });
+            lifePenaltyApplied = true;
           }
         } else {
-          const livesToDeduct = Math.floor(Number(wrongCountRef.current || 0) / Math.max(1, wrongsPerLife));
-          if (livesToDeduct > 0) {
-            await runTransactionSafe(`${livesPath}/currentLives`, (curr) => Math.max(0, Number(curr ?? 0) - livesToDeduct));
-            await safeUpdate({ [`${livesPath}/lastConsumedAt`]: Date.now() }).catch(() => {});
-          }
-        }
+          const livesPath = `Platform1/studentLives/${studentId}`;
+          if (didFailExam) {
+            livesMutationVersionRef.current += 1;
+            const consumedAt = Date.now();
+            const transactionResult = await runTransactionSafe(livesPath, (currentNode) => {
+              const raw = currentNode && typeof currentNode === "object" ? currentNode : {};
+              const resolvedMaxLives = Number(raw.maxLives ?? globalMaxLives ?? DEFAULT_MAX_LIVES);
+              const resolvedRefillMs = normalizeHeartRefillMs(raw.refillIntervalMs ?? raw.refillInterval ?? globalRefillMs ?? DEFAULT_HEART_REFILL_MS);
+              const consumedLives = buildQueuedHeartConsumption({
+                currentLives: raw.currentLives ?? raw.current ?? globalLives ?? resolvedMaxLives,
+                maxLives: resolvedMaxLives,
+                lastConsumedAt: toMsTs(raw.lastConsumedAt ?? raw.lastConsumed ?? globalLastConsumedAt ?? 0),
+                refillMs: resolvedRefillMs,
+                now: consumedAt,
+              });
 
-        const updated = await get(ref(database, livesPath)).catch(() => null);
-        if (updated?.exists()) {
-          const val = updated.val();
-          setGlobalLives(Number(val.currentLives ?? val.current ?? 0));
-          setGlobalLastConsumedAt(toMsTs(val.lastConsumedAt ?? val.lastConsumed ?? 0));
+              if (!consumedLives) return;
+
+              return {
+                ...raw,
+                currentLives: consumedLives.currentLives,
+                maxLives: resolvedMaxLives,
+                refillIntervalMs: resolvedRefillMs,
+                lastConsumedAt: consumedLives.lastConsumedAt,
+              };
+            });
+            lifePenaltyApplied = !!transactionResult?.committed;
+          }
+
+          const updated = await get(ref(database, livesPath)).catch(() => null);
+          if (updated?.exists()) {
+            const val = updated.val();
+            const nextGlobalLives = Number(val.currentLives ?? val.current ?? 0);
+            const nextGlobalLastConsumedAt = toMsTs(val.lastConsumedAt ?? val.lastConsumed ?? 0);
+            setGlobalLives(nextGlobalLives);
+            setGlobalLastConsumedAt(nextGlobalLastConsumedAt);
+            if (didFailExam) {
+              void syncPackageSubjectsReturnCache({
+                globalLives: nextGlobalLives,
+                globalMaxLives,
+                globalRefillMs,
+                globalLastConsumedAt: nextGlobalLastConsumedAt,
+              });
+            }
+          } else if (didFailExam && lifePenaltyApplied) {
+            void syncPackageSubjectsReturnCache({
+              globalLives: Math.max(0, Number(globalLives || 0) - 1),
+              globalMaxLives,
+              globalRefillMs,
+              globalLastConsumedAt: Number(globalLastConsumedAt || 0) || Date.now(),
+            });
+          }
         }
       }
     } catch (e) {
       console.warn("submitExam: life deduction failed", e);
     }
 
-    setLastCompletedAttempt({ id: attemptId, endTime: Date.now() });
+    setInProgressAttempt(null);
+    setAttemptId(null);
+    setLastCompletedAttempt(localReviewAttempt);
     setResult({
       percent: computed.percent,
       correct: computed.correct,
@@ -431,42 +740,216 @@ const gradeLabel = useMemo(() => {
       badge: scored.badge,
       points: awardedPointsValue,
       resultVisible,
+      passPercent: resolvedPassPercent,
+      lifePenaltyApplied,
     });
 
-    const shouldShowDetailedReview = !isCompetitive && feedbackMode === "end";
-    setShowPostSubmitReview(shouldShowDetailedReview);
+    if (studentId && examId && questions.length) {
+      await writeJsonCache(getReviewCacheKey(studentId, examId), {
+        savedAt: Date.now(),
+        roundMeta: roundMeta || null,
+        examMeta: examMeta || null,
+        isCompetitive,
+        feedbackMode,
+        questions,
+        reviewAttempt: localReviewAttempt,
+      });
+    }
+
+    setShowPostSubmitReview(false);
     setReviewIndex(0);
 
     wrongCountRef.current = 0;
     setStage("result");
-  }, [order, questions, answers, studentId, examId, attemptId, examMeta, roundMeta, isCompetitive, roundId, appExamConfig, feedbackMode, effectiveAttemptsUsed, attemptsUsed]);
+  }, [order, questions, answers, studentId, examId, attemptId, examMeta, roundMeta, isCompetitive, roundId, appExamConfig, feedbackMode, effectiveAttemptsUsed, attemptsUsed, isOfflinePracticeMode, inProgressAttempt, globalLives, globalLastConsumedAt, globalMaxLives, globalRefillMs, syncPackageSubjectsReturnCache]);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       setLoading(true);
+      bestScorePercentRef.current = 0;
+      const livesVersionBeforeLoad = livesMutationVersionRef.current;
 
-      const cfg = await getValue([`Platform1/appConfig/exams`, `appConfig/exams`]);
-      if (!cancelled && cfg) {
-        setAppExamConfig((prev) => ({
-          ...prev,
-          ...cfg,
-          attempts: { ...prev.attempts, ...(cfg.attempts || {}) },
-          lives: { ...prev.lives, ...(cfg.lives || {}) },
-          ui: { ...prev.ui, ...(cfg.ui || {}) },
-        }));
+      const sid = await readStoredStudentId();
+      if (!cancelled) setStudentId(sid);
+      if (practiceOfflineRequested && sid && examId) {
+        const bundle = await readPracticeExamBundle(sid, examId);
+        if (!bundle?.questions || !Array.isArray(bundle.questions) || !bundle.questions.length) {
+          if (!cancelled) {
+            setOfflinePracticeBundle(null);
+            setQuestions([]);
+            setQuestionLoadError("Download this practice exam first to use it offline.");
+            setLoading(false);
+          }
+          return;
+        }
+        const bundledConfig = mergeAppExamConfig(bundle.appExamConfig);
+        if (!cancelled) {
+          setOfflinePracticeBundle(bundle);
+          setQuestionLoadError(null);
+          setAppExamConfig((prev) => ({
+            ...prev,
+            ...bundle.appExamConfig,
+            attempts: { ...prev.attempts, ...(bundle.appExamConfig?.attempts || {}) },
+            lives: { ...prev.lives, ...(bundle.appExamConfig?.lives || {}) },
+            ui: { ...prev.ui, ...(bundle.appExamConfig?.ui || {}) },
+          }));
+          setRoundMeta(bundle.roundMeta || null);
+          setExamMeta(bundle.examMeta || null);
+          setIsCompetitive(false);
+          setFeedbackMode(bundle.feedbackMode || (bundle.examMeta?.scoringEnabled ? "end" : "instant"));
+          setQuestions(bundle.questions);
+        }
+        const localLives = await ensurePracticeLives(sid, bundledConfig.lives);
+        if (!cancelled) {
+          setGlobalMaxLives(Number(localLives.maxLives || DEFAULT_MAX_LIVES));
+          setGlobalRefillMs(normalizeHeartRefillMs(localLives.refillIntervalMs));
+          if (livesVersionBeforeLoad === livesMutationVersionRef.current) {
+            setGlobalLives(Number(localLives.currentLives || 0));
+            setGlobalLastConsumedAt(Number(localLives.lastConsumedAt || 0) || null);
+          }
+        }
+        const progressNode = await readPracticeExamProgress(sid, examId);
+        const entries = progressNode?.attempts || {};
+        const keys = Object.keys(entries || {});
+        let completedCount = 0;
+        let latestInProgress = null;
+        let latestInProgressKey = null;
+        let latestCompleted = null;
+        let latestCompletedKey = null;
+        for (const key of keys) {
+          const attempt = entries[key] || {};
+          const status = String(attempt.attemptStatus || "").toLowerCase();
+          if (status === "completed") {
+            completedCount += 1;
+            const endTime = Number(attempt.endTime || attempt.startTime || 0);
+            if (!latestCompleted || endTime > Number(latestCompleted.endTime || latestCompleted.startTime || 0)) {
+              latestCompleted = attempt;
+              latestCompletedKey = key;
+            }
+          } else if (status === "in_progress") {
+            if (!latestInProgress || Number(attempt.startTime || 0) > Number(latestInProgress.startTime || 0)) {
+              latestInProgress = attempt;
+              latestInProgressKey = key;
+            }
+          }
+        }
+        const progressAttemptsUsed = Math.max(
+          Number(progressNode?.attemptsUsed || 0),
+          completedCount,
+          keys.length
+        );
+        const progressLastAttemptTs = Number(
+          progressNode?.lastAttemptTimestamp ||
+          progressNode?.lastSubmittedAt ||
+          latestCompleted?.endTime ||
+          latestCompleted?.startTime ||
+          0
+        );
+        bestScorePercentRef.current = Math.max(
+          Number(progressNode?.bestScorePercent || 0),
+          getHighestCompletedScorePercent(entries)
+        );
+        if (!cancelled) {
+          setAttemptsUsed(progressAttemptsUsed);
+          setEffectiveAttemptsUsed(progressAttemptsUsed);
+          setAttemptNo(progressAttemptsUsed + 1);
+          setAttemptProgressAnchorTs(progressLastAttemptTs);
+        }
+        if (latestInProgress && latestInProgressKey && !cancelled) {
+          setInProgressAttempt({ id: latestInProgressKey, ...latestInProgress });
+          setAttemptId(latestInProgressKey);
+          setOrder(normalizeQuestionOrder(latestInProgress.questionOrder || {}));
+          setAnswers(latestInProgress.answers || {});
+          if (latestInProgress.remainingSeconds != null) setTimeLeft(Number(latestInProgress.remainingSeconds));
+          else if (bundle.examMeta?.timeLimit && latestInProgress.startTime) {
+            const elapsed = Math.floor((Date.now() - Number(latestInProgress.startTime || 0)) / 1000);
+            setTimeLeft(Math.max(0, Number(bundle.examMeta.timeLimit || 0) - elapsed));
+          }
+        }
+        if (latestCompleted && latestCompletedKey && !cancelled) {
+          setLastCompletedAttempt({ id: latestCompletedKey, ...latestCompleted });
+        }
+        if ((mode === "review" || mode === "result") && keys.length && !cancelled) {
+          const completedKeys = keys.filter((key) => String(entries[key]?.attemptStatus || "").toLowerCase() === "completed");
+          let latestKey = null;
+          if (completedKeys.length) {
+            completedKeys.sort((a, b) => Number(entries[b]?.endTime || entries[b]?.startTime || 0) - Number(entries[a]?.endTime || entries[a]?.startTime || 0));
+            latestKey = completedKeys[0];
+          } else {
+            keys.sort((a, b) => Number(entries[b]?.endTime || entries[b]?.startTime || 0) - Number(entries[a]?.endTime || entries[a]?.startTime || 0));
+            latestKey = keys[0];
+          }
+          if (latestKey) {
+            const rawAttempt = entries[latestKey] || {};
+            setReviewAttempt({
+              id: latestKey,
+              ...rawAttempt,
+              questionOrder: normalizeQuestionOrder(rawAttempt.questionOrder || {}),
+              answers: rawAttempt.answers || {},
+            });
+          }
+        }
+        if (!cancelled) setLoading(false);
+        return;
+      }
+      if (!cancelled) setOfflinePracticeBundle(null);
+
+      if (isReviewOnlyMode && sid && examId) {
+        const cachedBundle = await readJsonCache(getReviewCacheKey(sid, examId));
+        if (cachedBundle?.reviewAttempt && Array.isArray(cachedBundle?.questions) && cachedBundle.questions.length) {
+          if (!cancelled) {
+            setRoundMeta(cachedBundle.roundMeta || null);
+            setExamMeta(cachedBundle.examMeta || null);
+            setIsCompetitive(!!cachedBundle.isCompetitive);
+            setFeedbackMode(cachedBundle.feedbackMode || (cachedBundle.isCompetitive ? "end" : "instant"));
+            setQuestions(cachedBundle.questions);
+            setReviewAttempt({
+              ...(cachedBundle.reviewAttempt || {}),
+              questionOrder: normalizeQuestionOrder(cachedBundle.reviewAttempt?.questionOrder || {}),
+              answers: cachedBundle.reviewAttempt?.answers || {},
+            });
+            setLastCompletedAttempt(cachedBundle.reviewAttempt || null);
+            setLoading(false);
+          }
+          return;
+        }
       }
 
-      const sid =
-        (await AsyncStorage.getItem("studentNodeKey")) ||
-        (await AsyncStorage.getItem("studentId")) ||
-        (await AsyncStorage.getItem("username")) ||
-        null;
-      if (!cancelled) setStudentId(sid);
+      const cfgPromise = getValue([`Platform1/appConfig/exams`, `appConfig/exams`]);
+      const roundMetaPromise = findRoundMetaById(roundId, examId, questionBankIdParam);
+      const examPromise = getValue([
+        `Platform1/companyExams/exams/${examId}`,
+        `companyExams/exams/${examId}`,
+        `Platform1/exams/${examId}`,
+        `exams/${examId}`,
+      ]);
+      const livesPromise = sid && !isReviewOnlyMode
+        ? getValue([`Platform1/studentLives/${sid}`, `studentLives/${sid}`])
+        : Promise.resolve(null);
+      const attemptsPromise = sid && examId
+        ? getValue([`Platform1/attempts/company/${sid}/${examId}`, `attempts/company/${sid}/${examId}`])
+        : Promise.resolve({});
+      const progressPromise = sid && examId
+        ? getValue([`Platform1/studentProgress/${sid}/company/${roundId}/${examId}`], { maxAgeMs: 30 * 1000 })
+        : Promise.resolve({});
+      const eagerQuestionLoadPromise = questionBankIdParam ? loadQuestionBank(questionBankIdParam) : null;
 
-      if (sid) {
-        const livesNode = await getValue([`Platform1/studentLives/${sid}`, `studentLives/${sid}`]);
-        const defaultRefillMs = Number(cfg?.lives?.defaultRefillIntervalMs || DEFAULT_HEART_REFILL_MS);
+      const [cfg, rMeta, exam, livesNode, attemptsNodeRaw, progressNodeRaw] = await Promise.all([
+        cfgPromise,
+        roundMetaPromise,
+        examPromise,
+        livesPromise,
+        attemptsPromise,
+        progressPromise,
+      ]);
+
+      if (!cancelled && cfg) {
+        setAppExamConfig(mergeAppExamConfig(cfg));
+      }
+
+      if (sid && !isReviewOnlyMode) {
+        const defaultRefillMs = normalizeHeartRefillMs(cfg?.lives?.defaultRefillIntervalMs);
         const defaultMaxLives = Number(cfg?.lives?.defaultMaxLives || DEFAULT_MAX_LIVES);
 
         if (livesNode) {
@@ -478,7 +961,7 @@ const gradeLabel = useMemo(() => {
           const refillRaw = raw.refillIntervalMs ?? raw.refillInterval ?? null;
           if (refillRaw != null) {
             const n = Number(refillRaw);
-            if (Number.isFinite(n)) refillMs = n > 1000 ? n : n * 1000;
+            if (Number.isFinite(n)) refillMs = normalizeHeartRefillMs(n > 1000 ? n : n * 1000, defaultRefillMs);
           }
 
           const lastConsumed = toMsTs(raw.lastConsumedAt ?? raw.lastConsumed ?? 0) || 0;
@@ -491,7 +974,7 @@ const gradeLabel = useMemo(() => {
             if (recovered > 0) {
               computedCurrent = Math.min(max, computedCurrent + recovered);
               computedLastConsumed = lastConsumed + recovered * refillMs;
-              await safeUpdate({
+              void safeUpdate({
                 [`Platform1/studentLives/${sid}/currentLives`]: computedCurrent,
                 [`Platform1/studentLives/${sid}/lastConsumedAt`]: computedLastConsumed,
               }).catch(() => {});
@@ -499,10 +982,12 @@ const gradeLabel = useMemo(() => {
           }
 
           if (!cancelled) {
-            setGlobalLives(computedCurrent);
             setGlobalMaxLives(max || defaultMaxLives);
             setGlobalRefillMs(refillMs);
-            setGlobalLastConsumedAt(computedLastConsumed || null);
+            if (livesVersionBeforeLoad === livesMutationVersionRef.current) {
+              setGlobalLives(computedCurrent);
+              setGlobalLastConsumedAt(computedLastConsumed || null);
+            }
           }
         } else {
           const starterLives = {
@@ -512,37 +997,34 @@ const gradeLabel = useMemo(() => {
             lastConsumedAt: 0,
           };
 
-          await safeUpdate({
+          void safeUpdate({
             [`Platform1/studentLives/${sid}`]: starterLives,
           }).catch(() => {});
 
           if (!cancelled) {
-            setGlobalLives(defaultMaxLives);
             setGlobalMaxLives(defaultMaxLives);
             setGlobalRefillMs(defaultRefillMs);
-            setGlobalLastConsumedAt(null);
+            if (livesVersionBeforeLoad === livesMutationVersionRef.current) {
+              setGlobalLives(defaultMaxLives);
+              setGlobalLastConsumedAt(null);
+            }
           }
         }
       }
 
-      const rMeta = await findRoundMetaById(roundId, examId, questionBankIdParam);
       if (!cancelled) setRoundMeta(rMeta || null);
 
-      const exam = await getValue([
-        `Platform1/companyExams/exams/${examId}`,
-        `companyExams/exams/${examId}`,
-        `Platform1/exams/${examId}`,
-        `exams/${examId}`,
-      ]);
       if (!cancelled) setExamMeta(exam || null);
 
       let pkgMeta = null;
       if (rMeta?.packageId) {
         pkgMeta = await getValue([`Platform1/companyExams/packages/${rMeta.packageId}`, `companyExams/packages/${rMeta.packageId}`]);
       }
-      if (!cancelled) setIsCompetitive(String(pkgMeta?.type || "").toLowerCase() === "competitive");
+      const competitive = String(pkgMeta?.type || "").toLowerCase() === "competitive";
+      if (!cancelled) setIsCompetitive(competitive);
 
-      if (!cancelled) setFeedbackMode(exam?.scoringEnabled ? "end" : "instant");
+      const resolvedFeedbackMode = competitive ? "end" : exam?.scoringEnabled ? "end" : "instant";
+      if (!cancelled) setFeedbackMode(resolvedFeedbackMode);
 
       let qbId = questionBankIdParam || exam?.questionBankId || null;
       if (!qbId && examId) {
@@ -550,10 +1032,12 @@ const gradeLabel = useMemo(() => {
         if (examMap?.[examId]?.questionBankId) qbId = examMap[examId].questionBankId;
       }
 
-      await loadQuestionBank(qbId);
+      const loadedQuestions = eagerQuestionLoadPromise
+        ? await eagerQuestionLoadPromise
+        : await loadQuestionBank(qbId);
 
       if (sid && examId) {
-        const attemptsNode = (await getValue([`Platform1/attempts/company/${sid}/${examId}`, `attempts/company/${sid}/${examId}`])) || {};
+        const attemptsNode = attemptsNodeRaw || {};
         let entries = attemptsNode || {};
         if (attemptsNode && (attemptsNode.attemptStatus || attemptsNode.startTime || attemptsNode.scorePercent != null)) {
           entries = { legacy_single_attempt: attemptsNode };
@@ -584,10 +1068,29 @@ const gradeLabel = useMemo(() => {
           }
         }
 
+        const progressNode = progressNodeRaw || {};
+        const progressAttemptsUsed = Math.max(
+          Number(progressNode?.attemptsUsed || 0),
+          completedCount,
+          keys.length
+        );
+        const progressLastAttemptTs = Number(
+          progressNode?.lastAttemptTimestamp ||
+          progressNode?.lastSubmittedAt ||
+          latestCompleted?.endTime ||
+          latestCompleted?.startTime ||
+          0
+        );
+        bestScorePercentRef.current = Math.max(
+          Number(progressNode?.bestScorePercent || 0),
+          getHighestCompletedScorePercent(entries)
+        );
+
         if (!cancelled) {
-          setAttemptsUsed(completedCount);
-          setEffectiveAttemptsUsed(completedCount);
-          setAttemptNo(completedCount + 1);
+          setAttemptsUsed(progressAttemptsUsed);
+          setEffectiveAttemptsUsed(progressAttemptsUsed);
+          setAttemptNo(progressAttemptsUsed + 1);
+          setAttemptProgressAnchorTs(progressLastAttemptTs);
         }
 
         if (latestInProgress && latestInProgressKey && !cancelled) {
@@ -616,11 +1119,22 @@ const gradeLabel = useMemo(() => {
           }
           if (latestKey) {
             const raw = entries[latestKey] || {};
-            setReviewAttempt({
+            const normalizedReviewAttempt = {
               id: latestKey,
               ...raw,
               questionOrder: normalizeQuestionOrder(raw.questionOrder || {}),
               answers: raw.answers || {},
+            };
+            setReviewAttempt(normalizedReviewAttempt);
+
+            void writeJsonCache(getReviewCacheKey(sid, examId), {
+              savedAt: Date.now(),
+              roundMeta: rMeta || null,
+              examMeta: exam || null,
+              isCompetitive: competitive,
+              feedbackMode: resolvedFeedbackMode,
+              questions: Array.isArray(loadedQuestions) ? loadedQuestions : [],
+              reviewAttempt: normalizedReviewAttempt,
             });
           }
         }
@@ -630,11 +1144,33 @@ const gradeLabel = useMemo(() => {
     })();
 
     return () => clearInterval(timerRef.current);
-  }, [roundId, examId, questionBankIdParam, mode, findRoundMetaById, loadQuestionBank]);
+  }, [roundId, examId, questionBankIdParam, mode, isReviewOnlyMode, findRoundMetaById, loadQuestionBank, practiceOfflineRequested]);
 
-// [v49] add this effect below your other effects:
-useEffect(() => {
-  if (stage !== "result") return;
+  useEffect(() => {
+    if ((mode !== "review" && mode !== "result") || !reviewAttempt || !questions.length) return;
+
+    const hydratedOrder = normalizeQuestionOrder(reviewAttempt.questionOrder || {});
+    const hydratedAnswers = reviewAttempt.answers || {};
+    const resolvedOrder = hydratedOrder.length ? hydratedOrder : questions.map((item) => item.id);
+    const totalFromAttempt = Number(reviewAttempt.totalQuestions ?? reviewAttempt.total ?? resolvedOrder.length ?? 0);
+
+    setOrder(resolvedOrder);
+    setAnswers(hydratedAnswers);
+    setResult({
+      percent: Number(reviewAttempt.scorePercent || 0),
+      correct: Number(reviewAttempt.correctCount || 0),
+      total: totalFromAttempt,
+      badge: reviewAttempt.badge || null,
+      points: reviewAttempt.pointsAwarded,
+      resultVisible: reviewAttempt.resultVisible !== false,
+    });
+    setReviewIndex(0);
+    setShowPostSubmitReview(true);
+    setStage("result");
+  }, [mode, reviewAttempt, questions]);
+
+  useEffect(() => {
+    if (stage !== "result") return;
 
   resultPop.setValue(0);
   resultConfetti.setValue(0);
@@ -680,15 +1216,41 @@ useEffect(() => {
   }, [showHeartInfoModal, heartModalAnim]);
 
   useEffect(() => {
-    let t;
-    let syncing = false;
+    if (globalLives == null) {
+      setNextHeartInMs(0);
+      return undefined;
+    }
 
-    async function tickAndSync() {
-      if (globalLives == null) {
-        setNextHeartInMs(0);
-        return;
-      }
+    const refreshHeartCountdown = () => {
+      const state = computeRefillState({
+        currentLives: globalLives,
+        maxLives: globalMaxLives,
+        lastConsumedAt: globalLastConsumedAt,
+        refillMs: globalRefillMs,
+      });
+      setNextHeartInMs(state.nextInMs);
+    };
 
+    refreshHeartCountdown();
+
+    if (Number(globalLives || 0) >= Number(globalMaxLives || 0) || !Number(globalRefillMs || 0)) {
+      return undefined;
+    }
+
+    const intervalId = setInterval(refreshHeartCountdown, 1000);
+    return () => clearInterval(intervalId);
+  }, [globalLives, globalMaxLives, globalLastConsumedAt, globalRefillMs]);
+
+  useEffect(() => {
+    clearTimeout(heartSyncTimeoutRef.current);
+
+    if (globalLives == null) {
+      return undefined;
+    }
+
+    let cancelled = false;
+
+    const syncRecoveredHearts = async () => {
       const state = computeRefillState({
         currentLives: globalLives,
         maxLives: globalMaxLives,
@@ -696,94 +1258,183 @@ useEffect(() => {
         refillMs: globalRefillMs,
       });
 
-      setNextHeartInMs(state.nextInMs);
+      if (state.recovered <= 0 || !studentId) return;
 
-      if (state.recovered > 0 && studentId && !syncing) {
-        syncing = true;
-        try {
+      try {
+        if (isOfflinePracticeMode) {
+          await writePracticeLives(studentId, {
+            currentLives: state.currentLives,
+            maxLives: globalMaxLives,
+            refillIntervalMs: globalRefillMs,
+            lastConsumedAt: state.lastConsumedAt,
+          }, {
+            defaultMaxLives: globalMaxLives,
+            defaultRefillIntervalMs: globalRefillMs,
+          });
+        } else {
           await safeUpdate({
             [`Platform1/studentLives/${studentId}/currentLives`]: state.currentLives,
             [`Platform1/studentLives/${studentId}/lastConsumedAt`]: state.lastConsumedAt,
           });
+        }
+
+        if (!cancelled) {
           setGlobalLives(state.currentLives);
           setGlobalLastConsumedAt(state.lastConsumedAt);
-        } catch (e) {
-          console.warn("heart refill sync failed", e);
-        } finally {
-          syncing = false;
         }
+      } catch (e) {
+        console.warn("heart refill sync failed", e);
       }
+    };
+
+    const state = computeRefillState({
+      currentLives: globalLives,
+      maxLives: globalMaxLives,
+      lastConsumedAt: globalLastConsumedAt,
+      refillMs: globalRefillMs,
+    });
+
+    if (state.recovered > 0) {
+      syncRecoveredHearts().catch(() => {});
+    } else if (state.nextInMs > 0 && Number(globalLives || 0) < Number(globalMaxLives || 0)) {
+      heartSyncTimeoutRef.current = setTimeout(() => {
+        syncRecoveredHearts().catch(() => {});
+      }, state.nextInMs + 50);
     }
 
-    tickAndSync();
-    t = setInterval(tickAndSync, 1000);
-    return () => clearInterval(t);
-  }, [studentId, globalLives, globalMaxLives, globalLastConsumedAt, globalRefillMs]);
+    return () => {
+      cancelled = true;
+      clearTimeout(heartSyncTimeoutRef.current);
+    };
+  }, [studentId, globalLives, globalMaxLives, globalLastConsumedAt, globalRefillMs, isOfflinePracticeMode]);
 
   useEffect(() => {
-    let timer;
-    async function tickAttemptRefill() {
-      if (!studentId || !roundId || !examId || !examMeta) return;
-
-      if (isCompetitive) {
-        setEffectiveAttemptsUsed(Number(attemptsUsed || 0));
-        setNextAttemptInMs(0);
-        return;
-      }
-
-      const refillEnabled =
-        (examMeta?.attemptRefillEnabled !== false) &&
-        (appExamConfig?.attempts?.practiceRefillEnabled !== false);
-
-      const refillMs = Number(
-        examMeta?.attemptRefillIntervalMs ??
-        appExamConfig?.attempts?.defaultRefillIntervalMs ??
-        0
-      );
-
-      const progress = await getValue([`Platform1/studentProgress/${studentId}/company/${roundId}/${examId}`]) || {};
-      const usedRaw = Number(progress?.attemptsUsed || 0);
-      const lastTs = Number(progress?.lastAttemptTimestamp || progress?.lastSubmittedAt || 0);
-
-      if (!refillEnabled || !refillMs || !lastTs) {
-        setEffectiveAttemptsUsed(usedRaw);
-        setNextAttemptInMs(0);
-        return;
-      }
-
-      const elapsed = Math.max(0, Date.now() - lastTs);
-      const recovered = Math.floor(elapsed / refillMs);
-      const usedNew = Math.max(0, usedRaw - recovered);
-
-      const anchor = lastTs + recovered * refillMs;
-      const nextMs = usedNew <= 0 ? 0 : Math.max(0, refillMs - ((Date.now() - anchor) % refillMs));
-
-      setEffectiveAttemptsUsed(usedNew);
-      setNextAttemptInMs(nextMs);
-
-      if (usedNew !== usedRaw) {
-        await safeUpdate({
-          [`Platform1/studentProgress/${studentId}/company/${roundId}/${examId}/attemptsUsed`]: usedNew,
-          [`Platform1/studentProgress/${studentId}/company/${roundId}/${examId}/lastAttemptTimestamp`]: anchor,
-        }).catch(() => {});
-        setAttemptsUsed(usedNew);
-        setAttemptNo(usedNew + 1);
-      }
+    if (!studentId || !roundId || !examId || !examMeta) {
+      setEffectiveAttemptsUsed(Number(attemptsUsed || 0));
+      return undefined;
     }
 
-    tickAttemptRefill();
-    timer = setInterval(tickAttemptRefill, 1000);
-    return () => clearInterval(timer);
-  }, [studentId, roundId, examId, examMeta, appExamConfig?.attempts, isCompetitive, attemptsUsed]);
+    const refillEnabled =
+      examMeta?.attemptRefillEnabled !== false &&
+      appExamConfig?.attempts?.practiceRefillEnabled !== false;
+
+    const refillMs = Number(
+      examMeta?.attemptRefillIntervalMs ??
+      appExamConfig?.attempts?.defaultRefillIntervalMs ??
+      0
+    );
+
+    const refreshAttemptCountdown = () => {
+      if (isCompetitive || !refillEnabled || !refillMs || !attemptProgressAnchorTs) {
+        setEffectiveAttemptsUsed(Number(attemptsUsed || 0));
+        return;
+      }
+
+      const state = computeAttemptRefillState({
+        attemptsUsed,
+        lastAttemptTimestamp: attemptProgressAnchorTs,
+        refillMs,
+      });
+
+      setEffectiveAttemptsUsed(state.effectiveAttemptsUsed);
+    };
+
+    refreshAttemptCountdown();
+
+    if (isCompetitive || !refillEnabled || !refillMs || !attemptProgressAnchorTs || Number(attemptsUsed || 0) <= 0) {
+      return undefined;
+    }
+
+    const intervalId = setInterval(refreshAttemptCountdown, 1000);
+    return () => clearInterval(intervalId);
+  }, [studentId, roundId, examId, examMeta, appExamConfig?.attempts, isCompetitive, attemptsUsed, attemptProgressAnchorTs]);
+
+  useEffect(() => {
+    clearTimeout(attemptSyncTimeoutRef.current);
+
+    if (!studentId || !roundId || !examId || !examMeta || isCompetitive) {
+      return undefined;
+    }
+
+    const refillEnabled =
+      examMeta?.attemptRefillEnabled !== false &&
+      appExamConfig?.attempts?.practiceRefillEnabled !== false;
+
+    const refillMs = Number(
+      examMeta?.attemptRefillIntervalMs ??
+      appExamConfig?.attempts?.defaultRefillIntervalMs ??
+      0
+    );
+
+    const usedRaw = Number(attemptsUsed || 0);
+    const lastTs = Number(attemptProgressAnchorTs || 0);
+
+    if (!refillEnabled || !refillMs || !lastTs || usedRaw <= 0) {
+      return undefined;
+    }
+
+    let cancelled = false;
+
+    const syncRecoveredAttempts = async () => {
+      const state = computeAttemptRefillState({
+        attemptsUsed: usedRaw,
+        lastAttemptTimestamp: lastTs,
+        refillMs,
+      });
+
+      if (state.effectiveAttemptsUsed === usedRaw) return;
+
+      if (isOfflinePracticeMode) {
+        await updatePracticeExamProgress(studentId, examId, (current) => ({
+          ...current,
+          attemptsUsed: state.effectiveAttemptsUsed,
+          lastAttemptTimestamp: state.anchorTs,
+        })).catch(() => {});
+      } else {
+        await safeUpdate({
+          [`Platform1/studentProgress/${studentId}/company/${roundId}/${examId}/attemptsUsed`]: state.effectiveAttemptsUsed,
+          [`Platform1/studentProgress/${studentId}/company/${roundId}/${examId}/lastAttemptTimestamp`]: state.anchorTs,
+        }).catch(() => {});
+      }
+
+      if (!cancelled) {
+        setAttemptsUsed(state.effectiveAttemptsUsed);
+        setEffectiveAttemptsUsed(state.effectiveAttemptsUsed);
+        setAttemptNo(state.effectiveAttemptsUsed + 1);
+        setAttemptProgressAnchorTs(state.anchorTs);
+      }
+    };
+
+    const state = computeAttemptRefillState({
+      attemptsUsed: usedRaw,
+      lastAttemptTimestamp: lastTs,
+      refillMs,
+    });
+
+    if (state.effectiveAttemptsUsed !== usedRaw) {
+      syncRecoveredAttempts().catch(() => {});
+    } else if (state.nextInMs > 0) {
+      attemptSyncTimeoutRef.current = setTimeout(() => {
+        syncRecoveredAttempts().catch(() => {});
+      }, state.nextInMs + 50);
+    }
+
+    return () => {
+      cancelled = true;
+      clearTimeout(attemptSyncTimeoutRef.current);
+    };
+  }, [studentId, roundId, examId, examMeta, appExamConfig?.attempts, isCompetitive, attemptsUsed, attemptProgressAnchorTs, isOfflinePracticeMode]);
 
   const persistStartAttempt = useCallback(async (qOrder) => {
     if (!studentId || !examId) return null;
+
+    const startedAt = Date.now();
 
     const baseAttempt = {
       roundId,
       attemptNo,
       attemptStatus: "in_progress",
-      startTime: Date.now(),
+      startTime: startedAt,
       questionOrder: qOrder,
       answers: {},
       scorePercent: null,
@@ -794,6 +1445,32 @@ useEffect(() => {
       feedbackMode,
     };
 
+    if (isOfflinePracticeMode) {
+      const newAttemptId = createLocalAttemptId();
+      await updatePracticeExamProgress(studentId, examId, (current) => {
+        const attempts = { ...(current.attempts || {}) };
+        attempts[newAttemptId] = baseAttempt;
+        return {
+          ...current,
+          status: "in_progress",
+          attemptsUsed: Number(current.attemptsUsed || 0) + 1,
+          lastAttemptId: newAttemptId,
+          lastAttemptTimestamp: startedAt,
+          attempts,
+        };
+      }).catch(() => {});
+
+      setInProgressAttempt({ id: newAttemptId, ...baseAttempt });
+      setAttemptId(newAttemptId);
+      setAttemptsUsed((p) => Number(p || 0) + 1);
+      setEffectiveAttemptsUsed((p) => Number(p || 0) + 1);
+      setAttemptNo((p) => Number(p || 1) + 1);
+      setAttemptProgressAnchorTs(startedAt);
+
+      wrongCountRef.current = 0;
+      return newAttemptId;
+    }
+
     const newAttemptId = await pushAndSet(`Platform1/attempts/company/${studentId}/${examId}`, baseAttempt);
     setInProgressAttempt({ id: newAttemptId, ...baseAttempt });
     setAttemptId(newAttemptId);
@@ -801,15 +1478,17 @@ useEffect(() => {
     try {
       const progressPath = `Platform1/studentProgress/${studentId}/company/${roundId}/${examId}/attemptsUsed`;
       await runTransactionSafe(progressPath, (current = 0) => Number(current || 0) + 1);
-      await safeUpdate({ [`Platform1/studentProgress/${studentId}/company/${roundId}/${examId}/lastAttemptTimestamp`]: Date.now() }).catch(() => {});
-      setAttemptsUsed((p) => Number(p || 0) + 1);
-      setEffectiveAttemptsUsed((p) => Number(p || 0) + 1);
-      setAttemptNo((p) => Number(p || 1) + 1);
+      await safeUpdate({ [`Platform1/studentProgress/${studentId}/company/${roundId}/${examId}/lastAttemptTimestamp`]: startedAt }).catch(() => {});
     } catch {}
+
+    setAttemptsUsed((p) => Number(p || 0) + 1);
+    setEffectiveAttemptsUsed((p) => Number(p || 0) + 1);
+    setAttemptNo((p) => Number(p || 1) + 1);
+    setAttemptProgressAnchorTs(startedAt);
 
     wrongCountRef.current = 0;
     return newAttemptId;
-  }, [studentId, examId, roundId, attemptNo, feedbackMode]);
+  }, [studentId, examId, roundId, attemptNo, feedbackMode, isOfflinePracticeMode]);
 
   const attemptsUsedForUI = Number.isFinite(effectiveAttemptsUsed)
     ? effectiveAttemptsUsed
@@ -830,24 +1509,48 @@ useEffect(() => {
     const now = Date.now();
 
     try {
-      await runTransactionSafe(`${livesPath}/currentLives`, (curr) => Math.max(0, Number(curr ?? currentLives) - 1));
-      await safeUpdate({ [`${livesPath}/lastConsumedAt`]: now }).catch(() => {});
+      const transactionResult = await runTransactionSafe(livesPath, (currentNode) => {
+        const raw = currentNode && typeof currentNode === "object" ? currentNode : {};
+        const resolvedMaxLives = Number(raw.maxLives ?? globalMaxLives ?? DEFAULT_MAX_LIVES);
+        const resolvedRefillMs = normalizeHeartRefillMs(raw.refillIntervalMs ?? raw.refillInterval ?? globalRefillMs ?? DEFAULT_HEART_REFILL_MS);
+        const consumedLives = buildQueuedHeartConsumption({
+          currentLives: raw.currentLives ?? raw.current ?? currentLives,
+          maxLives: resolvedMaxLives,
+          lastConsumedAt: toMsTs(raw.lastConsumedAt ?? raw.lastConsumed ?? globalLastConsumedAt ?? 0),
+          refillMs: resolvedRefillMs,
+          now,
+        });
 
-      const updated = await get(ref(database, livesPath)).catch(() => null);
-      if (updated?.exists()) {
-        const val = updated.val() || {};
-        setGlobalLives(Number(val.currentLives ?? val.current ?? Math.max(0, currentLives - 1)));
-        setGlobalLastConsumedAt(toMsTs(val.lastConsumedAt ?? val.lastConsumed ?? now));
+        if (!consumedLives) return;
+
+        return {
+          ...raw,
+          currentLives: consumedLives.currentLives,
+          maxLives: resolvedMaxLives,
+          refillIntervalMs: resolvedRefillMs,
+          lastConsumedAt: consumedLives.lastConsumedAt,
+        };
+      });
+
+      if (!transactionResult?.committed) {
+        setOutOfLivesModalVisible(true);
+        return false;
+      }
+
+      const updatedLives = transactionResult?.snapshot?.exists?.() ? transactionResult.snapshot.val() || {} : null;
+      if (updatedLives) {
+        setGlobalLives(Number(updatedLives.currentLives ?? updatedLives.current ?? Math.max(0, currentLives - 1)));
+        setGlobalLastConsumedAt(toMsTs(updatedLives.lastConsumedAt ?? updatedLives.lastConsumed ?? now));
       } else {
         setGlobalLives(Math.max(0, currentLives - 1));
-        setGlobalLastConsumedAt(now);
+        setGlobalLastConsumedAt(Number(globalLastConsumedAt || 0) || now);
       }
       return true;
     } catch (e) {
       console.warn("consumeCompetitiveExamHeart failed", e);
       return true;
     }
-  }, [studentId, globalLives]);
+  }, [studentId, globalLives, globalLastConsumedAt, globalMaxLives, globalRefillMs]);
 
   const startExam = useCallback(async () => {
     if (!examMeta) return Alert.alert("Cannot start", "Exam metadata unavailable.");
@@ -877,6 +1580,8 @@ useEffect(() => {
     setOrder(qOrder);
     setAnswers({});
     setCurrentIndex(0);
+    setSelectedFeedback(null);
+    setShowAnswerRequiredWarning(false);
     setTimeLeft(Number(examMeta?.timeLimit || 600));
 
     const aId = await persistStartAttempt(qOrder);
@@ -903,6 +1608,8 @@ useEffect(() => {
     const normalizedOrder = normalizeQuestionOrder(inProgressAttempt.questionOrder || {});
     if (!order.length && normalizedOrder.length) setOrder(normalizedOrder);
     if (inProgressAttempt.answers) setAnswers(inProgressAttempt.answers || {});
+    setSelectedFeedback(null);
+    setShowAnswerRequiredWarning(false);
 
     if (inProgressAttempt.remainingSeconds != null) setTimeLeft(Number(inProgressAttempt.remainingSeconds));
     else if (inProgressAttempt.startTime && examMeta?.timeLimit) {
@@ -923,9 +1630,10 @@ useEffect(() => {
 
   const setAnswer = useCallback(async (qId, optionKey) => {
     if (stage !== "exam") return;
-    if (feedbackMode === "instant" && answers?.[qId] != null) return;
+    if (!isCompetitive && feedbackMode === "instant" && answers?.[qId] != null) return;
 
     setAnswers((p) => ({ ...p, [qId]: optionKey }));
+    setShowAnswerRequiredWarning(false);
 
     const q = questions.find((x) => x.id === qId);
     if (q) {
@@ -938,21 +1646,50 @@ useEffect(() => {
     }
 
     if (!studentId || !examId || !attemptId) return;
+    if (isOfflinePracticeMode) {
+      await updatePracticeExamProgress(studentId, examId, (current) => {
+        const attempts = { ...(current.attempts || {}) };
+        const currentAttempt = { ...(attempts[String(attemptId)] || {}) };
+        attempts[String(attemptId)] = {
+          ...currentAttempt,
+          answers: {
+            ...(currentAttempt.answers || {}),
+            [qId]: optionKey,
+          },
+        };
+        return {
+          ...current,
+          attempts,
+        };
+      }).catch(() => {});
+      return;
+    }
     await safeUpdate({ [`Platform1/attempts/company/${studentId}/${examId}/${attemptId}/answers/${qId}`]: optionKey }).catch(() => {});
-  }, [stage, feedbackMode, answers, questions, isCompetitive, studentId, examId, attemptId]);
+  }, [stage, feedbackMode, answers, questions, isCompetitive, studentId, examId, attemptId, isOfflinePracticeMode]);
 
   const prevQ = useCallback(() => {
     setSelectedFeedback(null);
+    setShowAnswerRequiredWarning(false);
     if (currentIndex > 0) setCurrentIndex((i) => i - 1);
   }, [currentIndex]);
 
   const nextQ = useCallback(() => {
+    const currentQuestionId = order[currentIndex] || questions[currentIndex]?.id;
+    const hasSelectedAnswer = currentQuestionId != null && answers?.[currentQuestionId] != null;
+
+    if (!hasSelectedAnswer) {
+      setShowAnswerRequiredWarning(true);
+      return;
+    }
+
     setSelectedFeedback(null);
+    setShowAnswerRequiredWarning(false);
     if (currentIndex < (order.length || questions.length) - 1) setCurrentIndex((i) => i + 1);
     else submitExam();
-  }, [currentIndex, order.length, questions.length, submitExam]);
+  }, [currentIndex, order, questions, answers, submitExam]);
 
   const canStart = useMemo(() => {
+    if (loading) return { ok: false, reason: "Preparing exam..." };
     if (!examMeta) return { ok: false, reason: "Exam metadata unavailable." };
     if (examMeta?.scoringEnabled && (!questions || questions.length === 0)) {
       if (questionLoadError) return { ok: false, reason: questionLoadError };
@@ -975,17 +1712,21 @@ useEffect(() => {
     }
 
     return { ok: true, reason: "" };
-  }, [examMeta, questions, questionLoadError, attemptsUsedForUI, inProgressAttempt, isCompetitive, lastCompletedAttempt, roundMeta]);
+  }, [loading, examMeta, questions, questionLoadError, attemptsUsedForUI, inProgressAttempt, isCompetitive, lastCompletedAttempt, roundMeta]);
 
-  const safeAreaPaddingTop = Platform.OS === "android" ? (StatusBar.currentHeight || 0) : 0;
   const qId = order[currentIndex];
   const q = questions.find((x) => x.id === qId);
+  const currentQuestionAnswered = q?.id != null && answers?.[q.id] != null;
 
   const totalQ = Math.max(1, order.length || questions.length || 1);
   const examProgressPct = Math.min(100, Math.max(0, ((currentIndex + 1) / totalQ) * 100));
 
-  const passingPercent = Number(examMeta?.passingPercent ?? examMeta?.passPercent ?? examMeta?.passScore ?? NaN);
-  const hasPassPercent = Number.isFinite(passingPercent);
+  const passingPercent = practicePassPercent;
+  const hasPassPercent = !isCompetitive;
+  const failedPracticeExam = !isCompetitive && !!result && !isPass;
+  const heartCountdownLabel = globalLives != null && Number(globalLives || 0) < Number(globalMaxLives || 0) && Number(nextHeartInMs || 0) > 0
+    ? formatMsToMMSS(nextHeartInMs)
+    : null;
 
   const instructionsList = useMemo(() => {
     const src = examMeta?.instructions ?? examMeta?.instruction ?? examMeta?.rules ?? [];
@@ -995,17 +1736,16 @@ useEffect(() => {
     return [];
   }, [examMeta]);
 
-  if (loading) {
+  const showWarmRulesShell = loading && stage === "rules" && !!examMeta;
+
+  if (loading && !showWarmRulesShell) {
     return (
-      <SafeAreaView style={[styles.loadingWrap, { paddingTop: safeAreaPaddingTop }]}>
-        <StatusBar barStyle={statusBarStyle} backgroundColor={colors.background} />
-        <ActivityIndicator size="large" color={C.primary} />
-      </SafeAreaView>
+      <PageLoadingSkeleton variant="detail" style={[styles.loadingWrap, { paddingTop: insets.top }]} />
     );
   }
 
   return (
-    <SafeAreaView style={[styles.safeRoot, { paddingTop: safeAreaPaddingTop }]}>
+    <SafeAreaView style={styles.safeRoot}>
       <StatusBar barStyle={statusBarStyle} backgroundColor={colors.background} />
 
       <Modal visible={outOfLivesModalVisible} transparent animationType="none" onRequestClose={() => {}}>
@@ -1039,16 +1779,19 @@ useEffect(() => {
       <View style={styles.root}>
         {stage === "rules" && (
           <View style={styles.panel}>
-            <View style={styles.headerBar}>
+            <View style={[styles.headerBar, { paddingTop: insets.top + 8 }]}>
               <TouchableOpacity onPress={handleBackNavigation} style={styles.backBtn}><Ionicons name="chevron-back" size={22} color={colors.text} /></TouchableOpacity>
               <View style={{ flex: 1 }}>
                 <Text style={styles.title}>{examMeta?.name || "Practice Test"}</Text>
                 <Text style={styles.subtitle}>{roundMeta?.name || ""}</Text>
               </View>
-              <TouchableOpacity style={{ minWidth: 72, alignItems: "flex-end" }} onPress={() => setShowHeartInfoModal(true)}>
-                <View style={{ flexDirection: "row", alignItems: "center" }}>
+              <TouchableOpacity style={styles.headerLivesButton} onPress={() => setShowHeartInfoModal(true)}>
+                <View style={styles.headerLivesRow}>
+                  {heartCountdownLabel ? (
+                    <Text style={styles.headerLivesTimer}>{heartCountdownLabel}</Text>
+                  ) : null}
                   <Ionicons name={globalLives != null && globalLives > 0 ? "heart" : "heart-outline"} size={18} color={globalLives != null && globalLives > 0 ? HEART_COLOR : colors.muted} />
-                  <Text style={{ marginLeft: 6, color: C.primary, fontWeight: "900" }}>{globalLives != null ? `${globalLives}` : `—`}</Text>
+                  <Text style={styles.headerLivesCount}>{globalLives != null ? `${globalLives}` : `—`}</Text>
                 </View>
               </TouchableOpacity>
             </View>
@@ -1131,9 +1874,8 @@ useEffect(() => {
                       <Text style={styles.noAttemptsSub}>
                         {isCompetitive
                           ? "You already took this exam. Wait until points are released."
-                          : "You used all attempts for this exam. Attempts refill by configured interval."}
+                          : "You used all attempts for this exam."}
                       </Text>
-                      {!isCompetitive ? <Text style={styles.noAttemptsTimer}>Next attempt in {formatMsToMMSS(nextAttemptInMs)}</Text> : null}
                     </>
                   ) : null}
                 </View>
@@ -1176,7 +1918,7 @@ useEffect(() => {
 
         {stage === "exam" && (
           <View style={styles.panel}>
-            <View style={styles.headerBar}>
+            <View style={[styles.headerBar, { paddingTop: insets.top + 8 }]}>
               <TouchableOpacity onPress={handleBackNavigation} style={styles.backBtn}><Ionicons name="chevron-back" size={22} color={colors.text} /></TouchableOpacity>
               <View style={{ flex: 1 }}>
                 <Text style={styles.title}>{examMeta?.name || "Exam"}</Text>
@@ -1203,7 +1945,7 @@ useEffect(() => {
 
                   {Object.keys(q.options || {}).map((optKey) => {
                     const selected = answers?.[q.id] === optKey;
-                    const showInstant = feedbackMode === "instant" && answers?.[q.id] != null;
+                    const showInstant = !isCompetitive && feedbackMode === "instant" && answers?.[q.id] != null;
                     const isCorrectOpt = String(q.correctAnswer || "") === String(optKey);
                     const isWrongSel = selected && !isCorrectOpt;
 
@@ -1228,13 +1970,13 @@ useEffect(() => {
                     );
                   })}
 
-                  {feedbackMode === "instant" && selectedFeedback ? (
+                  {!isCompetitive && feedbackMode === "instant" && selectedFeedback ? (
                     <Text style={{ marginTop: 10, fontWeight: "800", color: selectedFeedback === "correct" ? C.success : C.danger }}>
                       {selectedFeedback === "correct" ? "Correct ✅" : "Wrong ❌"}
                     </Text>
                   ) : null}
 
-                  {feedbackMode === "instant" && answers?.[q?.id] != null && q?.explanation ? (
+                  {!isCompetitive && feedbackMode === "instant" && answers?.[q?.id] != null && q?.explanation ? (
                     <View style={styles.explanationCard}>
                       <Text style={styles.explanationTitle}>Explanation</Text>
                       <Text style={styles.explanationText}>{q.explanation}</Text>
@@ -1243,6 +1985,10 @@ useEffect(() => {
                 </>
               )}
             </ScrollView>
+
+            {showAnswerRequiredWarning ? (
+              <Text style={[styles.warning, { marginHorizontal: 16, marginTop: 0 }]}>Choose one answer before continuing.</Text>
+            ) : null}
 
             <View
               style={[
@@ -1258,7 +2004,7 @@ useEffect(() => {
               <TouchableOpacity style={styles.ghostBtn} onPress={prevQ} disabled={currentIndex <= 0}>
                 <Text style={styles.ghostTxt}>Previous</Text>
               </TouchableOpacity>
-              <TouchableOpacity style={styles.primaryBtnSmall} onPress={nextQ}>
+              <TouchableOpacity style={[styles.primaryBtnSmall, !currentQuestionAnswered ? { opacity: 0.82 } : null]} onPress={nextQ}>
                 <Text style={styles.primaryBtnText}>{currentIndex < totalQ - 1 ? "Next" : "Submit"}</Text>
               </TouchableOpacity>
             </View>
@@ -1267,7 +2013,7 @@ useEffect(() => {
 
         {stage === "result" && showPostSubmitReview && (
           <View style={styles.panel}>
-            <View style={styles.headerBar}>
+            <View style={[styles.headerBar, { paddingTop: insets.top + 8 }]}>
               <TouchableOpacity onPress={handleBackNavigation} style={styles.backBtn}>
                 <Ionicons name="chevron-back" size={22} color={colors.text} />
               </TouchableOpacity>
@@ -1385,68 +2131,115 @@ useEffect(() => {
         <View style={styles.resultGlowBottom} />
 
         <Animated.View style={{ transform: [{ scale: resultPulse }] }}>
-          <View style={styles.resultBadgeBubble}>
+          <View
+            style={[
+              styles.resultBadgeBubble,
+              failedPracticeExam
+                ? { backgroundColor: C.danger, borderColor: "rgba(239,68,68,0.18)" }
+                : null,
+            ]}
+          >
             <Ionicons
-              name={isPass ? "checkmark-circle" : "refresh-circle"}
+              name={
+                isCompetitive && !result?.resultVisible
+                  ? "time-outline"
+                  : failedPracticeExam
+                  ? "close-circle"
+                  : "checkmark-circle"
+              }
               size={42}
               color="#fff"
             />
           </View>
         </Animated.View>
 
-        <Text style={styles.resultTitle}>Exam Completed</Text>
-        <Text style={styles.resultPct}>{Math.round(Number(result?.percent || 0))}%</Text>
-        <Text style={styles.resultSub}>
-          {isPass ? "Great work. Your exam has been submitted successfully." : "Your exam has been submitted. Keep practicing to improve your score."}
+        <Text style={styles.resultTitle}>
+          {isCompetitive && !result?.resultVisible ? "Exam Submitted" : failedPracticeExam ? "Failed" : "Exam Completed"}
         </Text>
 
-        <View style={styles.resultMoodPill}>
-          <Text style={styles.resultMoodText}>{gradeLabel}</Text>
-        </View>
-
-        <View style={styles.resultStatsRow}>
-          <View style={styles.resultStatBox}>
-            <Text style={styles.resultStatLabel}>Correct</Text>
-            <Text style={[styles.resultStatValue, { color: C.success }]}>{result?.correct ?? 0}</Text>
-          </View>
-          <View style={styles.resultStatDivider} />
-          <View style={styles.resultStatBox}>
-            <Text style={styles.resultStatLabel}>Wrong</Text>
-            <Text style={[styles.resultStatValue, { color: C.danger }]}>
-              {Math.max(0, Number(result?.total || 0) - Number(result?.correct || 0))}
+        {isCompetitive && !result?.resultVisible ? (
+          <>
+            <Text style={styles.resultSub}>
+              You finished the exam successfully. Please wait until all students submit and points are distributed.
             </Text>
-          </View>
-          <View style={styles.resultStatDivider} />
-          <View style={styles.resultStatBox}>
-            <Text style={styles.resultStatLabel}>Score</Text>
-            <Text style={[styles.resultStatValue, { color: C.primary }]}>
-              {Math.round(Number(result?.percent || 0))}%
+
+            <View style={styles.resultMoodPill}>
+              <Text style={styles.resultMoodText}>Results pending</Text>
+            </View>
+          </>
+        ) : (
+          <>
+            <Text style={styles.resultPct}>{Math.round(Number(result?.percent || 0))}%</Text>
+            <Text style={styles.resultSub}>
+              {failedPracticeExam
+                ? `You failed this practice exam. Score at least ${Math.round(Number(result?.passPercent || practicePassPercent))}% to pass.${result?.lifePenaltyApplied ? " 1 life has been deducted." : ""}`
+                : "Great work. Your exam has been submitted successfully."}
             </Text>
-          </View>
-        </View>
 
-        {result?.badge ? (
-          <View style={styles.resultChip}>
-            <Ionicons name="ribbon" size={14} color={C.primary} />
-            <Text style={styles.resultChipText}>Badge: {String(result.badge).toUpperCase()}</Text>
-          </View>
-        ) : null}
+            <View style={styles.resultMoodPill}>
+              <Text style={styles.resultMoodText}>{gradeLabel}</Text>
+            </View>
 
-        <View style={{ flexDirection: "row", width: "100%", gap: 10, marginTop: 16 }}>
+            <View style={styles.resultStatsRow}>
+              <View style={styles.resultStatBox}>
+                <Text style={styles.resultStatLabel}>Correct</Text>
+                <Text style={[styles.resultStatValue, { color: C.success }]}>{result?.correct ?? 0}</Text>
+              </View>
+              <View style={styles.resultStatDivider} />
+              <View style={styles.resultStatBox}>
+                <Text style={styles.resultStatLabel}>Wrong</Text>
+                <Text style={[styles.resultStatValue, { color: C.danger }]}>
+                  {Math.max(0, Number(result?.total || 0) - Number(result?.correct || 0))}
+                </Text>
+              </View>
+              <View style={styles.resultStatDivider} />
+              <View style={styles.resultStatBox}>
+                <Text style={styles.resultStatLabel}>Score</Text>
+                <Text style={[styles.resultStatValue, { color: C.primary }]}>
+                  {Math.round(Number(result?.percent || 0))}%
+                </Text>
+              </View>
+            </View>
+
+            {result?.badge ? (
+              <View style={styles.resultChip}>
+                <Ionicons name="ribbon" size={14} color={C.primary} />
+                <Text style={styles.resultChipText}>Badge: {String(result.badge).toUpperCase()}</Text>
+              </View>
+            ) : null}
+          </>
+        )}
+
+        <View style={styles.resultActions}>
           {!isCompetitive && feedbackMode === "end" ? (
             <TouchableOpacity
-              style={[styles.ghostBtn, { flex: 1 }]}
+              activeOpacity={0.9}
+              style={[styles.resultActionBtn, styles.resultActionBtnSecondary]}
               onPress={() => {
                 setShowPostSubmitReview(true);
-                setReviewIndex(Math.max(0, (order.length || questions.length) - 1));
+                setReviewIndex(0);
               }}
             >
-              <Text style={styles.ghostTxt}>Review Answers</Text>
+              <View style={[styles.resultActionIconWrap, styles.resultActionIconWrapSecondary]}>
+                <Ionicons name="reader-outline" size={20} color={C.primary} />
+              </View>
+              <View style={styles.resultActionCopy}>
+                <Text style={styles.resultActionTitle}>Review</Text>
+                <Text style={styles.resultActionSubtitle}>See your answers.</Text>
+              </View>
+              <Ionicons name="chevron-forward" size={18} color={C.primary} />
             </TouchableOpacity>
           ) : null}
 
-          <TouchableOpacity style={[styles.primaryBtnSmall, { flex: 1 }]} onPress={handleBackNavigation}>
-            <Text style={styles.primaryBtnText}>Continue</Text>
+          <TouchableOpacity activeOpacity={0.92} style={[styles.resultActionBtn, styles.resultActionBtnPrimary]} onPress={handleBackNavigation}>
+            <View style={[styles.resultActionIconWrap, styles.resultActionIconWrapPrimary]}>
+              <Ionicons name="arrow-forward" size={20} color="#fff" />
+            </View>
+            <View style={styles.resultActionCopy}>
+              <Text style={[styles.resultActionTitle, styles.resultActionTitlePrimary]}>Continue</Text>
+              <Text style={[styles.resultActionSubtitle, styles.resultActionSubtitlePrimary]}>Back to exams.</Text>
+            </View>
+            <Ionicons name="chevron-forward" size={18} color="#fff" />
           </TouchableOpacity>
         </View>
       </Animated.View>
@@ -1459,7 +2252,7 @@ useEffect(() => {
         <View style={modalStyles.overlay}>
           <Animated.View style={[modalStyles.card, { transform: [{ scale: heartModalAnim.interpolate({ inputRange: [0, 1], outputRange: [0.9, 1] }) }], opacity: heartModalAnim }]}>
             <Text style={modalStyles.title}>Lives & refill</Text>
-            <Text style={modalStyles.text}>Hearts are global across subjects.</Text>
+            <Text style={modalStyles.text}>Lives are shared across all practice exams and refill automatically over time.</Text>
             <View style={{ marginTop: 12, alignItems: "center" }}>
               <Ionicons name={globalLives != null && globalLives > 0 ? "heart" : "heart-outline"} size={32} color={globalLives != null && globalLives > 0 ? HEART_COLOR : colors.muted} />
               <Text style={{ fontWeight: "900", marginTop: 8, fontSize: 18 }}>{globalLives != null ? `${globalLives} / ${globalMaxLives}` : `— / ${globalMaxLives}`}</Text>
@@ -1489,7 +2282,6 @@ function createStyles(colors) {
   headerBar: {
     minHeight: 62,
     paddingHorizontal: 16,
-    paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight || 0) : 0,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
@@ -1498,6 +2290,10 @@ function createStyles(colors) {
   backBtn: { width: 40, height: 40, borderRadius: 10, alignItems: "center", justifyContent: "center", backgroundColor: colors.inputBackground },
   title: { fontSize: 18, fontWeight: "900", color: colors.text },
   subtitle: { marginTop: 2, color: colors.muted, fontSize: 12 },
+  headerLivesButton: { minWidth: 72, alignItems: "flex-end" },
+  headerLivesRow: { flexDirection: "row", alignItems: "center" },
+  headerLivesTimer: { marginRight: 8, color: C.primary, fontWeight: "800", fontSize: 12 },
+  headerLivesCount: { marginLeft: 6, color: C.primary, fontWeight: "900" },
 
   body: { paddingHorizontal: 16, paddingBottom: 24 },
   mainTitle: { fontSize: 24, fontWeight: "900", color: colors.text, marginTop: 8, marginBottom: 10 },
@@ -1715,6 +2511,70 @@ function createStyles(colors) {
     marginTop: 4,
     fontSize: 18,
     fontWeight: "900",
+  },
+  resultActions: {
+    width: "100%",
+    marginTop: 18,
+    gap: 10,
+  },
+  resultActionBtn: {
+    width: "100%",
+    minHeight: 62,
+    borderRadius: 18,
+    borderWidth: 1,
+    paddingVertical: 11,
+    paddingHorizontal: 14,
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  resultActionBtnSecondary: {
+    backgroundColor: colors.soft,
+    borderColor: colors.border,
+  },
+  resultActionBtnPrimary: {
+    backgroundColor: C.primary,
+    borderColor: "rgba(11,114,255,0.16)",
+    shadowColor: C.primary,
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.22,
+    shadowRadius: 18,
+    elevation: 8,
+  },
+  resultActionIconWrap: {
+    width: 42,
+    height: 42,
+    borderRadius: 14,
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 12,
+  },
+  resultActionIconWrapSecondary: {
+    backgroundColor: "rgba(11,114,255,0.12)",
+  },
+  resultActionIconWrapPrimary: {
+    backgroundColor: "rgba(255,255,255,0.18)",
+  },
+  resultActionCopy: {
+    flex: 1,
+    paddingRight: 12,
+  },
+  resultActionTitle: {
+    color: colors.text,
+    fontSize: 14,
+    fontWeight: "900",
+  },
+  resultActionTitlePrimary: {
+    color: "#fff",
+  },
+  resultActionSubtitle: {
+    marginTop: 2,
+    color: colors.muted,
+    fontSize: 11,
+    lineHeight: 15,
+    fontWeight: "600",
+  },
+  resultActionSubtitlePrimary: {
+    color: "rgba(255,255,255,0.84)",
   },
   resultChip: {
     marginTop: 12,

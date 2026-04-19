@@ -8,16 +8,16 @@ import {
   TouchableOpacity,
   Alert,
   ScrollView,
-  ActivityIndicator,
   Modal,
   Pressable,
 } from "react-native";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
-import { ref, get, set, remove, update } from "firebase/database";
+import { ref, get, set, remove, update } from "../lib/offlineDatabase";
 import { database } from "../constants/firebaseConfig";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useAppTheme } from "../hooks/use-app-theme";
+import PageLoadingSkeleton from "../components/ui/page-loading-skeleton";
 import {
   DEFAULT_NOTE_COLOR_KEY,
   getNoteColorOptions,
@@ -306,9 +306,7 @@ export default function ChapterNoteScreen() {
 
   if (loading) {
     return (
-      <SafeAreaView style={[styles.center, { paddingTop: insets.top, paddingBottom: insets.bottom }]}>
-        <ActivityIndicator color={PRIMARY} />
-      </SafeAreaView>
+      <PageLoadingSkeleton variant="detail" style={[styles.screen, { paddingTop: insets.top, paddingBottom: insets.bottom }]} />
     );
   }
 

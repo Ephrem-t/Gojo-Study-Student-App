@@ -1,5 +1,5 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { ref, get, query, orderByChild, equalTo } from "firebase/database";
+import { ref, get, query, orderByChild, equalTo } from "../../lib/offlineDatabase";
 import { database } from "../../constants/firebaseConfig";
 
 /**

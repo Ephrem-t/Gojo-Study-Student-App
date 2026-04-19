@@ -1,12 +1,16 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ThemeProvider } from "@react-navigation/native";
-import { AppState, SafeAreaView, StyleSheet, View, Text, TouchableOpacity, Animated, Easing, Modal, Platform } from "react-native";
+import type { NativeStackNavigationOptions } from "@react-navigation/native-stack";
+import { AppState, SafeAreaView, StyleSheet, View, Text, TouchableOpacity, Animated, Easing, Modal, Platform, InteractionManager } from "react-native";
 import { Stack, usePathname, useRouter } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import * as ScreenOrientation from "expo-screen-orientation";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { getOfflineState, startOfflineSync, subscribeOfflineState } from "../lib/offlineDatabase";
+import { prewarmEssentialAppCaches } from "../lib/appOfflineCache";
+import { startMediaUploadSync } from "../lib/mediaUploadQueue";
 import { getValue } from "./lib/dbHelpers";
 import AppLaunchSplash from "../components/ui/app-launch-splash";
 import PasscodePanel from "../components/passcode-panel";
@@ -63,15 +67,17 @@ function ThemedRootLayout() {
   const bootRedirectDoneRef = useRef(false);
   const appStateRef = useRef(AppState.currentState);
   const sessionSyncDoneRef = useRef(false);
+  const postBootWarmupTaskRef = useRef<any>(null);
+  const startupSyncTaskRef = useRef<any>(null);
   const [appLock, setAppLock] = useState<any>(DEFAULT_APP_LOCK_STATE);
   const [appLocked, setAppLocked] = useState(false);
   const [bootReady, setBootReady] = useState(false);
-  const [minimumSplashElapsed, setMinimumSplashElapsed] = useState(false);
   const [unlockCode, setUnlockCode] = useState("");
   const [unlockError, setUnlockError] = useState("");
+  const [offlineState, setOfflineState] = useState(() => getOfflineState());
   const currentPath = String(pathname || "/");
   const isPublicRoute = currentPath === "/" || currentPath === "/index";
-  const showLaunchSplash = !bootReady || !minimumSplashElapsed;
+  const showLaunchSplash = !bootReady;
 
   const resetAppLockState = useCallback(() => {
     AsyncStorage.removeItem(APP_LOCK_LAST_INACTIVE_AT_KEY).catch(() => null);
@@ -163,7 +169,19 @@ function ThemedRootLayout() {
     if (Platform.OS === "web") return;
 
     ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP).catch(() => null);
-  }, [currentPath]);
+  }, []);
+
+  const schedulePostBootWarmup = useCallback(() => {
+    if (postBootWarmupTaskRef.current) return;
+
+    postBootWarmupTaskRef.current = InteractionManager.runAfterInteractions(() => {
+      Promise.resolve(prewarmEssentialAppCaches())
+        .catch(() => null)
+        .finally(() => {
+          postBootWarmupTaskRef.current = null;
+        });
+    });
+  }, []);
 
   const syncSessionAccess = useCallback(async (options?: { forceAppLock?: boolean }) => {
     const shouldForceHome = isPublicRoute || currentPath === "/setting";
@@ -183,11 +201,14 @@ function ThemedRootLayout() {
       await syncAppLockState(session, {
         evaluateAutoLock,
       });
+      prewarmEssentialAppCaches().catch(() => null);
 
       if (shouldForceHome && !bootRedirectDoneRef.current) {
         bootRedirectDoneRef.current = true;
         router.replace("/dashboard/home");
       }
+
+      schedulePostBootWarmup();
 
       sessionSyncDoneRef.current = true;
       return;
@@ -205,7 +226,7 @@ function ThemedRootLayout() {
     if (!isPublicRoute) {
       router.replace("/");
     }
-  }, [currentPath, isPublicRoute, resetAppLockState, router, syncAppLockState]);
+  }, [currentPath, isPublicRoute, resetAppLockState, router, schedulePostBootWarmup, syncAppLockState]);
 
   useEffect(() => {
     let active = true;
@@ -226,11 +247,21 @@ function ThemedRootLayout() {
   }, [syncSessionAccess]);
 
   useEffect(() => {
-    const timer = setTimeout(() => {
-      setMinimumSplashElapsed(true);
-    }, 1800);
+    const unsubscribeOfflineState = subscribeOfflineState(setOfflineState);
 
-    return () => clearTimeout(timer);
+    startupSyncTaskRef.current = InteractionManager.runAfterInteractions(() => {
+      startOfflineSync();
+      startMediaUploadSync();
+      startupSyncTaskRef.current = null;
+    });
+
+    return () => {
+      startupSyncTaskRef.current?.cancel?.();
+      startupSyncTaskRef.current = null;
+      postBootWarmupTaskRef.current?.cancel?.();
+      postBootWarmupTaskRef.current = null;
+      unsubscribeOfflineState();
+    };
   }, []);
 
   useEffect(() => {
@@ -297,14 +328,54 @@ function ThemedRootLayout() {
     setAppLocked(true);
   }, []);
 
+  const showOfflineBanner = !showLaunchSplash && (
+    (offlineState.hasResolved && !offlineState.isConnected) || offlineState.pendingWrites > 0
+  );
+  const offlineBannerText = !offlineState.isConnected
+    ? offlineState.pendingWrites > 0
+      ? `${offlineState.pendingWrites} offline ${offlineState.pendingWrites === 1 ? "change" : "changes"} will sync when you reconnect.`
+      : "Offline mode. Showing cached data where available."
+    : `Syncing ${offlineState.pendingWrites} offline ${offlineState.pendingWrites === 1 ? "change" : "changes"}...`;
+  const offlineBannerBackground = offlineState.isConnected ? colors.successSurface : colors.warningSurface;
+  const offlineBannerIconColor = offlineState.isConnected ? colors.success : colors.warningText;
+  const offlineBannerTextColor = offlineState.isConnected ? colors.success : colors.warningText;
+  const stackAnimation: NativeStackNavigationOptions["animation"] =
+    Platform.OS === "web" ? "none" : Platform.OS === "ios" ? "simple_push" : "fade";
+  const stackScreenOptions = useMemo<NativeStackNavigationOptions>(() => ({
+    headerShown: false,
+    animation: stackAnimation,
+    gestureEnabled: true,
+    contentStyle: { backgroundColor: colors.background },
+    ...(Platform.OS === "ios"
+      ? {
+          animationDuration: 170,
+          fullScreenGestureEnabled: true,
+        }
+      : {}),
+  }), [colors.background, stackAnimation]);
+
   return (
     <AppLockProvider value={{ appLockEnabled: appLock.enabled, lockAppNow }}>
       <ThemeProvider value={navigationTheme}>
         <SafeAreaView style={[styles.container, { backgroundColor: colors.background }]}>
           <StatusBar style={statusBarStyle} backgroundColor={colors.background} />
+          {showOfflineBanner ? (
+            <View style={[styles.offlineBanner, { backgroundColor: offlineBannerBackground, borderColor: colors.border }]}> 
+              <View style={styles.offlineBannerRow}>
+                <Ionicons
+                  name={offlineState.isConnected ? "cloud-done-outline" : "cloud-offline-outline"}
+                  size={15}
+                  color={offlineBannerIconColor}
+                />
+                <Text style={[styles.offlineBannerText, { color: offlineBannerTextColor }]} numberOfLines={2}>
+                  {offlineBannerText}
+                </Text>
+              </View>
+            </View>
+          ) : null}
           <GlobalNotificationToast />
-          <Stack initialRouteName="index" screenOptions={{ headerShown: false, contentStyle: { backgroundColor: colors.background } }}>
-            <Stack.Screen name="setting" options={{ animation: "slide_from_right", presentation: "card" }} />
+          <Stack initialRouteName="index" screenOptions={stackScreenOptions}>
+            <Stack.Screen name="setting" options={{ presentation: "card" }} />
           </Stack>
 
           <Modal visible={appLock.enabled && appLocked} transparent animationType="fade" onRequestClose={() => null}>
@@ -526,6 +597,27 @@ function GlobalNotificationToast() {
 
 const styles = StyleSheet.create({
   container: { flex: 1 },
+
+  offlineBanner: {
+    marginHorizontal: 12,
+    marginTop: 6,
+    marginBottom: 2,
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  offlineBannerRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  offlineBannerText: {
+    flex: 1,
+    fontSize: 12,
+    fontWeight: "700",
+    lineHeight: 16,
+  },
 
   lockOverlay: {
     flex: 1,

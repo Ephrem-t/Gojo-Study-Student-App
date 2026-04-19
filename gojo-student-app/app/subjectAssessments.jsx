@@ -6,26 +6,37 @@ import {
   SafeAreaView,
   FlatList,
   TouchableOpacity,
-  ActivityIndicator,
   RefreshControl,
+  ActivityIndicator,
+  InteractionManager,
+  Alert,
 } from "react-native";
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { ref, get } from "firebase/database";
+import { ref, get } from "../lib/offlineDatabase";
 import { database } from "../constants/firebaseConfig";
-import { getSnapshot } from "./lib/dbHelpers";
+import { resolveSchoolKeyFromStudentId } from "./lib/dbHelpers";
 import { useAppTheme } from "../hooks/use-app-theme";
+import PageLoadingSkeleton from "../components/ui/page-loading-skeleton";
+import {
+  downloadAssessmentBundle,
+  readDownloadedAssessmentStateMap,
+  persistCachedSubjectAssessments,
+  readAssessmentSubmissionIndex,
+  readCachedSubjectAssessments,
+} from "../lib/schoolAssessments";
 
 const PRIMARY = "#0B72FF";
 const MUTED = "#6B78A8";
-const TEXT = "#0B2540";
-const BORDER = "#EAF0FF";
 const SUCCESS = "#12B76A";
 const WARNING = "#F59E0B";
 const DANGER = "#EF4444";
 const INFO = "#0EA5E9";
+const SUBJECT_ASSESSMENTS_CACHE_TTL_MS = 2 * 60 * 1000;
+const SUBJECT_ASSESSMENTS_NODE_CACHE_MS = 90 * 1000;
+const SUBJECT_ASSESSMENTS_SUBMISSION_CACHE_MS = 90 * 1000;
 
 const SUBJECT_ICON_MAP = [
   { keys: ["english", "literature"], icon: "book-open-page-variant", color: "#6C5CE7" },
@@ -94,6 +105,32 @@ function getTypeMeta(type = "") {
   return { label: type || "Assessment", icon: "reader-outline" };
 }
 
+function getAssessmentSortTimestamp(item = {}, fallbackIndex = 0) {
+  return Math.max(
+    normalizeUnixTimestamp(item?.publishedAt) || 0,
+    normalizeUnixTimestamp(item?.createdAt) || 0,
+    normalizeUnixTimestamp(item?.updatedAt) || 0,
+    normalizeUnixTimestamp(item?.openAt || item?.startAt || item?.availableFrom) || 0,
+    Number(fallbackIndex || 0)
+  );
+}
+
+function sortAssessmentsNewestFirst(items = []) {
+  return [...items]
+    .sort((left, right) => {
+      const leftIndex = Number(left?.__sourceIndex || 0);
+      const rightIndex = Number(right?.__sourceIndex || 0);
+      const timeDiff = getAssessmentSortTimestamp(right, rightIndex) - getAssessmentSortTimestamp(left, leftIndex);
+      if (timeDiff !== 0) return timeDiff;
+
+      const indexDiff = rightIndex - leftIndex;
+      if (indexDiff !== 0) return indexDiff;
+
+      return String(right?.assessmentId || "").localeCompare(String(left?.assessmentId || ""));
+    })
+    .map(({ __sourceIndex, ...rest }) => rest);
+}
+
 async function resolveSchoolKeyFast(studentId) {
   if (!studentId) return null;
 
@@ -103,18 +140,25 @@ async function resolveSchoolKeyFast(studentId) {
   } catch {}
 
   try {
-    const schoolsSnap = await getSnapshot([`Platform1/Schools`]);
-    const schools = schoolsSnap?.val ? schoolsSnap.val() || {} : {};
-    for (const schoolKey of Object.keys(schools)) {
-      const s = await get(ref(database, `Platform1/Schools/${schoolKey}/Students/${studentId}`));
-      if (s.exists()) {
-        try { await AsyncStorage.setItem("schoolKey", schoolKey); } catch {}
-        return schoolKey;
-      }
+    const resolvedSchoolKey = await resolveSchoolKeyFromStudentId(studentId);
+    if (resolvedSchoolKey) {
+      try {
+        await AsyncStorage.setItem("schoolKey", resolvedSchoolKey);
+      } catch {}
+      return resolvedSchoolKey;
     }
   } catch {}
 
   return null;
+}
+
+async function readAssessmentSession() {
+  const pairs = await AsyncStorage.multiGet(["studentNodeKey", "studentId", "username", "schoolKey"]);
+  const session = Object.fromEntries(pairs || []);
+  return {
+    studentId: session.studentNodeKey || session.studentId || session.username || null,
+    schoolKey: session.schoolKey || null,
+  };
 }
 
 export default function SubjectAssessmentsScreen() {
@@ -124,6 +168,25 @@ export default function SubjectAssessmentsScreen() {
   const { colors } = useAppTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
   const { courseId, subject, grade, section, returnTo, returnExamFilter } = params;
+  const warmStats = useMemo(() => {
+    const total = Math.max(0, Number(params?.warmAssessmentCount || 0));
+    const pending = Math.max(0, Number(params?.warmPendingAssessmentCount || 0));
+    return {
+      total,
+      pending,
+      submitted: Math.max(0, total - pending),
+    };
+  }, [params?.warmAssessmentCount, params?.warmPendingAssessmentCount]);
+  const hasWarmShell = useMemo(
+    () => !!subject || !!grade || !!section || warmStats.total > 0,
+    [grade, section, subject, warmStats.total]
+  );
+  const cacheRouteParams = useMemo(() => ({
+    courseId: String(courseId || ""),
+    subject: String(subject || ""),
+    grade: String(grade || ""),
+    section: String(section || ""),
+  }), [courseId, grade, section, subject]);
 
   const handleBackNavigation = useCallback(() => {
     if (String(returnTo || "") === "exam") {
@@ -139,50 +202,138 @@ export default function SubjectAssessmentsScreen() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [items, setItems] = useState([]);
+  const [sessionInfo, setSessionInfo] = useState(null);
+  const [downloadedMap, setDownloadedMap] = useState({});
+  const [downloadProgressMap, setDownloadProgressMap] = useState({});
 
-  const loadData = useCallback(async () => {
-    setLoading(true);
+  const hydrateDownloadedMap = useCallback(async (assessmentItems = [], session = null) => {
+    const activeSession = session || sessionInfo || await readAssessmentSession();
+    const sid = activeSession?.studentId || null;
+    if (!sid || !Array.isArray(assessmentItems) || !assessmentItems.length) {
+      setDownloadedMap({});
+      return;
+    }
+
+    const nextMap = await readDownloadedAssessmentStateMap(sid, assessmentItems);
+    setDownloadedMap(nextMap);
+  }, [sessionInfo]);
+
+  const openAssessment = useCallback((item) => {
+    router.push({
+      pathname: "/takeAssessment",
+      params: {
+        assessmentId: item.assessmentId,
+        courseId: item.courseId,
+        title: item.title || "Assessment",
+        warmTitle: String(item.title || "Assessment"),
+        warmDueDate: String(item.dueDate || ""),
+        warmTotalPoints: String(item.totalPoints || 0),
+        warmQuestionCount: String(item.questionCount || 0),
+        warmType: String(item.type || ""),
+        warmSubmitted: item.submitted ? "1" : "0",
+        warmFinalScore: item.finalScore != null ? String(item.finalScore) : "",
+        returnTo: "subjectAssessments",
+        returnCourseId: String(courseId || ""),
+        returnSubject: String(subject || ""),
+        returnGrade: String(grade || ""),
+        returnSection: String(section || ""),
+        returnExamFilter: String(returnExamFilter || "school"),
+      },
+    });
+  }, [courseId, grade, returnExamFilter, router, section, subject]);
+
+  const downloadAssessmentToPhone = useCallback(async (item) => {
+    const assessmentKey = String(item?.assessmentId || "").trim();
+    if (!assessmentKey || Number(downloadProgressMap?.[assessmentKey] || 0) > 0) return;
+
+    const activeSession = sessionInfo || await readAssessmentSession();
+    const sid = activeSession?.studentId || null;
+    if (!sid) {
+      Alert.alert("Download unavailable", "Student account was not found on this phone.");
+      return;
+    }
+
+    let sk = activeSession?.schoolKey || null;
+    if (!sk) {
+      sk = await resolveSchoolKeyFast(sid);
+    }
+
+    setSessionInfo({ studentId: sid, schoolKey: sk || null });
+    setDownloadProgressMap((prev) => ({ ...prev, [assessmentKey]: 8 }));
+
     try {
-      const sid =
-        (await AsyncStorage.getItem("studentNodeKey")) ||
-        (await AsyncStorage.getItem("studentId")) ||
-        (await AsyncStorage.getItem("username")) ||
-        null;
+      setDownloadProgressMap((prev) => ({ ...prev, [assessmentKey]: 34 }));
+      await downloadAssessmentBundle({
+        studentId: sid,
+        schoolKey: sk,
+        assessmentId: assessmentKey,
+        assessment: item,
+      });
+      setDownloadedMap((prev) => ({ ...prev, [assessmentKey]: true }));
+      setDownloadProgressMap((prev) => ({ ...prev, [assessmentKey]: 0 }));
+    } catch (error) {
+      setDownloadProgressMap((prev) => ({ ...prev, [assessmentKey]: 0 }));
+      Alert.alert("Download failed", error?.message || "Could not download this assessment.");
+    }
+  }, [downloadProgressMap, sessionInfo]);
 
+  const handleAssessmentPress = useCallback((item, isDownloaded) => {
+    if (!isDownloaded) {
+      Alert.alert("Download first", "Download this assessment to the phone before opening it.");
+      return;
+    }
+
+    openAssessment(item);
+  }, [openAssessment]);
+
+  const loadData = useCallback(async (options = {}) => {
+    const background = Boolean(options?.background);
+    const force = Boolean(options?.force);
+    const session = options?.session || await readAssessmentSession();
+    const sid = session?.studentId || null;
+    setSessionInfo(session || null);
+
+    if (!background) {
+      setLoading(true);
+    }
+
+    try {
       const sk = await resolveSchoolKeyFast(sid);
 
       let assessmentsObj = {};
       if (sk) {
-        const scoped = await get(ref(database, `Platform1/Schools/${sk}/SchoolExams/Assessments`));
+        const scoped = await get(
+          ref(database, `Platform1/Schools/${sk}/SchoolExams/Assessments`),
+          force ? null : { maxAgeMs: SUBJECT_ASSESSMENTS_NODE_CACHE_MS }
+        );
         if (scoped.exists()) assessmentsObj = scoped.val() || {};
       }
 
       if (!Object.keys(assessmentsObj).length) {
-        const global = await get(ref(database, `SchoolExams/Assessments`));
+        const global = await get(
+          ref(database, `SchoolExams/Assessments`),
+          force ? null : { maxAgeMs: SUBJECT_ASSESSMENTS_NODE_CACHE_MS }
+        );
         if (global.exists()) assessmentsObj = global.val() || {};
       }
 
-      const list = Object.keys(assessmentsObj)
-        .map((aid) => ({ assessmentId: aid, ...assessmentsObj[aid] }))
-        .filter((a) => String(a.courseId) === String(courseId))
-        .filter((a) => String(a.status || "").toLowerCase() !== "removed")
-        .sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0));
+      const list = sortAssessmentsNewestFirst(
+        Object.keys(assessmentsObj)
+          .map((aid, index) => ({ assessmentId: aid, __sourceIndex: index, ...assessmentsObj[aid] }))
+          .filter((a) => String(a.courseId) === String(courseId))
+          .filter((a) => String(a.status || "").toLowerCase() !== "removed")
+      );
 
       const enriched = await Promise.all(
         list.map(async (a) => {
-          let idx = null;
-
-          if (sk && sid) {
-            const scoped = await get(
-              ref(database, `Platform1/Schools/${sk}/SchoolExams/SubmissionIndex/${a.assessmentId}/${sid}`)
-            );
-            if (scoped.exists()) idx = scoped.val() || {};
-          }
-
-          if (!idx && sid) {
-            const global = await get(ref(database, `SchoolExams/SubmissionIndex/${a.assessmentId}/${sid}`));
-            if (global.exists()) idx = global.val() || {};
-          }
+          const idx = sid
+            ? await readAssessmentSubmissionIndex({
+                schoolKey: sk,
+                assessmentId: a.assessmentId,
+                studentId: sid,
+                maxAgeMs: force ? 0 : SUBJECT_ASSESSMENTS_SUBMISSION_CACHE_MS,
+              })
+            : null;
 
           return {
             ...a,
@@ -192,36 +343,88 @@ export default function SubjectAssessmentsScreen() {
         })
       );
 
-      setItems(enriched);
+      const sortedEnriched = sortAssessmentsNewestFirst(enriched);
+
+      setItems(sortedEnriched);
+      await hydrateDownloadedMap(sortedEnriched, { studentId: sid, schoolKey: sk || null });
+      if (sid && courseId) {
+        void persistCachedSubjectAssessments({
+          studentId: sid,
+          ...cacheRouteParams,
+          schoolKey: sk || "",
+          items: sortedEnriched,
+        });
+      }
     } finally {
-      setLoading(false);
+      if (!background) {
+        setLoading(false);
+      }
     }
-  }, [courseId]);
+  }, [cacheRouteParams, courseId, hydrateDownloadedMap]);
 
   useEffect(() => {
-    loadData();
-  }, [loadData]);
+    let cancelled = false;
+    let task = null;
+
+    (async () => {
+      const session = await readAssessmentSession();
+      setSessionInfo(session || null);
+      const sid = session?.studentId || null;
+      const cached = sid && courseId
+        ? await readCachedSubjectAssessments({ studentId: sid, ...cacheRouteParams })
+        : null;
+
+      if (cancelled) return;
+
+      const hasCachedSnapshot = !!cached && Array.isArray(cached.items);
+      if (hasCachedSnapshot) {
+        const sortedCachedItems = sortAssessmentsNewestFirst(cached.items);
+        setItems(sortedCachedItems);
+        void hydrateDownloadedMap(sortedCachedItems, session);
+        setLoading(false);
+      }
+
+      const fetchedAt = Number(cached?.fetchedAt || 0);
+      const cacheAgeMs = fetchedAt > 0 ? Date.now() - fetchedAt : Number.POSITIVE_INFINITY;
+      const shouldRefresh = !hasCachedSnapshot || cacheAgeMs > SUBJECT_ASSESSMENTS_CACHE_TTL_MS;
+      if (!shouldRefresh) return;
+
+      task = InteractionManager.runAfterInteractions(() => {
+        loadData({ background: hasCachedSnapshot, force: !hasCachedSnapshot, session }).catch(() => null);
+      });
+    })();
+
+    return () => {
+      cancelled = true;
+      task?.cancel?.();
+    };
+  }, [cacheRouteParams, courseId, hydrateDownloadedMap, loadData]);
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
-    await loadData();
-    setRefreshing(false);
+    try {
+      await loadData({ force: true });
+    } finally {
+      setRefreshing(false);
+    }
   }, [loadData]);
 
   const visual = useMemo(() => getSubjectVisual(subject), [subject]);
 
   const stats = useMemo(() => {
+    if (loading && items.length === 0 && hasWarmShell) {
+      return warmStats;
+    }
+
     const total = items.length;
     const submitted = items.filter((x) => x.submitted).length;
     const pending = items.filter((x) => !x.submitted).length;
     return { total, submitted, pending };
-  }, [items]);
+  }, [hasWarmShell, items, loading, warmStats]);
 
-  if (loading) {
+  if (loading && !hasWarmShell) {
     return (
-      <SafeAreaView style={[styles.center, { paddingTop: insets.top }]}>
-        <ActivityIndicator color={PRIMARY} size="large" />
-      </SafeAreaView>
+      <PageLoadingSkeleton variant="list" style={[styles.screen, { paddingTop: insets.top }]} />
     );
   }
 
@@ -230,6 +433,9 @@ export default function SubjectAssessmentsScreen() {
       <FlatList
         data={items}
         keyExtractor={(i) => i.assessmentId}
+        initialNumToRender={8}
+        maxToRenderPerBatch={8}
+        windowSize={7}
         contentContainerStyle={{
           paddingBottom: Math.max(24, insets.bottom + 16),
         }}
@@ -258,15 +464,15 @@ export default function SubjectAssessmentsScreen() {
               <View style={styles.heroGlowB} />
 
               <View style={styles.heroRow}>
+                <Text numberOfLines={1} style={styles.heroTitleInline}>{subject || "Subject"}</Text>
                 <View style={styles.heroChip}>
                   <MaterialCommunityIcons name={visual.icon} size={14} color={PRIMARY} />
                   <Text style={styles.heroChipText}>School</Text>
                 </View>
               </View>
 
-              <Text style={styles.heroTitle}>{subject || "Subject"}</Text>
               <Text style={styles.heroSubTitle}>Grade {grade || "--"} • Section {section || "--"}</Text>
-              <Text style={styles.heroText}>View available school assessments and continue where needed.</Text>
+              <Text style={styles.heroText}>Download once and open from the phone.</Text>
             </View>
 
             <View style={styles.statsRow}>
@@ -287,21 +493,33 @@ export default function SubjectAssessmentsScreen() {
             <View style={styles.sectionHeader}>
               <Text style={styles.sectionTitle}>Assessments</Text>
               <Text style={styles.sectionSubtitle}>
-                {items.length ? "Tap any card to open it." : "No published assessments yet."}
+                {loading
+                  ? "Loading available assessments..."
+                  : items.length
+                  ? "Download first, then open offline."
+                  : "No published assessments yet."}
               </Text>
             </View>
           </>
         }
         ListEmptyComponent={
-          <View style={styles.emptyWrap}>
-            <View style={styles.emptyIconWrap}>
-              <MaterialCommunityIcons name="clipboard-text-outline" size={28} color={MUTED} />
+          loading ? (
+            <View style={styles.loadingStateWrap}>
+              <ActivityIndicator size="small" color={PRIMARY} />
+              <Text style={styles.loadingStateTitle}>Preparing assessments</Text>
+              <Text style={styles.loadingStateText}>Fetching the latest work for this subject.</Text>
             </View>
-            <Text style={styles.emptyTitle}>No assessments available</Text>
-            <Text style={styles.emptyText}>
-              Your teacher has not published assessments for this subject yet.
-            </Text>
-          </View>
+          ) : (
+            <View style={styles.emptyWrap}>
+              <View style={styles.emptyIconWrap}>
+                <MaterialCommunityIcons name="clipboard-text-outline" size={28} color={MUTED} />
+              </View>
+              <Text style={styles.emptyTitle}>No assessments available</Text>
+              <Text style={styles.emptyText}>
+                Your teacher has not published assessments for this subject yet.
+              </Text>
+            </View>
+          )
         }
         renderItem={({ item, index }) => {
           const status = getAssessmentStatus({
@@ -312,27 +530,16 @@ export default function SubjectAssessmentsScreen() {
 
           const typeMeta = getTypeMeta(item.type);
           const dueLabel = formatDueDate(item.dueDate);
+          const assessmentKey = String(item.assessmentId || "");
+          const downloadPct = Number(downloadProgressMap?.[assessmentKey] || 0);
+          const isDownloading = downloadPct > 0;
+          const isDownloaded = !!downloadedMap?.[assessmentKey];
 
           return (
             <TouchableOpacity
               style={styles.card}
               activeOpacity={0.92}
-              onPress={() =>
-                router.push({
-                  pathname: "/takeAssessment",
-                  params: {
-                    assessmentId: item.assessmentId,
-                    courseId: item.courseId,
-                    title: item.title || "Assessment",
-                    returnTo: "subjectAssessments",
-                    returnCourseId: String(courseId || ""),
-                    returnSubject: String(subject || ""),
-                    returnGrade: String(grade || ""),
-                    returnSection: String(section || ""),
-                    returnExamFilter: String(returnExamFilter || "school"),
-                  },
-                })
-              }
+              onPress={() => handleAssessmentPress(item, isDownloaded)}
             >
               <View style={styles.cardMain}>
                 <View style={styles.cardOrderBadge}>
@@ -377,9 +584,44 @@ export default function SubjectAssessmentsScreen() {
                   )}
                 </View>
 
-                <View style={styles.openWrap}>
-                  <Text style={styles.openText}>{item.submitted ? "Open" : "Start"}</Text>
-                  <Ionicons name="arrow-forward" size={14} color={PRIMARY} />
+                <View style={styles.cardActionRow}>
+                  <TouchableOpacity
+                    activeOpacity={0.9}
+                    disabled={isDownloading}
+                    style={[
+                      styles.downloadWrap,
+                      isDownloaded && styles.downloadWrapDone,
+                      isDownloading && styles.downloadWrapBusy,
+                    ]}
+                    onPress={() => downloadAssessmentToPhone(item)}
+                  >
+                    {isDownloading ? (
+                      <Text style={styles.downloadText}>{Math.round(downloadPct)}%</Text>
+                    ) : (
+                      <>
+                        <Ionicons
+                          name={isDownloaded ? "checkmark-circle" : "cloud-download-outline"}
+                          size={14}
+                          color={isDownloaded ? SUCCESS : PRIMARY}
+                        />
+                        <Text style={[styles.downloadText, isDownloaded && styles.downloadTextDone]}>
+                          {isDownloaded ? "Saved" : "Download"}
+                        </Text>
+                      </>
+                    )}
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    activeOpacity={0.9}
+                    disabled={!isDownloaded}
+                    style={[styles.openWrap, !isDownloaded && styles.openWrapDisabled]}
+                    onPress={() => openAssessment(item)}
+                  >
+                    <Text style={[styles.openText, !isDownloaded && styles.openTextDisabled]}>
+                      {item.submitted ? "Review" : "Open"}
+                    </Text>
+                    <Ionicons name="arrow-forward" size={14} color={!isDownloaded ? MUTED : PRIMARY} />
+                  </TouchableOpacity>
                 </View>
               </View>
             </TouchableOpacity>
@@ -470,7 +712,7 @@ function createStyles(colors) {
   heroRow: {
     flexDirection: "row",
     alignItems: "center",
-    justifyContent: "flex-end",
+    justifyContent: "flex-start",
   },
   heroChip: {
     flexDirection: "row",
@@ -487,6 +729,13 @@ function createStyles(colors) {
     fontSize: 11,
     fontWeight: "800",
     color: PRIMARY,
+  },
+  heroTitleInline: {
+    flex: 1,
+    marginRight: 10,
+    fontSize: 18,
+    fontWeight: "900",
+    color: colors.text,
   },
   heroTitle: {
     marginTop: 6,
@@ -558,6 +807,29 @@ function createStyles(colors) {
     fontSize: 12,
     color: colors.muted,
     fontWeight: "600",
+  },
+
+  loadingStateWrap: {
+    marginHorizontal: 16,
+    marginTop: 8,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 18,
+    padding: 22,
+    alignItems: "center",
+    backgroundColor: colors.card,
+  },
+  loadingStateTitle: {
+    marginTop: 10,
+    color: colors.text,
+    fontSize: 14,
+    fontWeight: "800",
+  },
+  loadingStateText: {
+    marginTop: 4,
+    color: colors.muted,
+    fontSize: 12,
+    textAlign: "center",
   },
 
   emptyWrap: {
@@ -686,6 +958,10 @@ function createStyles(colors) {
     alignItems: "center",
     justifyContent: "space-between",
   },
+  cardActionRow: {
+    flexDirection: "row",
+    alignItems: "center",
+  },
   cardScoreWrap: {
     flex: 1,
   },
@@ -699,6 +975,32 @@ function createStyles(colors) {
     fontWeight: "700",
     fontSize: 11.5,
   },
+  downloadWrap: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: colors.soft,
+    borderRadius: 999,
+    paddingHorizontal: 11,
+    paddingVertical: 7,
+    marginRight: 8,
+    minWidth: 88,
+  },
+  downloadWrapDone: {
+    backgroundColor: `${SUCCESS}14`,
+  },
+  downloadWrapBusy: {
+    opacity: 0.84,
+  },
+  downloadText: {
+    color: PRIMARY,
+    fontWeight: "800",
+    marginLeft: 6,
+    fontSize: 11.5,
+  },
+  downloadTextDone: {
+    color: SUCCESS,
+  },
   openWrap: {
     flexDirection: "row",
     alignItems: "center",
@@ -707,11 +1009,17 @@ function createStyles(colors) {
     paddingHorizontal: 11,
     paddingVertical: 7,
   },
+  openWrapDisabled: {
+    backgroundColor: colors.inputBackground,
+  },
   openText: {
     color: PRIMARY,
     fontWeight: "800",
     marginRight: 6,
     fontSize: 11.5,
+  },
+  openTextDisabled: {
+    color: MUTED,
   },
 });
 }

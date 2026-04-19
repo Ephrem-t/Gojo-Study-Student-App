@@ -20,7 +20,7 @@ import { StatusBar } from "expo-status-bar";
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { ref, query, orderByChild, equalTo, get } from "firebase/database";
+import { ref, query, orderByChild, equalTo, get } from "../lib/offlineDatabase";
 import { database } from "../constants/firebaseConfig";
 import {
   SESSION_AUTH_KEYS,
@@ -31,6 +31,7 @@ import {
   isStudentSessionValid,
 } from "../constants/session";
 import { useAppTheme } from "../hooks/use-app-theme";
+import PageLoadingSkeleton from "../components/ui/page-loading-skeleton";
 
 export const options = { headerShown: false };
 
@@ -299,14 +300,7 @@ export default function LoginScreen() {
     return (
       <SafeAreaView style={styles.safe} edges={["top", "left", "right", "bottom"]}>
         <StatusBar style={statusBarStyle} />
-        <View style={styles.bootWrap}>
-          <View style={styles.bootCard}>
-            <Image source={require("../assets/images/login-logo.png")} style={styles.bootLogo} resizeMode="contain" />
-            <ActivityIndicator color={colors.primary} size="large" />
-            <Text style={styles.bootTitle}>Preparing your workspace</Text>
-            <Text style={styles.bootText}>Checking your saved student session.</Text>
-          </View>
-        </View>
+        <PageLoadingSkeleton variant="auth" style={styles.safe} />
       </SafeAreaView>
     );
   }

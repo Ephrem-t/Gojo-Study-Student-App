@@ -17,12 +17,14 @@ import {
 import { Ionicons } from "@expo/vector-icons";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { ref, get } from "firebase/database";
+import { ref, get } from "../lib/offlineDatabase";
 import { database } from "../constants/firebaseConfig";
 import { useAppTheme } from "../hooks/use-app-theme";
 import { getSnapshot } from "./lib/dbHelpers";
 import { queryUserByUsernameInSchool, queryUserByChildInSchool } from "./lib/userHelpers";
 import { extractProfileImage } from "./lib/profileImage";
+import { readScreenCache, writeScreenCache } from "../lib/appOfflineCache";
+import PageLoadingSkeleton from "../components/ui/page-loading-skeleton";
 
 const C = {
   primary: "#0B72FF",
@@ -298,6 +300,30 @@ export default function LeaderboardScreen() {
   const secondAnim = useRef(new Animated.Value(0)).current;
   const thirdAnim = useRef(new Animated.Value(0)).current;
 
+  const hydrateCachedLeaderboard = useCallback(async () => {
+    const sid =
+      (await AsyncStorage.getItem("studentNodeKey")) ||
+      (await AsyncStorage.getItem("studentId")) ||
+      (await AsyncStorage.getItem("username")) ||
+      "anonymous";
+
+    const cached = await readScreenCache("leaderboard", [sid]);
+    if (!cached) return false;
+
+    setCountry(cached.country || "Ethiopia");
+    setSchoolCode(cached.schoolCode || null);
+    setSchoolName(cached.schoolName || null);
+    setGrade(cached.grade || "7");
+    setCountryRows(Array.isArray(cached.countryRows) ? cached.countryRows : []);
+    setSchoolRows(Array.isArray(cached.schoolRows) ? cached.schoolRows : []);
+    setMyUserId(cached.myUserId || null);
+    if (!requestedScope && cached.scope) {
+      setScope(cached.scope);
+    }
+    setLoading(false);
+    return true;
+  }, [requestedScope]);
+
   const enrichRows = useCallback(async (valObj, activeGrade) => {
     const targetGrade = normalizeGrade(activeGrade);
     const base = Object.keys(valObj || {}).map((uid) => ({
@@ -329,68 +355,85 @@ export default function LeaderboardScreen() {
     return resolved.filter((r) => !!r.studentGrade && r.studentGrade === targetGrade);
   }, []);
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  const load = useCallback(async (options = {}) => {
+    const silent = Boolean(options?.silent);
+    if (!silent) setLoading(true);
 
-    const sid =
-      (await AsyncStorage.getItem("studentNodeKey")) ||
-      (await AsyncStorage.getItem("studentId")) ||
-      (await AsyncStorage.getItem("username")) ||
-      null;
-    setMyUserId(sid);
+    try {
+      const sid =
+        (await AsyncStorage.getItem("studentNodeKey")) ||
+        (await AsyncStorage.getItem("studentId")) ||
+        (await AsyncStorage.getItem("username")) ||
+        null;
+      setMyUserId(sid);
 
-    const gradeRaw = await AsyncStorage.getItem("studentGrade");
-    const g = normalizeGrade(gradeRaw) || "7";
-    setGrade(g);
+      const gradeRaw = await AsyncStorage.getItem("studentGrade");
+      const g = normalizeGrade(gradeRaw) || "7";
+      setGrade(g);
 
-    const countrySnap = await getSnapshot([`Platform1/country`, `country`]);
-    const c = (countrySnap?.val && countrySnap.val()) || "Ethiopia";
-    setCountry(c);
+      const countrySnap = await getSnapshot([`Platform1/country`, `country`]);
+      const c = (countrySnap?.val && countrySnap.val()) || "Ethiopia";
+      setCountry(c);
 
-    let mySchool = null;
-    if (sid) {
-      try {
-        const pref = String(sid).slice(0, 3).toUpperCase();
-        const idx = await get(ref(database, `Platform1/schoolCodeIndex/${pref}`));
-        mySchool = idx?.val() || null;
-      } catch {}
-    }
-    setSchoolCode(mySchool);
-    if (mySchool) {
-      try {
-        const schoolInfoSnap = await get(ref(database, `Platform1/Schools/${mySchool}/schoolInfo`));
-        const info = schoolInfoSnap?.exists() ? schoolInfoSnap.val() : null;
-        setSchoolName(info?.name || info?.schoolName || mySchool);
-      } catch {
-        setSchoolName(mySchool);
+      let mySchool = null;
+      if (sid) {
+        try {
+          const pref = String(sid).slice(0, 3).toUpperCase();
+          const idx = await get(ref(database, `Platform1/schoolCodeIndex/${pref}`));
+          mySchool = idx?.val() || null;
+        } catch {}
       }
-    } else {
-      setSchoolName(null);
+      setSchoolCode(mySchool);
+      if (mySchool) {
+        try {
+          const schoolInfoSnap = await get(ref(database, `Platform1/Schools/${mySchool}/schoolInfo`));
+          const info = schoolInfoSnap?.exists() ? schoolInfoSnap.val() : null;
+          setSchoolName(info?.name || info?.schoolName || mySchool);
+        } catch {
+          setSchoolName(mySchool);
+        }
+      } else {
+        setSchoolName(null);
+      }
+
+      const gradeKey = `grade${g}`;
+      const countryPath = `Platform1/rankings/country/${c}/${gradeKey}/leaderboard`;
+      const schoolPath = mySchool ? `Platform1/rankings/schools/${mySchool}/${gradeKey}/leaderboard` : null;
+
+      const countrySnapLb = await getSnapshot([countryPath]);
+      const countryVal = countrySnapLb?.val ? countrySnapLb.val() : null;
+      const enrichedCountry = countryVal ? await enrichRows(countryVal, g) : [];
+      setCountryRows(enrichedCountry);
+
+      if (schoolPath) {
+        const schoolSnapLb = await getSnapshot([schoolPath]);
+        const schoolValRaw = schoolSnapLb?.val ? schoolSnapLb.val() : null;
+        const schoolVal = schoolValRaw?.leaderboard || schoolValRaw;
+        const enrichedSchool = schoolVal ? await enrichRows(schoolVal, g) : [];
+        setSchoolRows(enrichedSchool);
+      } else {
+        setSchoolRows([]);
+      }
+    } catch (error) {
+      console.warn("Leaderboard load error:", error);
+    } finally {
+      if (!silent) setLoading(false);
     }
-
-    const gradeKey = `grade${g}`;
-    const countryPath = `Platform1/rankings/country/${c}/${gradeKey}/leaderboard`;
-    const schoolPath = mySchool ? `Platform1/rankings/schools/${mySchool}/${gradeKey}/leaderboard` : null;
-
-    const countrySnapLb = await getSnapshot([countryPath]);
-    const countryVal = countrySnapLb?.val ? countrySnapLb.val() : null;
-    const enrichedCountry = countryVal ? await enrichRows(countryVal, g) : [];
-    setCountryRows(enrichedCountry);
-
-    if (schoolPath) {
-      const schoolSnapLb = await getSnapshot([schoolPath]);
-      const schoolValRaw = schoolSnapLb?.val ? schoolSnapLb.val() : null;
-      const schoolVal = schoolValRaw?.leaderboard || schoolValRaw;
-      const enrichedSchool = schoolVal ? await enrichRows(schoolVal, g) : [];
-      setSchoolRows(enrichedSchool);
-    } else {
-      setSchoolRows([]);
-    }
-
-    setLoading(false);
   }, [enrichRows]);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    let active = true;
+
+    (async () => {
+      const hadCache = await hydrateCachedLeaderboard();
+      if (!active) return;
+      await load({ silent: hadCache });
+    })();
+
+    return () => {
+      active = false;
+    };
+  }, [hydrateCachedLeaderboard, load]);
 
   useEffect(() => {
     if (requestedScope === "country") {
@@ -408,6 +451,29 @@ export default function LeaderboardScreen() {
     await load();
     setRefreshing(false);
   }, [load]);
+
+  useEffect(() => {
+    if (loading) return;
+
+    (async () => {
+      const sid =
+        (await AsyncStorage.getItem("studentNodeKey")) ||
+        (await AsyncStorage.getItem("studentId")) ||
+        (await AsyncStorage.getItem("username")) ||
+        "anonymous";
+
+      await writeScreenCache("leaderboard", [sid], {
+        country,
+        schoolCode,
+        schoolName,
+        grade,
+        scope,
+        countryRows,
+        schoolRows,
+        myUserId,
+      });
+    })();
+  }, [loading, country, schoolCode, schoolName, grade, scope, countryRows, schoolRows, myUserId]);
 
   const rows = useMemo(
     () => (scope === "school" ? schoolRows : countryRows),
@@ -587,12 +653,7 @@ export default function LeaderboardScreen() {
 
   if (loading) {
     return (
-      <SafeAreaView style={styles.screen}>
-        <StatusBar barStyle={statusBarStyle} backgroundColor={colors.background} />
-        <View style={styles.center}>
-          <ActivityIndicator color={C.primary} />
-        </View>
-      </SafeAreaView>
+      <PageLoadingSkeleton variant="list" style={styles.screen} />
     );
   }
 

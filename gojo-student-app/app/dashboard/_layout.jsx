@@ -1,16 +1,17 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Tabs, useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
-import { Text, TouchableOpacity, View, Image, StyleSheet, Platform } from "react-native";
+import { Text, TouchableOpacity, View, Image, StyleSheet, Platform, InteractionManager } from "react-native";
 import * as NavigationBar from "expo-navigation-bar";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { ref, get, onValue, off, query, orderByChild, equalTo } from "firebase/database";
+import { ref, get, onValue, query, orderByChild, equalTo, update } from "../../lib/offlineDatabase";
 import { database } from "../../constants/firebaseConfig";
 import { StatusBar } from "expo-status-bar";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useAppTheme } from "../../hooks/use-app-theme";
 import { useAppLock } from "../../hooks/use-app-lock";
 import { extractProfileImage, normalizeProfileImageUri } from "../lib/profileImage";
+import { persistUnreadTotal, readCachedUnreadTotal, subscribeUnreadTotal } from "../../lib/chatCache";
 
 export default function DashboardLayout() {
   const router = useRouter();
@@ -52,15 +53,39 @@ export default function DashboardLayout() {
 
   useEffect(() => {
     let mounted = true;
+    let unsubscribeUnreadCache = () => {};
+    let unsubscribeUnreadNode = () => {};
+    let hasSeededUnreadTotal = false;
+    let deferredInitTask = null;
+
+    unsubscribeUnreadCache = subscribeUnreadTotal((nextUnreadTotal) => {
+      if (mounted) setTotalUnread(Math.max(0, Number(nextUnreadTotal || 0)));
+    });
 
     (async () => {
       try {
-        const userNodeKey = await AsyncStorage.getItem("userNodeKey");
-        const studentNodeKey = await AsyncStorage.getItem("studentNodeKey");
-        const userId = await AsyncStorage.getItem("userId");
-        const username = await AsyncStorage.getItem("username");
-        const studentId = await AsyncStorage.getItem("studentId");
-        const storedSchoolKey = await AsyncStorage.getItem("schoolKey");
+        const cachedUnread = await readCachedUnreadTotal();
+        if (mounted) setTotalUnread(cachedUnread);
+      } catch {}
+    })();
+
+    const initDashboardChrome = async () => {
+      try {
+        const pairs = await AsyncStorage.multiGet([
+          "userNodeKey",
+          "studentNodeKey",
+          "userId",
+          "username",
+          "studentId",
+          "schoolKey",
+        ]);
+        const session = Object.fromEntries(pairs);
+        const userNodeKey = session.userNodeKey || null;
+        const studentNodeKey = session.studentNodeKey || null;
+        const userId = session.userId || null;
+        const username = session.username || null;
+        const studentId = session.studentId || null;
+        const storedSchoolKey = session.schoolKey || null;
 
         const resolveSchoolKey = async () => {
           if (storedSchoolKey) return storedSchoolKey;
@@ -207,49 +232,82 @@ export default function DashboardLayout() {
           ? `Platform1/Schools/${schoolKey}/Chats`
           : "Chats";
 
-        const chatsRef = ref(database, chatsRefPath);
+        const unreadTotalPath = schoolKey
+          ? `Platform1/Schools/${schoolKey}/ChatUnreadTotals/${userId}`
+          : `ChatUnreadTotals/${userId}`;
 
-        const listener = (snap) => {
-          if (!snap.exists()) {
-            setTotalUnread(0);
-            return;
-          }
+        const seedUnreadCount = async () => {
+          if (hasSeededUnreadTotal) return;
+          hasSeededUnreadTotal = true;
 
-          let total = 0;
-          snap.forEach((chatSnap) => {
-            const unreadNode = chatSnap.child("unread");
-            if (unreadNode.exists()) {
-              const val = unreadNode.child(userId).val();
-              if (typeof val === "number") total += val;
+          try {
+            const chatsSnap = await get(ref(database, chatsRefPath));
+            let total = 0;
+
+            if (chatsSnap.exists()) {
+              chatsSnap.forEach((chatSnap) => {
+                const unreadNode = chatSnap.child("unread");
+                if (!unreadNode.exists()) return;
+                const val = unreadNode.child(userId).val();
+                if (typeof val === "number") total += val;
+              });
             }
-          });
 
-          setTotalUnread(total);
+            if (mounted) setTotalUnread(total);
+            await persistUnreadTotal(total, Date.now()).catch(() => {});
+            await update(ref(database), { [unreadTotalPath]: total }).catch(() => {});
+          } catch (error) {
+            hasSeededUnreadTotal = false;
+            console.warn("Unread seed error:", error);
+          }
         };
 
-        onValue(chatsRef, listener);
-        chatsCleanupRef.current = () => {
-          try {
-            off(chatsRef, "value", listener);
-          } catch {
-            try {
-              off(chatsRef);
-            } catch {}
+        unsubscribeUnreadNode = onValue(
+          ref(database, unreadTotalPath),
+          (snapshot) => {
+            if (!mounted) return;
+
+            if (!snapshot.exists()) {
+              seedUnreadCount().catch(() => {});
+              return;
+            }
+
+            const nextUnreadTotal = Math.max(0, Number(snapshot.val() || 0));
+            setTotalUnread(nextUnreadTotal);
+            persistUnreadTotal(nextUnreadTotal, Date.now()).catch(() => {});
+          },
+          () => {
+            seedUnreadCount().catch(() => {});
           }
+        );
+
+        chatsCleanupRef.current = () => {
+          unsubscribeUnreadNode();
+          unsubscribeUnreadCache();
         };
       } catch (err) {
         console.warn("Dashboard layout init error:", err);
       }
-    })();
+    };
+
+    deferredInitTask = InteractionManager.runAfterInteractions(() => {
+      initDashboardChrome().catch((err) => {
+        console.warn("Dashboard layout deferred init error:", err);
+      });
+    });
 
     return () => {
       mounted = false;
+      deferredInitTask?.cancel?.();
+      deferredInitTask = null;
       if (chatsCleanupRef.current) {
         try {
           chatsCleanupRef.current();
         } catch {}
         chatsCleanupRef.current = null;
       }
+      unsubscribeUnreadNode();
+      unsubscribeUnreadCache();
     };
   }, []);
 
@@ -409,6 +467,8 @@ export default function DashboardLayout() {
         initialRouteName="home"
         tabBar={(props) => <DashboardTabBar {...props} />}
         screenOptions={{
+          lazy: true,
+          freezeOnBlur: true,
           headerStyle: { backgroundColor: colors.tabBar },
           headerShadowVisible: false,
           headerTitleAlign: "left",

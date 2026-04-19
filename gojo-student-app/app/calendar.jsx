@@ -3,7 +3,6 @@ import {
   View,
   Text,
   StyleSheet,
-  ActivityIndicator,
   TouchableOpacity,
   ScrollView,
   RefreshControl,
@@ -11,13 +10,14 @@ import {
   Pressable,
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { ref, get } from "firebase/database";
+import { ref, get } from "../lib/offlineDatabase";
 import { database } from "../constants/firebaseConfig";
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
 import { SafeAreaView } from "react-native-safe-area-context";
 import * as EthiopianDate from "ethiopian-date";
 import { useAppTheme } from "../hooks/use-app-theme";
+import PageLoadingSkeleton from "../components/ui/page-loading-skeleton";
 
 const CAT_COLORS = {
   academic: "#16A34A",
@@ -584,6 +584,9 @@ export default function CalendarTab() {
       null;
 
     if (userNodeKey) {
+      const resolvedFromUserKeyPrefix = await resolveBySchoolCodeIndex(String(userNodeKey).slice(0, 3));
+      if (resolvedFromUserKeyPrefix) return resolvedFromUserKeyPrefix;
+
       const userPaths = [
         `Users/${userNodeKey}`,
         `Students/${userNodeKey}`,
@@ -603,38 +606,7 @@ export default function CalendarTab() {
       }
     }
 
-    const [schoolsRootSnap, schoolsP1Snap] = await Promise.all([
-      get(ref(database, "Schools")).catch(() => null),
-      get(ref(database, "Platform1/Schools")).catch(() => null),
-    ]);
-
-    const pickFromSchoolsSnap = (schoolsSnap) => {
-      if (!schoolsSnap?.exists()) return null;
-
-      let fallbackKey = null;
-      schoolsSnap.forEach((child) => {
-        if (fallbackKey) return true;
-        const hasCalendarEvents = !!child.child("CalendarEvents")?.exists();
-        if (hasCalendarEvents) {
-          fallbackKey = child.key;
-          return true;
-        }
-        return false;
-      });
-
-      if (fallbackKey) return fallbackKey;
-
-      let firstKey = null;
-      schoolsSnap.forEach((child) => {
-        if (firstKey) return true;
-        firstKey = child.key;
-        return true;
-      });
-
-      return firstKey;
-    };
-
-    return pickFromSchoolsSnap(schoolsRootSnap) || pickFromSchoolsSnap(schoolsP1Snap) || null;
+    return null;
   };
 
   const fetchCalendarEvents = async () => {
@@ -927,8 +899,7 @@ export default function CalendarTab() {
   if (loading) {
     return (
       <SafeAreaView style={styles.loadingWrap} edges={["top"]}>
-        <ActivityIndicator size="large" color={colors.primary} />
-        <Text style={styles.loadingText}>Loading calendar...</Text>
+        <PageLoadingSkeleton variant="list" style={styles.loadingWrap} />
       </SafeAreaView>
     );
   }

@@ -1,4 +1,4 @@
-import { get, ref } from "firebase/database";
+import { get, ref } from "../../lib/offlineDatabase";
 import { database } from "../../constants/firebaseConfig";
 import { queryUserByUsernameInSchool, queryUserByChildInSchool } from "./userHelpers";
 

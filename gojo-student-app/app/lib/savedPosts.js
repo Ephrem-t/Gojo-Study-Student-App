@@ -1,5 +1,5 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { get, ref, remove, set } from "firebase/database";
+import { get, ref, remove, set } from "../../lib/offlineDatabase";
 import { database } from "../../constants/firebaseConfig";
 
 function getPostsBasePath(schoolKey) {

@@ -21,7 +21,7 @@ import {
   useWindowDimensions,
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { ref, get, remove, update } from "firebase/database";
+import { ref, get, remove, update } from "../../lib/offlineDatabase";
 import { database } from "../../constants/firebaseConfig";
 import { Ionicons } from "@expo/vector-icons";
 import * as FileSystem from "expo-file-system/legacy";
@@ -36,6 +36,7 @@ import {
 import { useRouter, useFocusEffect } from "expo-router";
 import NativePdfView, { nativePdfUnavailableMessage } from "../../components/native-pdf-view";
 import { useAppTheme } from "../../hooks/use-app-theme";
+import PageLoadingSkeleton from "../../components/ui/page-loading-skeleton";
 
 const MAX_NOTES_PER_CHAPTER = 5;
 
@@ -2278,11 +2279,7 @@ export default function BooksScreen() {
   }
 
   if (loading) {
-    return (
-      <View style={styles.center}>
-        <ActivityIndicator size="large" color={PRIMARY} />
-      </View>
-    );
+    return <PageLoadingSkeleton variant="library" showHeader={false} style={{ flex: 1, backgroundColor: colors.background }} />;
   }
 
   if (!subjects.length) {

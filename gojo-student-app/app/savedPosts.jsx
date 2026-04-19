@@ -1,6 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  ActivityIndicator,
   Alert,
   Animated,
   FlatList,
@@ -17,7 +16,7 @@ import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context"
 import { Ionicons } from "@expo/vector-icons";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useRouter } from "expo-router";
-import { get, ref, runTransaction } from "firebase/database";
+import { get, ref, runTransaction } from "../lib/offlineDatabase";
 import { database } from "../constants/firebaseConfig";
 import { useAppTheme } from "../hooks/use-app-theme";
 import useUserProfileCard from "../hooks/use-user-profile-card";
@@ -25,6 +24,7 @@ import { getImageAspectRatio } from "./lib/instagramMedia";
 import { extractProfileImage, normalizeProfileImageUri } from "./lib/profileImage";
 import { getSavedPostsLocation, getSavedPostsMap, setSavedPostEntry } from "./lib/savedPosts";
 import { queryUserByChildInSchool, queryUserByUsernameInSchool } from "./lib/userHelpers";
+import PageLoadingSkeleton from "../components/ui/page-loading-skeleton";
 
 const DESCRIPTION_PREVIEW_LENGTH = 140;
 
@@ -500,9 +500,7 @@ export default function SavedPostsScreen() {
       </View>
 
       {loading ? (
-        <View style={styles.center}>
-          <ActivityIndicator size="large" color={colors.primary} />
-        </View>
+        <PageLoadingSkeleton variant="feed" showHeader={false} style={{ flex: 1, backgroundColor: colors.background }} />
       ) : posts.length === 0 ? (
         <EmptyState />
       ) : (
