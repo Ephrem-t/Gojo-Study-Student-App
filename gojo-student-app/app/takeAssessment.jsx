@@ -89,6 +89,11 @@ export default function TakeAssessment() {
 
   const handleBackNavigation = () => {
     if (String(params?.returnTo || "") === "subjectAssessments") {
+      if (router.canGoBack()) {
+        router.back();
+        return;
+      }
+
       router.replace({
         pathname: "/subjectAssessments",
         params: {
@@ -102,7 +107,16 @@ export default function TakeAssessment() {
       });
       return;
     }
-    router.back();
+
+    if (router.canGoBack()) {
+      router.back();
+      return;
+    }
+
+    router.replace({
+      pathname: "/dashboard/exam",
+      params: { activeFilter: String(params?.returnExamFilter || "school") },
+    });
   };
 
   const [loading, setLoading] = useState(true);

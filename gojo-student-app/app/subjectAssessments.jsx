@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback, useMemo } from "react";
+import React, { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import {
   View,
   Text,
@@ -190,13 +190,27 @@ export default function SubjectAssessmentsScreen() {
 
   const handleBackNavigation = useCallback(() => {
     if (String(returnTo || "") === "exam") {
+      if (router.canGoBack()) {
+        router.back();
+        return;
+      }
+
       router.replace({
         pathname: "/dashboard/exam",
         params: { activeFilter: String(returnExamFilter || "school") },
       });
       return;
     }
-    router.back();
+
+    if (router.canGoBack()) {
+      router.back();
+      return;
+    }
+
+    router.replace({
+      pathname: "/dashboard/exam",
+      params: { activeFilter: String(returnExamFilter || "school") },
+    });
   }, [returnTo, returnExamFilter, router]);
 
   const [loading, setLoading] = useState(true);
@@ -205,9 +219,34 @@ export default function SubjectAssessmentsScreen() {
   const [sessionInfo, setSessionInfo] = useState(null);
   const [downloadedMap, setDownloadedMap] = useState({});
   const [downloadProgressMap, setDownloadProgressMap] = useState({});
+  const sessionInfoRef = useRef(null);
+
+  const storeSessionInfo = useCallback((nextSession) => {
+    const normalized = nextSession
+      ? {
+          studentId: nextSession?.studentId || null,
+          schoolKey: nextSession?.schoolKey || null,
+        }
+      : null;
+
+    sessionInfoRef.current = normalized;
+
+    setSessionInfo((prev) => {
+      const prevStudentId = prev?.studentId || null;
+      const prevSchoolKey = prev?.schoolKey || null;
+      const nextStudentId = normalized?.studentId || null;
+      const nextSchoolKey = normalized?.schoolKey || null;
+
+      if (prevStudentId === nextStudentId && prevSchoolKey === nextSchoolKey) {
+        return prev;
+      }
+
+      return normalized;
+    });
+  }, []);
 
   const hydrateDownloadedMap = useCallback(async (assessmentItems = [], session = null) => {
-    const activeSession = session || sessionInfo || await readAssessmentSession();
+    const activeSession = session || sessionInfoRef.current || await readAssessmentSession();
     const sid = activeSession?.studentId || null;
     if (!sid || !Array.isArray(assessmentItems) || !assessmentItems.length) {
       setDownloadedMap({});
@@ -216,7 +255,7 @@ export default function SubjectAssessmentsScreen() {
 
     const nextMap = await readDownloadedAssessmentStateMap(sid, assessmentItems);
     setDownloadedMap(nextMap);
-  }, [sessionInfo]);
+  }, []);
 
   const openAssessment = useCallback((item) => {
     router.push({
@@ -258,7 +297,7 @@ export default function SubjectAssessmentsScreen() {
       sk = await resolveSchoolKeyFast(sid);
     }
 
-    setSessionInfo({ studentId: sid, schoolKey: sk || null });
+    storeSessionInfo({ studentId: sid, schoolKey: sk || null });
     setDownloadProgressMap((prev) => ({ ...prev, [assessmentKey]: 8 }));
 
     try {
@@ -275,7 +314,7 @@ export default function SubjectAssessmentsScreen() {
       setDownloadProgressMap((prev) => ({ ...prev, [assessmentKey]: 0 }));
       Alert.alert("Download failed", error?.message || "Could not download this assessment.");
     }
-  }, [downloadProgressMap, sessionInfo]);
+  }, [downloadProgressMap, sessionInfo, storeSessionInfo]);
 
   const handleAssessmentPress = useCallback((item, isDownloaded) => {
     if (!isDownloaded) {
@@ -291,7 +330,7 @@ export default function SubjectAssessmentsScreen() {
     const force = Boolean(options?.force);
     const session = options?.session || await readAssessmentSession();
     const sid = session?.studentId || null;
-    setSessionInfo(session || null);
+    storeSessionInfo(session || null);
 
     if (!background) {
       setLoading(true);
@@ -360,7 +399,7 @@ export default function SubjectAssessmentsScreen() {
         setLoading(false);
       }
     }
-  }, [cacheRouteParams, courseId, hydrateDownloadedMap]);
+  }, [cacheRouteParams, courseId, hydrateDownloadedMap, storeSessionInfo]);
 
   useEffect(() => {
     let cancelled = false;
@@ -368,7 +407,7 @@ export default function SubjectAssessmentsScreen() {
 
     (async () => {
       const session = await readAssessmentSession();
-      setSessionInfo(session || null);
+      storeSessionInfo(session || null);
       const sid = session?.studentId || null;
       const cached = sid && courseId
         ? await readCachedSubjectAssessments({ studentId: sid, ...cacheRouteParams })
@@ -398,7 +437,7 @@ export default function SubjectAssessmentsScreen() {
       cancelled = true;
       task?.cancel?.();
     };
-  }, [cacheRouteParams, courseId, hydrateDownloadedMap, loadData]);
+  }, [cacheRouteParams, courseId, hydrateDownloadedMap, loadData, storeSessionInfo]);
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
