@@ -1,33 +1,35 @@
-import React, { useEffect, useState, useCallback, useRef } from "react";
+import React, { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import {
   View,
   Text,
   StyleSheet,
   FlatList,
   TouchableOpacity,
-  ActivityIndicator,
   Image,
   StatusBar,
-  Alert,
   ScrollView,
   RefreshControl,
+  TextInput,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { ref, get } from "firebase/database";
+import { ref, get } from "../lib/offlineDatabase";
 import { database } from "../constants/firebaseConfig";
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
 import { setOpenedChat } from "./lib/chatStore";
 import { useFocusEffect } from "@react-navigation/native";
 import { getUserVal } from "./lib/userHelpers";
+import { useAppTheme } from "../hooks/use-app-theme";
+import useUserProfileCard from "../hooks/use-user-profile-card";
+import { extractProfileImage, normalizeProfileImageUri } from "./lib/profileImage";
+import { persistChatsCache, readChatsCache, readChatsCacheFetchedAt } from "../lib/chatCache";
+import PageLoadingSkeleton from "../components/ui/page-loading-skeleton";
 
-const PRIMARY = "#007AFB";
-const MUTED = "#6B78A8";
 const AVATAR_PLACEHOLDER = require("../assets/images/avatar_placeholder.png");
 
-const FILTERS = ["All", "Management", "Teachers", "Parents"];
-const debounceWindowMs = 15 * 1000;
+const FILTERS = ["Parents", "Teachers", "Management", "Support"];
+const debounceWindowMs = 60 * 1000;
 
 function shortText(s, n = 60) {
   if (!s && s !== 0) return "";
@@ -51,12 +53,18 @@ function fmtTime12(ts) {
 
 export default function ChatsScreen() {
   const router = useRouter();
+  const { colors, statusBarStyle } = useAppTheme();
+  const MUTED = colors.muted;
+  const styles = useMemo(() => createStyles(colors), [colors]);
+  const { openUserProfile, profileCardModal } = useUserProfileCard();
 
   const [loadingInitial, setLoadingInitial] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [filter, setFilter] = useState("All");
+  const [filter, setFilter] = useState(FILTERS[0]);
   const [contacts, setContacts] = useState([]);
   const [currentUserId, setCurrentUserId] = useState(null);
+  const [searchActive, setSearchActive] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
 
   const cacheRef = useRef({
     studentNodeKey: null,
@@ -64,8 +72,6 @@ export default function ChatsScreen() {
     teacherNodeKeys: null,
   });
   const lastFetchedAtRef = useRef(0);
-
-  const makeDeterministicChatId = (a, b) => `${a}_${b}`;
 
   async function getDbRef(subPath) {
     const sk = (await AsyncStorage.getItem("schoolKey")) || null;
@@ -93,16 +99,13 @@ export default function ChatsScreen() {
 
   const loadCacheAndShow = async () => {
     try {
-      const raw = await AsyncStorage.getItem("chatsCache");
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          setContacts(parsed);
-          setLoadingInitial(false);
-          const fetchedAt = Number((await AsyncStorage.getItem("chatsCacheFetchedAt")) || 0);
-          lastFetchedAtRef.current = fetchedAt;
-          return true;
-        }
+      const parsed = await readChatsCache();
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        setContacts(parsed);
+        setLoadingInitial(false);
+        const fetchedAt = await readChatsCacheFetchedAt();
+        lastFetchedAtRef.current = fetchedAt;
+        return true;
       }
     } catch {}
     return false;
@@ -202,6 +205,7 @@ export default function ChatsScreen() {
 
       // management sources: School_Admins + Registerers + Finances (NO HR)
       const managementMap = new Map(); // userId -> role label
+      const supportMap = new Map(); // userId -> role label
 
       try {
         const saSnap = await get(await getDbRef("School_Admins"));
@@ -233,10 +237,31 @@ export default function ChatsScreen() {
         }
       } catch {}
 
+      try {
+        const supportSnap = await get(await getDbRef("Support"));
+        if (supportSnap.exists()) {
+          supportSnap.forEach((child) => {
+            const v = child.val();
+            if (v?.userId) supportMap.set(String(v.userId), "Support");
+          });
+        }
+      } catch {}
+
+      try {
+        const supportsSnap = await get(await getDbRef("Supports"));
+        if (supportsSnap.exists()) {
+          supportsSnap.forEach((child) => {
+            const v = child.val();
+            if (v?.userId) supportMap.set(String(v.userId), "Support");
+          });
+        }
+      } catch {}
+
       const userNodeKeysToLoad = new Set([
         ...Array.from(teacherUserNodeKeys),
         ...Array.from(parentUserNodeKeys),
         ...Array.from(managementMap.keys()),
+        ...Array.from(supportMap.keys()),
       ]);
 
       const userProfiles = {};
@@ -259,7 +284,7 @@ export default function ChatsScreen() {
           userId: p?.userId || nodeK,
           name: p?.name || p?.username || "Teacher",
           role: "Teacher",
-          profileImage: p?.profileImage || null,
+          profileImage: extractProfileImage(p),
           type: "teacher",
           chatId: null,
           lastMessage: null,
@@ -278,7 +303,7 @@ export default function ChatsScreen() {
           userId: p?.userId || nodeK,
           name: p?.name || p?.username || "Parent",
           role: "Parent",
-          profileImage: p?.profileImage || null,
+          profileImage: extractProfileImage(p),
           type: "parent",
           chatId: null,
           lastMessage: null,
@@ -299,8 +324,29 @@ export default function ChatsScreen() {
           userId: p?.userId || nodeK,
           name: p?.name || p?.username || roleLabel,
           role: roleLabel, // Registerer / Finance / Management
-          profileImage: p?.profileImage || null,
+          profileImage: extractProfileImage(p),
           type: "management",
+          chatId: null,
+          lastMessage: null,
+          lastTime: null,
+          lastSenderId: null,
+          lastSeen: false,
+          unread: 0,
+        });
+      }
+
+      for (const nodeK of Array.from(supportMap.keys())) {
+        if (contactsMap.has(nodeK)) continue;
+        const p = userProfiles[nodeK] || null;
+        const roleLabel = supportMap.get(nodeK) || "Support";
+
+        contactsMap.set(nodeK, {
+          key: nodeK,
+          userId: p?.userId || nodeK,
+          name: p?.name || p?.username || roleLabel,
+          role: roleLabel,
+          profileImage: extractProfileImage(p),
+          type: "support",
           chatId: null,
           lastMessage: null,
           lastTime: null,
@@ -358,9 +404,9 @@ export default function ChatsScreen() {
       setContacts(fresh);
 
       try {
-        await AsyncStorage.setItem("chatsCache", JSON.stringify(fresh));
-        await AsyncStorage.setItem("chatsCacheFetchedAt", String(Date.now()));
-        lastFetchedAtRef.current = Date.now();
+        const fetchedAt = Date.now();
+        await persistChatsCache(fresh, fetchedAt);
+        lastFetchedAtRef.current = fetchedAt;
       } catch {}
     } catch (err) {
       console.warn("loadData error", err);
@@ -374,7 +420,7 @@ export default function ChatsScreen() {
     (async () => {
       await loadCacheAndShow();
       try {
-        const fetchedAt = Number((await AsyncStorage.getItem("chatsCacheFetchedAt")) || 0);
+        const fetchedAt = await readChatsCacheFetchedAt();
         if (!fetchedAt || Date.now() - fetchedAt > debounceWindowMs) loadData({ background: true });
         else lastFetchedAtRef.current = fetchedAt;
       } catch {
@@ -397,103 +443,123 @@ export default function ChatsScreen() {
     loadData({ background: false });
   }, [loadData]);
 
+  const onBackPress = useCallback(() => {
+    if (searchActive) {
+      setSearchActive(false);
+      setSearchQuery("");
+      return;
+    }
+
+    router.back();
+  }, [router, searchActive]);
+
   const onOpenChat = async (contact) => {
     if (!contact) return;
 
-    let contactUserId = contact.userId || "";
-    if (!contactUserId) {
-      try {
-        const p = await getUserVal(contact.key);
-        contactUserId = p?.userId || contact.key;
-      } catch {
-        contactUserId = contact.key;
-      }
-    }
-
-    let myUserId = await AsyncStorage.getItem("userId");
-    if (!myUserId) {
-      const nk =
-        (await AsyncStorage.getItem("userNodeKey")) ||
-        (await AsyncStorage.getItem("studentNodeKey")) ||
-        (await AsyncStorage.getItem("studentId")) ||
-        null;
-      if (nk) {
-        try {
-          const u = await getUserVal(nk);
-          myUserId = u?.userId || nk;
-        } catch {
-          myUserId = nk;
-        }
-      }
-    }
-
-    let existingChatId = "";
-    if (myUserId && contactUserId) {
-      try {
-        const c1 = makeDeterministicChatId(myUserId, contactUserId);
-        const c2 = makeDeterministicChatId(contactUserId, myUserId);
-        const s1 = await get(await getDbRef(`Chats/${c1}`));
-        if (s1.exists()) existingChatId = c1;
-        else {
-          const s2 = await get(await getDbRef(`Chats/${c2}`));
-          if (s2.exists()) existingChatId = c2;
-        }
-      } catch (e) {
-        console.warn("onOpenChat find existing chat error", e);
-      }
-    }
-
     setOpenedChat({
-      chatId: existingChatId || "",
+      chatId: contact.chatId || "",
       contactKey: contact.key || "",
-      contactUserId: contactUserId || "",
+      contactUserId: contact.userId || "",
       contactName: contact.name || "",
-      contactImage: contact.profileImage || "",
+      contactImage: normalizeProfileImageUri(contact.profileImage) || "",
     });
 
     router.push("/messages");
   };
 
+  const normalizedSearchQuery = searchQuery.trim().toLowerCase();
+  const shouldShowSearchResults = normalizedSearchQuery.length > 0;
+
   const filteredContacts = contacts.filter((c) => {
-    if (filter === "All") return true;
+    if (normalizedSearchQuery) {
+      const haystack = [c.name, c.role, c.lastMessage]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+
+      return haystack.includes(normalizedSearchQuery);
+    }
+
     if (filter === "Management") return c.type === "management";
     if (filter === "Teachers") return c.type === "teacher";
     if (filter === "Parents") return c.type === "parent";
-    return true;
+    if (filter === "Support") return c.type === "support";
+    return false;
   });
 
   return (
     <SafeAreaView edges={["top", "bottom"]} style={styles.safe}>
-      <StatusBar barStyle="dark-content" backgroundColor="#ffffff" translucent={false} />
+      <StatusBar barStyle={statusBarStyle === "dark" ? "dark-content" : "light-content"} backgroundColor={colors.background} translucent={false} />
       <View style={styles.container}>
         <View style={styles.headerRow}>
-          <TouchableOpacity onPress={() => router.back()} style={styles.backButton}>
-            <Ionicons name="chevron-back" size={22} color="#222" />
+          <TouchableOpacity onPress={onBackPress} style={styles.backButton}>
+            <Ionicons name="chevron-back" size={22} color={colors.text} />
           </TouchableOpacity>
 
-          <Text style={styles.headerTitle}>Messages</Text>
+          {searchActive ? (
+            <View style={styles.searchBar}>
+              <Ionicons name="search-outline" size={18} color={MUTED} />
+              <TextInput
+                autoFocus
+                value={searchQuery}
+                onChangeText={setSearchQuery}
+                placeholder="Search"
+                placeholderTextColor="#93A1C6"
+                style={styles.searchInput}
+                returnKeyType="search"
+              />
+              {searchQuery ? (
+                <TouchableOpacity onPress={() => setSearchQuery("")} style={styles.searchIconButton}>
+                  <Ionicons name="close-circle" size={18} color={MUTED} />
+                </TouchableOpacity>
+              ) : null}
+            </View>
+          ) : (
+            <Text style={styles.headerTitle}>Messages</Text>
+          )}
 
-          <TouchableOpacity onPress={() => Alert.alert("Search", "Search not implemented yet")}>
-            <Ionicons name="search-outline" size={20} color={MUTED} />
+          <TouchableOpacity
+            onPress={() => {
+              if (searchActive) {
+                setSearchActive(false);
+                setSearchQuery("");
+                return;
+              }
+              setSearchActive(true);
+            }}
+            style={styles.searchToggle}
+          >
+            <Ionicons name={searchActive ? "close" : "search-outline"} size={20} color={colors.muted} />
           </TouchableOpacity>
         </View>
 
-        <View style={styles.filterContainer}>
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.filterScrollContent}>
-            {FILTERS.map((f) => (
-              <TouchableOpacity key={f} onPress={() => setFilter(f)} activeOpacity={0.85} style={[styles.filterPill, filter === f ? styles.filterPillActive : null]}>
-                <Text style={[styles.filterPillText, filter === f ? styles.filterPillTextActive : null]}>{f}</Text>
-              </TouchableOpacity>
-            ))}
-          </ScrollView>
-        </View>
+        {!searchActive ? (
+          <View style={styles.filterContainer}>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.filterScrollContent}>
+              {FILTERS.map((f) => (
+                <TouchableOpacity key={f} onPress={() => setFilter(f)} activeOpacity={0.85} style={[styles.filterPill, filter === f ? styles.filterPillActive : null]}>
+                  <Text style={[styles.filterPillText, filter === f ? styles.filterPillTextActive : null]}>{f}</Text>
+                </TouchableOpacity>
+              ))}
+            </ScrollView>
+          </View>
+        ) : null}
 
         {loadingInitial && contacts.length === 0 ? (
-          <View style={styles.center}><ActivityIndicator size="large" color={PRIMARY} /></View>
+          <PageLoadingSkeleton variant="chat" showHeader={false} style={{ flex: 1, backgroundColor: colors.background }} />
+        ) : searchActive && !shouldShowSearchResults ? (
+          <View style={styles.emptyWrap}>
+            <Text style={styles.emptyTitle}>Search chats</Text>
+            <Text style={styles.emptySubtitle}>Type a name, role, or message to find a user.</Text>
+          </View>
         ) : filteredContacts.length === 0 ? (
           <View style={styles.emptyWrap}>
             <Text style={styles.emptyTitle}>No contacts</Text>
-            <Text style={styles.emptySubtitle}>No {filter.toLowerCase()} contacts found yet.</Text>
+            <Text style={styles.emptySubtitle}>
+              {normalizedSearchQuery
+                ? `No results for "${searchQuery.trim()}".`
+                : `No ${filter.toLowerCase()} contacts found yet.`}
+            </Text>
           </View>
         ) : (
           <FlatList
@@ -506,19 +572,45 @@ export default function ChatsScreen() {
               return (
                 <TouchableOpacity style={styles.itemWrapper} onPress={() => onOpenChat(item)} activeOpacity={0.9}>
                   <View style={styles.row}>
-                    <Image source={item.profileImage ? { uri: item.profileImage } : AVATAR_PLACEHOLDER} style={styles.avatar} />
+                    <TouchableOpacity
+                      style={styles.profileTapArea}
+                      activeOpacity={0.85}
+                      onPress={() => openUserProfile({
+                        candidates: [item.key, item.userId].filter(Boolean),
+                        fallbackName: item.name,
+                        fallbackAvatar: item.profileImage,
+                        fallbackRole: item.role || item.type || "School Account",
+                        fallbackRoleTitle: item.role || item.type || "School Account",
+                        fallbackContactKey: item.key || "",
+                        fallbackContactUserId: item.userId || item.key || "",
+                      })}
+                    >
+                      <Image source={normalizeProfileImageUri(item.profileImage) ? { uri: normalizeProfileImageUri(item.profileImage) } : AVATAR_PLACEHOLDER} style={styles.avatar} />
+                    </TouchableOpacity>
                     <View style={{ flex: 1, marginLeft: 12 }}>
                       <View style={styles.rowTop}>
-                        <View style={{ flex: 1, flexDirection: "row", alignItems: "center" }}>
+                        <TouchableOpacity
+                          style={styles.nameTapArea}
+                          activeOpacity={0.85}
+                          onPress={() => openUserProfile({
+                            candidates: [item.key, item.userId].filter(Boolean),
+                            fallbackName: item.name,
+                            fallbackAvatar: item.profileImage,
+                            fallbackRole: item.role || item.type || "School Account",
+                            fallbackRoleTitle: item.role || item.type || "School Account",
+                            fallbackContactKey: item.key || "",
+                            fallbackContactUserId: item.userId || item.key || "",
+                          })}
+                        >
                           <Text style={styles.name} numberOfLines={1}>{item.name}</Text>
                           {item.role ? <View style={styles.badge}><Text style={styles.badgeText}>{item.role}</Text></View> : null}
-                        </View>
+                        </TouchableOpacity>
 
                         <View style={{ alignItems: "flex-end", flexDirection: "row" }}>
                           <Text style={styles.time}>{fmtTime12(item.lastTime)}</Text>
                           <View style={{ width: 8 }} />
                           {lastWasMine ? (
-                            <Ionicons name={seenFlag ? "checkmark-done" : "checkmark"} size={16} color={seenFlag ? PRIMARY : MUTED} />
+                            <Ionicons name={seenFlag ? "checkmark-done" : "checkmark"} size={16} color={seenFlag ? colors.primary : colors.muted} />
                           ) : null}
                           {item.unread ? <View style={styles.unreadPill}><Text style={styles.unreadText}>{item.unread}</Text></View> : null}
                         </View>
@@ -539,52 +631,97 @@ export default function ChatsScreen() {
           />
         )}
       </View>
+      {profileCardModal}
     </SafeAreaView>
   );
 }
 
-const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: "#fff" },
-  container: { flex: 1, backgroundColor: "#fff" },
+function createStyles(colors) {
+  return StyleSheet.create({
+  safe: { flex: 1, backgroundColor: colors.background },
+  container: { flex: 1, backgroundColor: colors.background },
 
   headerRow: { paddingHorizontal: 12, paddingTop: 12, paddingBottom: 6, flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
   backButton: { width: 36, height: 36, alignItems: "center", justifyContent: "center" },
-  headerTitle: { fontSize: 20, fontWeight: "800", color: "#111" },
+  headerTitle: { fontSize: 20, fontWeight: "800", color: colors.text },
+  searchToggle: { width: 36, height: 36, alignItems: "center", justifyContent: "center" },
+  searchBar: {
+    flex: 1,
+    height: 42,
+    marginHorizontal: 10,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.inputBackground,
+    paddingHorizontal: 12,
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  searchInput: {
+    flex: 1,
+    marginLeft: 8,
+    color: colors.text,
+    fontSize: 14,
+    fontWeight: "600",
+    paddingVertical: 0,
+  },
+  searchIconButton: {
+    width: 22,
+    height: 22,
+    alignItems: "center",
+    justifyContent: "center",
+    marginLeft: 6,
+  },
 
-  filterContainer: { height: 52, justifyContent: "center" },
-  filterScrollContent: { paddingHorizontal: 12, alignItems: "center" },
+  filterContainer: {
+    flexDirection: "row",
+    paddingHorizontal: 16,
+    paddingTop: 6,
+    paddingBottom: 6,
+  },
+  filterScrollContent: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
   filterPill: {
-    height: 36,
-    paddingHorizontal: 14,
-    borderRadius: 18,
-    backgroundColor: "#F8FAFF",
-    marginRight: 10,
-    minWidth: 88,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.card,
     justifyContent: "center",
     alignItems: "center",
   },
-  filterPillActive: { backgroundColor: PRIMARY },
-  filterPillText: { color: MUTED, fontWeight: "700", fontSize: 13 },
-  filterPillTextActive: { color: "#fff" },
+  filterPillActive: {
+    backgroundColor: colors.soft,
+    borderColor: colors.primary,
+  },
+  filterPillText: { color: colors.muted, fontWeight: "700", fontSize: 12 },
+  filterPillTextActive: { color: colors.primary },
 
   itemWrapper: { paddingHorizontal: 0 },
-  row: { flexDirection: "row", alignItems: "center", paddingVertical: 12, backgroundColor: "#fff" },
-  avatar: { width: 56, height: 56, borderRadius: 28, backgroundColor: "#F1F3F8" },
+  row: { flexDirection: "row", alignItems: "center", paddingVertical: 12, backgroundColor: colors.background },
+  profileTapArea: { alignItems: "center", justifyContent: "center" },
+  avatar: { width: 56, height: 56, borderRadius: 28, backgroundColor: colors.surfaceMuted },
   rowTop: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
-  name: { fontWeight: "700", fontSize: 16, color: "#111", marginRight: 8 },
-  badge: { marginLeft: -4, paddingHorizontal: 7, paddingVertical: 3, borderRadius: 8, backgroundColor: "#F1F7FF" },
-  badgeText: { color: PRIMARY, fontWeight: "700", fontSize: 11 },
-  subtitleText: { color: MUTED, fontSize: 13, flex: 1 },
+  nameTapArea: { flex: 1, flexDirection: "row", alignItems: "center" },
+  name: { fontWeight: "700", fontSize: 16, color: colors.text, marginRight: 8 },
+  badge: { marginLeft: -4, paddingHorizontal: 7, paddingVertical: 3, borderRadius: 8, backgroundColor: colors.badgeBackground },
+  badgeText: { color: colors.primary, fontWeight: "700", fontSize: 11 },
+  subtitleText: { color: colors.muted, fontSize: 13, flex: 1 },
 
-  time: { color: MUTED, fontSize: 11 },
-  unreadPill: { marginTop: 8, backgroundColor: PRIMARY, paddingHorizontal: 8, paddingVertical: 3, borderRadius: 12, minWidth: 24, alignItems: "center" },
-  unreadText: { color: "#fff", fontWeight: "700", fontSize: 12 },
+  time: { color: colors.muted, fontSize: 11 },
+  unreadPill: { marginTop: 8, backgroundColor: colors.primary, paddingHorizontal: 8, paddingVertical: 3, borderRadius: 12, minWidth: 24, alignItems: "center" },
+  unreadText: { color: colors.white, fontWeight: "700", fontSize: 12 },
 
-  separatorLine: { height: 1, backgroundColor: "#EEF4FF", marginLeft: 56 + 12 + 8, marginRight: 0 },
+  separatorLine: { height: 1, backgroundColor: colors.separator, marginLeft: 56 + 12 + 8, marginRight: 0 },
 
   center: { flex: 1, alignItems: "center", justifyContent: "center" },
 
   emptyWrap: { flex: 1, alignItems: "center", justifyContent: "center", paddingTop: 40, paddingHorizontal: 24 },
-  emptyTitle: { fontWeight: "700", fontSize: 16, color: "#222", textAlign: "center" },
-  emptySubtitle: { color: MUTED, marginTop: 6, textAlign: "center" },
+  emptyTitle: { fontWeight: "700", fontSize: 16, color: colors.text, textAlign: "center" },
+  emptySubtitle: { color: colors.muted, marginTop: 6, textAlign: "center" },
 });
+}

@@ -1,11 +1,39 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { SafeAreaView, StyleSheet, View, Text, TouchableOpacity, Animated, Easing } from "react-native";
-import { Slot, useRouter } from "expo-router";
+import { ThemeProvider } from "@react-navigation/native";
+import type { NativeStackNavigationOptions } from "@react-navigation/native-stack";
+import { AppState, SafeAreaView, StyleSheet, View, Text, TouchableOpacity, Animated, Easing, Modal, Platform, InteractionManager } from "react-native";
+import { Stack, usePathname, useRouter } from "expo-router";
 import { StatusBar } from "expo-status-bar";
+import * as ScreenOrientation from "expo-screen-orientation";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { Ionicons } from "@expo/vector-icons";
+import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { getOfflineState, startOfflineSync, subscribeOfflineState } from "../lib/offlineDatabase";
+import { prewarmEssentialAppCaches } from "../lib/appOfflineCache";
+import { startMediaUploadSync } from "../lib/mediaUploadQueue";
 import { getValue } from "./lib/dbHelpers";
+import AppLaunchSplash from "../components/ui/app-launch-splash";
+import PasscodePanel from "../components/passcode-panel";
+import { AppLockProvider } from "../hooks/use-app-lock";
+import {
+  APP_LOCK_LAST_INACTIVE_AT_KEY,
+  APP_LOCK_PASSCODE_LENGTH,
+  DEFAULT_APP_LOCK_STATE,
+  loadStoredAppLock,
+  normalizePasscodeValue,
+  resolveAppLockAccountKey,
+} from "../constants/appLock";
+import {
+  SESSION_AUTH_KEYS,
+  SESSION_EXPIRED_NOTICE_KEY,
+  SESSION_LAST_ACTIVE_KEY,
+  isStudentSessionValid,
+} from "../constants/session";
+import { AppThemeProvider, useAppTheme } from "../hooks/use-app-theme";
+
+export const unstable_settings = {
+  initialRouteName: "index",
+};
 
 type Notif = {
   id: string;
@@ -26,17 +54,361 @@ type Notif = {
 
 export default function RootLayout() {
   return (
-    <SafeAreaView style={styles.container}>
-      <StatusBar style="auto" />
-      <GlobalNotificationToast />
-      <Slot />
-    </SafeAreaView>
+    <AppThemeProvider>
+      <ThemedRootLayout />
+    </AppThemeProvider>
+  );
+}
+
+function ThemedRootLayout() {
+  const router = useRouter();
+  const pathname = usePathname();
+  const { colors, navigationTheme, statusBarStyle } = useAppTheme();
+  const bootRedirectDoneRef = useRef(false);
+  const appStateRef = useRef(AppState.currentState);
+  const sessionSyncDoneRef = useRef(false);
+  const postBootWarmupTaskRef = useRef<any>(null);
+  const startupSyncTaskRef = useRef<any>(null);
+  const [appLock, setAppLock] = useState<any>(DEFAULT_APP_LOCK_STATE);
+  const [appLocked, setAppLocked] = useState(false);
+  const [bootReady, setBootReady] = useState(false);
+  const [unlockCode, setUnlockCode] = useState("");
+  const [unlockError, setUnlockError] = useState("");
+  const [offlineState, setOfflineState] = useState(() => getOfflineState());
+  const currentPath = String(pathname || "/");
+  const isPublicRoute = currentPath === "/" || currentPath === "/index";
+  const showLaunchSplash = !bootReady;
+
+  const resetAppLockState = useCallback(() => {
+    AsyncStorage.removeItem(APP_LOCK_LAST_INACTIVE_AT_KEY).catch(() => null);
+    setAppLock(DEFAULT_APP_LOCK_STATE);
+    setAppLocked(false);
+    setUnlockCode("");
+    setUnlockError("");
+  }, []);
+
+  const syncAppLockState = useCallback(async (session: Record<string, string | null>, options?: { evaluateAutoLock?: boolean }) => {
+    const role = String(session.role || "");
+    const evaluateAutoLock = Boolean(options?.evaluateAutoLock);
+
+    if (role !== "student") {
+      resetAppLockState();
+      return;
+    }
+
+    const accountKey = resolveAppLockAccountKey(session.studentNodeKey, session.studentId, session.userId);
+    const normalizedAppLock = await loadStoredAppLock(accountKey);
+
+    setAppLock(normalizedAppLock);
+
+    if (!normalizedAppLock.enabled) {
+      AsyncStorage.removeItem(APP_LOCK_LAST_INACTIVE_AT_KEY).catch(() => null);
+      setAppLocked(false);
+      setUnlockCode("");
+      setUnlockError("");
+      return;
+    }
+
+    if (!evaluateAutoLock) {
+      return;
+    }
+
+    const lastInactiveValue = await AsyncStorage.getItem(APP_LOCK_LAST_INACTIVE_AT_KEY);
+    await AsyncStorage.removeItem(APP_LOCK_LAST_INACTIVE_AT_KEY).catch(() => null);
+
+    const lastInactiveAt = Number(lastInactiveValue || 0);
+    const shouldLock =
+      lastInactiveAt > 0 && Date.now() - lastInactiveAt >= Number(normalizedAppLock.autoLockDelayMs || 0);
+
+    if (shouldLock) {
+      setUnlockCode("");
+      setUnlockError("");
+      setAppLocked(true);
+    }
+  }, [resetAppLockState]);
+
+  useEffect(() => {
+    if (Platform.OS !== "web") return;
+    if (typeof window === "undefined") return;
+    if (typeof window.addEventListener !== "function") return;
+
+    const preloadFonts = async () => {
+      try {
+        await Promise.all([
+          Ionicons.loadFont(),
+          MaterialCommunityIcons.loadFont(),
+        ]);
+      } catch (error) {
+        console.warn("Icon font preload failed on web:", error);
+      }
+    };
+
+    preloadFonts();
+
+    const onUnhandledRejection = (event: any) => {
+      const reasonText = String(event?.reason?.message || event?.reason || "").toLowerCase();
+      const isFontTimeout =
+        reasonText.includes("fontfaceobserver") ||
+        reasonText.includes("6000ms timeout exceeded");
+
+      if (isFontTimeout) {
+        event?.preventDefault?.();
+        console.warn("Ignored web font timeout for icon font.");
+      }
+    };
+
+    window.addEventListener("unhandledrejection", onUnhandledRejection as any);
+    return () => {
+      if (typeof window.removeEventListener === "function") {
+        window.removeEventListener("unhandledrejection", onUnhandledRejection as any);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (Platform.OS === "web") return;
+
+    ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP).catch(() => null);
+  }, []);
+
+  const schedulePostBootWarmup = useCallback(() => {
+    if (postBootWarmupTaskRef.current) return;
+
+    postBootWarmupTaskRef.current = InteractionManager.runAfterInteractions(() => {
+      Promise.resolve(prewarmEssentialAppCaches())
+        .catch(() => null)
+        .finally(() => {
+          postBootWarmupTaskRef.current = null;
+        });
+    });
+  }, []);
+
+  const syncSessionAccess = useCallback(async (options?: { forceAppLock?: boolean }) => {
+    const shouldForceHome = isPublicRoute || currentPath === "/setting";
+    const evaluateAutoLock = !sessionSyncDoneRef.current || Boolean(options?.forceAppLock);
+
+    const pairs = await AsyncStorage.multiGet([
+      "role",
+      "userId",
+      SESSION_LAST_ACTIVE_KEY,
+      "studentNodeKey",
+      "studentId",
+    ]);
+    const session = Object.fromEntries(pairs) as Record<string, string | null>;
+
+    if (isStudentSessionValid(session)) {
+      await AsyncStorage.setItem(SESSION_LAST_ACTIVE_KEY, String(Date.now()));
+      await syncAppLockState(session, {
+        evaluateAutoLock,
+      });
+      prewarmEssentialAppCaches().catch(() => null);
+
+      if (shouldForceHome && !bootRedirectDoneRef.current) {
+        bootRedirectDoneRef.current = true;
+        router.replace("/dashboard/home");
+      }
+
+      schedulePostBootWarmup();
+
+      sessionSyncDoneRef.current = true;
+      return;
+    }
+
+    sessionSyncDoneRef.current = true;
+    bootRedirectDoneRef.current = false;
+    resetAppLockState();
+
+    if (session.role === "student" && session.userId) {
+      await AsyncStorage.multiRemove(SESSION_AUTH_KEYS);
+      await AsyncStorage.setItem(SESSION_EXPIRED_NOTICE_KEY, String(Date.now()));
+    }
+
+    if (!isPublicRoute) {
+      router.replace("/");
+    }
+  }, [currentPath, isPublicRoute, resetAppLockState, router, schedulePostBootWarmup, syncAppLockState]);
+
+  useEffect(() => {
+    let active = true;
+
+    syncSessionAccess()
+      .catch((error) => {
+        console.warn("Session sync error:", error);
+      })
+      .finally(() => {
+        if (active) {
+          setBootReady(true);
+        }
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [syncSessionAccess]);
+
+  useEffect(() => {
+    const unsubscribeOfflineState = subscribeOfflineState(setOfflineState);
+
+    startupSyncTaskRef.current = InteractionManager.runAfterInteractions(() => {
+      startOfflineSync();
+      startMediaUploadSync();
+      startupSyncTaskRef.current = null;
+    });
+
+    return () => {
+      startupSyncTaskRef.current?.cancel?.();
+      startupSyncTaskRef.current = null;
+      postBootWarmupTaskRef.current?.cancel?.();
+      postBootWarmupTaskRef.current = null;
+      unsubscribeOfflineState();
+    };
+  }, []);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener("change", (nextState) => {
+      const wasBackgrounded = /inactive|background/.test(appStateRef.current);
+
+      if (/inactive|background/.test(nextState)) {
+        if (appLock.enabled) {
+          AsyncStorage.setItem(APP_LOCK_LAST_INACTIVE_AT_KEY, String(Date.now())).catch(() => null);
+        } else {
+          AsyncStorage.removeItem(APP_LOCK_LAST_INACTIVE_AT_KEY).catch(() => null);
+        }
+      }
+
+      appStateRef.current = nextState;
+
+      if (wasBackgrounded && nextState === "active") {
+        syncSessionAccess({ forceAppLock: true }).catch((error) => {
+          console.warn("Session resume sync error:", error);
+        });
+      }
+    });
+
+    return () => {
+      subscription.remove();
+    };
+  }, [appLock.enabled, syncSessionAccess]);
+
+  useEffect(() => {
+    if (!appLocked || unlockCode.length !== APP_LOCK_PASSCODE_LENGTH) return;
+
+    if (unlockCode === appLock.passcode) {
+      AsyncStorage.removeItem(APP_LOCK_LAST_INACTIVE_AT_KEY).catch(() => null);
+      setAppLocked(false);
+      setUnlockCode("");
+      setUnlockError("");
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      setUnlockCode("");
+      setUnlockError("Wrong 4-digit passcode. Try again.");
+    }, 120);
+
+    return () => clearTimeout(timer);
+  }, [appLock.passcode, appLocked, unlockCode]);
+
+  const handleUnlockDigit = useCallback((digit: string) => {
+    setUnlockError("");
+    setUnlockCode((current) => {
+      if (current.length >= APP_LOCK_PASSCODE_LENGTH) return current;
+      return normalizePasscodeValue(`${current}${digit}`);
+    });
+  }, []);
+
+  const handleUnlockBackspace = useCallback(() => {
+    setUnlockError("");
+    setUnlockCode((current) => current.slice(0, -1));
+  }, []);
+
+  const lockAppNow = useCallback(() => {
+    setUnlockCode("");
+    setUnlockError("");
+    setAppLocked(true);
+  }, []);
+
+  const showOfflineBanner = !showLaunchSplash && (
+    (offlineState.hasResolved && !offlineState.isConnected) || offlineState.pendingWrites > 0
+  );
+  const offlineBannerText = !offlineState.isConnected
+    ? offlineState.pendingWrites > 0
+      ? `${offlineState.pendingWrites} offline ${offlineState.pendingWrites === 1 ? "change" : "changes"} will sync when you reconnect.`
+      : "Offline mode. Showing cached data where available."
+    : `Syncing ${offlineState.pendingWrites} offline ${offlineState.pendingWrites === 1 ? "change" : "changes"}...`;
+  const offlineBannerBackground = offlineState.isConnected ? colors.successSurface : colors.warningSurface;
+  const offlineBannerIconColor = offlineState.isConnected ? colors.success : colors.warningText;
+  const offlineBannerTextColor = offlineState.isConnected ? colors.success : colors.warningText;
+  const stackAnimation: NativeStackNavigationOptions["animation"] =
+    Platform.OS === "web" ? "none" : Platform.OS === "ios" ? "simple_push" : "fade";
+  const stackScreenOptions = useMemo<NativeStackNavigationOptions>(() => ({
+    headerShown: false,
+    animation: stackAnimation,
+    gestureEnabled: true,
+    contentStyle: { backgroundColor: colors.background },
+    ...(Platform.OS === "ios"
+      ? {
+          animationDuration: 170,
+          fullScreenGestureEnabled: true,
+        }
+      : {}),
+  }), [colors.background, stackAnimation]);
+
+  return (
+    <AppLockProvider value={{ appLockEnabled: appLock.enabled, lockAppNow }}>
+      <ThemeProvider value={navigationTheme}>
+        <SafeAreaView style={[styles.container, { backgroundColor: colors.background }]}>
+          <StatusBar style={statusBarStyle} backgroundColor={colors.background} />
+          {showOfflineBanner ? (
+            <View style={[styles.offlineBanner, { backgroundColor: offlineBannerBackground, borderColor: colors.border }]}> 
+              <View style={styles.offlineBannerRow}>
+                <Ionicons
+                  name={offlineState.isConnected ? "cloud-done-outline" : "cloud-offline-outline"}
+                  size={15}
+                  color={offlineBannerIconColor}
+                />
+                <Text style={[styles.offlineBannerText, { color: offlineBannerTextColor }]} numberOfLines={2}>
+                  {offlineBannerText}
+                </Text>
+              </View>
+            </View>
+          ) : null}
+          <GlobalNotificationToast />
+          <Stack initialRouteName="index" screenOptions={stackScreenOptions}>
+            <Stack.Screen name="setting" options={{ presentation: "card" }} />
+          </Stack>
+
+          <Modal visible={appLock.enabled && appLocked} transparent animationType="fade" onRequestClose={() => null}>
+            <View style={[styles.lockOverlay, { backgroundColor: colors.overlay }]}> 
+              <PasscodePanel
+                colors={colors}
+                title="Passcode Lock"
+                subtitle="Enter your 4-digit code to unlock Gojo Study."
+                value={unlockCode}
+                errorText={unlockError}
+                onDigitPress={handleUnlockDigit}
+                onBackspace={handleUnlockBackspace}
+                /* supply optional action props to satisfy TS consumers */
+                secondaryLabel=""
+                onSecondaryPress={() => {}}
+                primaryLabel=""
+                onPrimaryPress={() => {}}
+                footerNote="Tap the lock icon on the home page header to lock Gojo Study instantly on this phone."
+              />
+            </View>
+          </Modal>
+
+          {showLaunchSplash ? <AppLaunchSplash /> : null}
+        </SafeAreaView>
+      </ThemeProvider>
+    </AppLockProvider>
   );
 }
 
 function GlobalNotificationToast() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
+  const { colors } = useAppTheme();
 
   const [current, setCurrent] = useState<Notif | null>(null);
   const [queue, setQueue] = useState<Notif[]>([]);
@@ -49,12 +421,12 @@ function GlobalNotificationToast() {
 
   const notifVisual = useCallback((type?: string) => {
     const t = String(type || "").toLowerCase();
-    if (t === "new_package") return { icon: "cube-outline" as const, color: "#2563EB", bg: "#EFF6FF" };
-    if (t === "new_round") return { icon: "layers-outline" as const, color: "#7C3AED", bg: "#F5F3FF" };
-    if (t === "round_live") return { icon: "flash-outline" as const, color: "#EA580C", bg: "#FFF7ED" };
-    if (t === "result_released") return { icon: "trophy-outline" as const, color: "#16A34A", bg: "#ECFDF5" };
-    return { icon: "notifications-outline" as const, color: "#0B72FF", bg: "#EEF4FF" };
-  }, []);
+    if (t === "new_package") return { icon: "cube-outline" as const, color: colors.primary, bg: colors.infoSurface };
+    if (t === "new_round") return { icon: "layers-outline" as const, color: "#8B5CF6", bg: colors.soft };
+    if (t === "round_live") return { icon: "flash-outline" as const, color: colors.warningText, bg: colors.warningSurface };
+    if (t === "result_released") return { icon: "trophy-outline" as const, color: colors.success, bg: colors.successSurface };
+    return { icon: "notifications-outline" as const, color: colors.primary, bg: colors.soft };
+  }, [colors]);
 
   const parseDeepLink = useCallback((dl?: string) => {
     const deep = String(dl || "");
@@ -195,7 +567,7 @@ function GlobalNotificationToast() {
     <Animated.View style={[styles.toastWrap, { top: insets.top + 8, transform: [{ translateY: slideY }], opacity }]}>
       <TouchableOpacity
         activeOpacity={0.92}
-        style={styles.toastCard}
+        style={[styles.toastCard, { backgroundColor: colors.card, borderColor: colors.border }]}
         onPress={async () => {
           const n = current;
           hideToast();
@@ -206,17 +578,17 @@ function GlobalNotificationToast() {
           <View style={[styles.toastIconWrap, { backgroundColor: vis.bg }]}>
             <Ionicons name={vis.icon} size={16} color={vis.color} />
           </View>
-          <Text style={styles.toastTitle} numberOfLines={1}>
+          <Text style={[styles.toastTitle, { color: colors.text }]} numberOfLines={1}>
             {current.title || "New Notification"}
           </Text>
         </View>
         {!!current.body && (
-          <Text style={styles.toastBody} numberOfLines={2}>
+          <Text style={[styles.toastBody, { color: colors.muted }]} numberOfLines={2}>
             {current.body}
           </Text>
         )}
-        <View style={styles.toastBarTrack}>
-          <Animated.View style={[styles.toastBarFill, { width: progressWidth }]} />
+        <View style={[styles.toastBarTrack, { backgroundColor: colors.surfaceMuted }]}>
+          <Animated.View style={[styles.toastBarFill, { width: progressWidth, backgroundColor: colors.primary }]} />
         </View>
       </TouchableOpacity>
     </Animated.View>
@@ -224,7 +596,35 @@ function GlobalNotificationToast() {
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: "#fff" },
+  container: { flex: 1 },
+
+  offlineBanner: {
+    marginHorizontal: 12,
+    marginTop: 6,
+    marginBottom: 2,
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  offlineBannerRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  offlineBannerText: {
+    flex: 1,
+    fontSize: 12,
+    fontWeight: "700",
+    lineHeight: 16,
+  },
+
+  lockOverlay: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 20,
+  },
 
   toastWrap: {
     position: "absolute",
@@ -234,9 +634,7 @@ const styles = StyleSheet.create({
     elevation: 9999,
   },
   toastCard: {
-    backgroundColor: "#fff",
     borderWidth: 1,
-    borderColor: "#EAF0FF",
     borderRadius: 12,
     paddingHorizontal: 12,
     paddingVertical: 10,
@@ -254,18 +652,16 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     marginRight: 8,
   },
-  toastTitle: { color: "#0B2540", fontWeight: "900", flex: 1 },
-  toastBody: { marginTop: 6, color: "#6B78A8", fontSize: 12, lineHeight: 16 },
+  toastTitle: { fontWeight: "900", flex: 1 },
+  toastBody: { marginTop: 6, fontSize: 12, lineHeight: 16 },
   toastBarTrack: {
     marginTop: 8,
     height: 4,
     borderRadius: 999,
     overflow: "hidden",
-    backgroundColor: "#EAF0FF",
   },
   toastBarFill: {
     height: 4,
     borderRadius: 999,
-    backgroundColor: "#0B72FF",
   },
 });

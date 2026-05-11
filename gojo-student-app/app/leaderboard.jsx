@@ -9,20 +9,22 @@ import {
   ActivityIndicator,
   Image,
   RefreshControl,
-  TextInput,
-  Platform,
   StatusBar,
   Modal,
   Animated,
   Easing,
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
-import { useRouter } from "expo-router";
+import { useLocalSearchParams, useRouter } from "expo-router";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { ref, get } from "firebase/database";
+import { ref, get } from "../lib/offlineDatabase";
 import { database } from "../constants/firebaseConfig";
+import { useAppTheme } from "../hooks/use-app-theme";
 import { getSnapshot } from "./lib/dbHelpers";
 import { queryUserByUsernameInSchool, queryUserByChildInSchool } from "./lib/userHelpers";
+import { extractProfileImage } from "./lib/profileImage";
+import { readScreenCache, writeScreenCache } from "../lib/appOfflineCache";
+import PageLoadingSkeleton from "../components/ui/page-loading-skeleton";
 
 const C = {
   primary: "#0B72FF",
@@ -40,17 +42,6 @@ function normalizeGrade(g) {
   const s = String(g).trim().toLowerCase();
   const m = s.match(/(\d{1,2})/);
   return m ? String(m[1]) : s.replace(/^grade\s*/i, "");
-}
-
-function yearsFromDob(dob) {
-  if (!dob) return "";
-  const d = new Date(dob);
-  if (Number.isNaN(d.getTime())) return "";
-  const now = new Date();
-  let age = now.getFullYear() - d.getFullYear();
-  const m = now.getMonth() - d.getMonth();
-  if (m < 0 || (m === 0 && now.getDate() < d.getDate())) age--;
-  return age >= 0 ? String(age) : "";
 }
 
 async function resolveUserProfile(userId) {
@@ -83,30 +74,91 @@ async function resolveUserProfile(userId) {
 
 async function resolveStudentAndSchoolDetails(userId, fallbackSchoolCode) {
   try {
-    const schoolCode = fallbackSchoolCode || null;
-    if (!schoolCode) return { student: null, schoolInfo: null };
+    if (!userId) return { student: null, schoolInfo: null, schoolCode: null, user: null };
 
-    const usersSnap = await get(ref(database, `Platform1/Schools/${schoolCode}/Users/${userId}`));
-    const user = usersSnap?.exists() ? usersSnap.val() : null;
-    const studentId = user?.studentId || null;
+    const candidates = [];
+    if (fallbackSchoolCode) candidates.push(fallbackSchoolCode);
 
-    let student = null;
-    if (studentId) {
-      const st = await get(ref(database, `Platform1/Schools/${schoolCode}/Students/${studentId}`));
-      if (st?.exists()) student = st.val();
+    const { schoolCode: profileSchoolCode } = await resolveUserProfile(userId);
+    if (profileSchoolCode && !candidates.includes(profileSchoolCode)) {
+      candidates.push(profileSchoolCode);
     }
 
-    const schoolInfoSnap = await get(ref(database, `Platform1/Schools/${schoolCode}/schoolInfo`));
-    const schoolInfo = schoolInfoSnap?.exists() ? schoolInfoSnap.val() : null;
+    try {
+      const pref = String(userId).slice(0, 3).toUpperCase();
+      const idx = await get(ref(database, `Platform1/schoolCodeIndex/${pref}`));
+      const indexedSchoolCode = idx?.val() || null;
+      if (indexedSchoolCode && !candidates.includes(indexedSchoolCode)) {
+        candidates.push(indexedSchoolCode);
+      }
+    } catch {}
 
-    return { student, schoolInfo };
+    for (const schoolCode of candidates) {
+      if (!schoolCode) continue;
+
+      let user = null;
+
+      const usersSnap = await get(ref(database, `Platform1/Schools/${schoolCode}/Users/${userId}`));
+      if (usersSnap?.exists()) user = usersSnap.val();
+
+      if (!user) {
+        try {
+          const byUsername = await queryUserByUsernameInSchool(userId, schoolCode);
+          if (byUsername?.exists()) {
+            byUsername.forEach((c) => {
+              user = c.val();
+              return true;
+            });
+          }
+        } catch {}
+      }
+
+      if (!user) {
+        try {
+          const byUserId = await queryUserByChildInSchool("userId", userId, schoolCode);
+          if (byUserId?.exists()) {
+            byUserId.forEach((c) => {
+              user = c.val();
+              return true;
+            });
+          }
+        } catch {}
+      }
+
+      const studentId = user?.studentId || null;
+
+      let student = null;
+      if (studentId) {
+        const st = await get(ref(database, `Platform1/Schools/${schoolCode}/Students/${studentId}`));
+        if (st?.exists()) student = st.val();
+      }
+
+      const schoolInfoSnap = await get(ref(database, `Platform1/Schools/${schoolCode}/schoolInfo`));
+      const schoolInfo = schoolInfoSnap?.exists() ? schoolInfoSnap.val() : null;
+
+      if (user || student || schoolInfo) {
+        return { student, schoolInfo, schoolCode, user };
+      }
+    }
+
+    return { student: null, schoolInfo: null, schoolCode: fallbackSchoolCode || null, user: null };
   } catch {
-    return { student: null, schoolInfo: null };
+    return { student: null, schoolInfo: null, schoolCode: fallbackSchoolCode || null, user: null };
   }
 }
-function PodiumItem({ item, place, rankColor, animatedStyle }) {
+
+function extractStudentGrade(student) {
+  const raw =
+    student?.basicStudentInformation?.grade ||
+    student?.grade ||
+    "";
+  const normalized = normalizeGrade(raw);
+  return normalized ? `Grade ${normalized}` : "-";
+}
+function PodiumItem({ item, place, rankColor, animatedStyle, onPress, styles }) {
   const isFirst = place === 1;
   const medalColor = rankColor(place);
+  const tiedItems = Array.isArray(item?.tiedItems) ? item.tiedItems : [];
 
   if (!item) {
     return (
@@ -119,16 +171,21 @@ function PodiumItem({ item, place, rankColor, animatedStyle }) {
             { borderColor: medalColor },
           ]}
         >
-          <Ionicons name="person-outline" size={isFirst ? 28 : 24} color={medalColor} />
+          <Ionicons name="sparkles-outline" size={isFirst ? 28 : 24} color={medalColor} />
           <View style={[styles.medalBadge, { backgroundColor: medalColor }]}>
             <Text style={styles.medalText}>{place}</Text>
           </View>
         </View>
 
         <Text numberOfLines={1} style={styles.podiumNameEmpty}>
-          Open Spot
+          Rank #{place} Open
         </Text>
-        <Text style={styles.podiumPtsEmpty}>Not taken yet</Text>
+        <Text style={styles.podiumPtsEmpty}>No student yet</Text>
+
+        <View style={styles.emptyPodiumHint}>
+          <Ionicons name="flash-outline" size={12} color={medalColor} />
+          <Text style={[styles.emptyPodiumHintText, { color: medalColor }]}>Be the first here</Text>
+        </View>
 
         <View
           style={[
@@ -145,48 +202,78 @@ function PodiumItem({ item, place, rankColor, animatedStyle }) {
 
   return (
     <Animated.View style={[styles.podiumCol, isFirst ? styles.podiumCenter : null, animatedStyle]}>
-      <View
-        style={[
-          styles.podiumAvatarWrap,
-          isFirst ? styles.podiumAvatarWrapFirst : null,
-          { borderColor: medalColor },
-        ]}
-      >
-        {item.avatar ? (
-          <Image source={{ uri: item.avatar }} style={styles.podiumAvatar} />
-        ) : (
-          <View style={styles.podiumAvatarFallback}>
-            <Text style={styles.initial}>{(item.name || "U")[0]}</Text>
+      <TouchableOpacity activeOpacity={0.9} onPress={onPress} style={styles.podiumTouch}>
+        <View
+          style={[
+            styles.podiumAvatarWrap,
+            isFirst ? styles.podiumAvatarWrapFirst : null,
+            { borderColor: medalColor },
+          ]}
+        >
+          {item.avatar ? (
+            <Image source={{ uri: item.avatar }} style={styles.podiumAvatar} />
+          ) : (
+            <View style={styles.podiumAvatarFallback}>
+              <Text style={styles.initial}>{(item.name || "U")[0]}</Text>
+            </View>
+          )}
+          <View style={[styles.medalBadge, { backgroundColor: medalColor }]}>
+            <Text style={styles.medalText}>{place}</Text>
           </View>
-        )}
-        <View style={[styles.medalBadge, { backgroundColor: medalColor }]}>
-          <Text style={styles.medalText}>{place}</Text>
         </View>
-      </View>
 
-      <Text numberOfLines={1} style={styles.podiumName}>{item.name}</Text>
-      <Text style={styles.podiumPts}>{item.totalPoints} pts</Text>
+        <Text numberOfLines={1} style={styles.podiumName}>{item.name}</Text>
+        <Text style={styles.podiumPts}>{item.totalPoints} pts</Text>
 
-      <View
-        style={[
-          styles.podiumBlock,
-          isFirst ? styles.podiumBlockFirst : styles.podiumBlockSide,
-          { backgroundColor: `${medalColor}33` },
-        ]}
-      >
-        <Text style={[styles.podiumBlockText, { color: medalColor }]}>#{place}</Text>
-      </View>
+        {tiedItems.length > 1 ? (
+          <View style={styles.tiePreviewWrap}>
+            {tiedItems.slice(0, 4).map((p, idx) => (
+              <View
+                key={`${p.userId}-${idx}`}
+                style={[
+                  styles.tiePreviewAvatarWrap,
+                  { borderColor: medalColor },
+                  idx > 0 ? { marginLeft: -12 } : null,
+                ]}
+              >
+                {p.avatar ? (
+                  <Image source={{ uri: p.avatar }} style={styles.tiePreviewAvatar} />
+                ) : (
+                  <View style={styles.tiePreviewFallback}>
+                    <Text style={styles.tiePreviewInitial}>{(p.name || "U")[0]}</Text>
+                  </View>
+                )}
+              </View>
+            ))}
+            <Text style={[styles.tiePreviewText, { color: medalColor }]}>+{tiedItems.length - 1}</Text>
+          </View>
+        ) : null}
+
+        <View
+          style={[
+            styles.podiumBlock,
+            isFirst ? styles.podiumBlockFirst : styles.podiumBlockSide,
+            { backgroundColor: `${medalColor}33` },
+          ]}
+        >
+          <Text style={[styles.podiumBlockText, { color: medalColor }]}>#{place}</Text>
+        </View>
+      </TouchableOpacity>
     </Animated.View>
   );
 }
 export default function LeaderboardScreen() {
   const router = useRouter();
+  const params = useLocalSearchParams();
+  const { colors, statusBarStyle } = useAppTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
 
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
 
   const [country, setCountry] = useState("Ethiopia");
   const [schoolCode, setSchoolCode] = useState(null);
+  const [schoolName, setSchoolName] = useState(null);
   const [grade, setGrade] = useState("7");
   const [scope, setScope] = useState("country");
 
@@ -194,19 +281,51 @@ export default function LeaderboardScreen() {
   const [schoolRows, setSchoolRows] = useState([]);
 
   const [myUserId, setMyUserId] = useState(null);
-  const [search, setSearch] = useState("");
 
   const [profileModalVisible, setProfileModalVisible] = useState(false);
   const [profileLoading, setProfileLoading] = useState(false);
   const [selectedProfile, setSelectedProfile] = useState(null);
+  const [tiePickerVisible, setTiePickerVisible] = useState(false);
+  const [tieCandidates, setTieCandidates] = useState([]);
+  const [tieRank, setTieRank] = useState(null);
 
-  const safeTop = Platform.OS === "android" ? (StatusBar.currentHeight || 0) : 0;
+  const requestedScope = useMemo(() => {
+    const raw = String(params?.scope || params?.filter || params?.level || "").toLowerCase();
+    if (raw.includes("school")) return "school";
+    if (raw.includes("country")) return "country";
+    return null;
+  }, [params?.filter, params?.level, params?.scope]);
 
   const firstAnim = useRef(new Animated.Value(0)).current;
   const secondAnim = useRef(new Animated.Value(0)).current;
   const thirdAnim = useRef(new Animated.Value(0)).current;
 
-  const enrichRows = useCallback(async (valObj) => {
+  const hydrateCachedLeaderboard = useCallback(async () => {
+    const sid =
+      (await AsyncStorage.getItem("studentNodeKey")) ||
+      (await AsyncStorage.getItem("studentId")) ||
+      (await AsyncStorage.getItem("username")) ||
+      "anonymous";
+
+    const cached = await readScreenCache("leaderboard", [sid]);
+    if (!cached) return false;
+
+    setCountry(cached.country || "Ethiopia");
+    setSchoolCode(cached.schoolCode || null);
+    setSchoolName(cached.schoolName || null);
+    setGrade(cached.grade || "7");
+    setCountryRows(Array.isArray(cached.countryRows) ? cached.countryRows : []);
+    setSchoolRows(Array.isArray(cached.schoolRows) ? cached.schoolRows : []);
+    setMyUserId(cached.myUserId || null);
+    if (!requestedScope && cached.scope) {
+      setScope(cached.scope);
+    }
+    setLoading(false);
+    return true;
+  }, [requestedScope]);
+
+  const enrichRows = useCallback(async (valObj, activeGrade) => {
+    const targetGrade = normalizeGrade(activeGrade);
     const base = Object.keys(valObj || {}).map((uid) => ({
       userId: uid,
       rank: Number(valObj[uid]?.rank || 9999),
@@ -214,69 +333,118 @@ export default function LeaderboardScreen() {
     }));
     base.sort((a, b) => a.rank - b.rank);
 
-    return Promise.all(
+    const resolved = await Promise.all(
       base.map(async (r) => {
         const { profile, schoolCode: resolvedSchool } = await resolveUserProfile(r.userId);
+        const details = await resolveStudentAndSchoolDetails(r.userId, resolvedSchool);
+        const studentGrade = normalizeGrade(
+          details?.student?.basicStudentInformation?.grade ||
+          details?.student?.grade ||
+          ""
+        );
         return {
           ...r,
           name: profile?.name || profile?.username || r.userId,
-          avatar: profile?.profileImage || null,
+          avatar: extractProfileImage(profile),
           schoolCode: resolvedSchool || null,
+          studentGrade,
         };
       })
     );
+
+    return resolved.filter((r) => !!r.studentGrade && r.studentGrade === targetGrade);
   }, []);
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  const load = useCallback(async (options = {}) => {
+    const silent = Boolean(options?.silent);
+    if (!silent) setLoading(true);
 
-    const sid =
-      (await AsyncStorage.getItem("studentNodeKey")) ||
-      (await AsyncStorage.getItem("studentId")) ||
-      (await AsyncStorage.getItem("username")) ||
-      null;
-    setMyUserId(sid);
+    try {
+      const sid =
+        (await AsyncStorage.getItem("studentNodeKey")) ||
+        (await AsyncStorage.getItem("studentId")) ||
+        (await AsyncStorage.getItem("username")) ||
+        null;
+      setMyUserId(sid);
 
-    const gradeRaw = await AsyncStorage.getItem("studentGrade");
-    const g = normalizeGrade(gradeRaw) || "7";
-    setGrade(g);
+      const gradeRaw = await AsyncStorage.getItem("studentGrade");
+      const g = normalizeGrade(gradeRaw) || "7";
+      setGrade(g);
 
-    const countrySnap = await getSnapshot([`Platform1/country`, `country`]);
-    const c = (countrySnap?.val && countrySnap.val()) || "Ethiopia";
-    setCountry(c);
+      const countrySnap = await getSnapshot([`Platform1/country`, `country`]);
+      const c = (countrySnap?.val && countrySnap.val()) || "Ethiopia";
+      setCountry(c);
 
-    let mySchool = null;
-    if (sid) {
-      try {
-        const pref = String(sid).slice(0, 3).toUpperCase();
-        const idx = await get(ref(database, `Platform1/schoolCodeIndex/${pref}`));
-        mySchool = idx?.val() || null;
-      } catch {}
+      let mySchool = null;
+      if (sid) {
+        try {
+          const pref = String(sid).slice(0, 3).toUpperCase();
+          const idx = await get(ref(database, `Platform1/schoolCodeIndex/${pref}`));
+          mySchool = idx?.val() || null;
+        } catch {}
+      }
+      setSchoolCode(mySchool);
+      if (mySchool) {
+        try {
+          const schoolInfoSnap = await get(ref(database, `Platform1/Schools/${mySchool}/schoolInfo`));
+          const info = schoolInfoSnap?.exists() ? schoolInfoSnap.val() : null;
+          setSchoolName(info?.name || info?.schoolName || mySchool);
+        } catch {
+          setSchoolName(mySchool);
+        }
+      } else {
+        setSchoolName(null);
+      }
+
+      const gradeKey = `grade${g}`;
+      const countryPath = `Platform1/rankings/country/${c}/${gradeKey}/leaderboard`;
+      const schoolPath = mySchool ? `Platform1/rankings/schools/${mySchool}/${gradeKey}/leaderboard` : null;
+
+      const countrySnapLb = await getSnapshot([countryPath]);
+      const countryVal = countrySnapLb?.val ? countrySnapLb.val() : null;
+      const enrichedCountry = countryVal ? await enrichRows(countryVal, g) : [];
+      setCountryRows(enrichedCountry);
+
+      if (schoolPath) {
+        const schoolSnapLb = await getSnapshot([schoolPath]);
+        const schoolValRaw = schoolSnapLb?.val ? schoolSnapLb.val() : null;
+        const schoolVal = schoolValRaw?.leaderboard || schoolValRaw;
+        const enrichedSchool = schoolVal ? await enrichRows(schoolVal, g) : [];
+        setSchoolRows(enrichedSchool);
+      } else {
+        setSchoolRows([]);
+      }
+    } catch (error) {
+      console.warn("Leaderboard load error:", error);
+    } finally {
+      if (!silent) setLoading(false);
     }
-    setSchoolCode(mySchool);
-
-    const gradeKey = `grade${g}`;
-    const countryPath = `Platform1/rankings/country/${c}/${gradeKey}/leaderboard`;
-    const schoolPath = mySchool ? `Platform1/rankings/schools/${mySchool}/${gradeKey}/leaderboard` : null;
-
-    const countrySnapLb = await getSnapshot([countryPath]);
-    const countryVal = countrySnapLb?.val ? countrySnapLb.val() : null;
-    const enrichedCountry = countryVal ? await enrichRows(countryVal) : [];
-    setCountryRows(enrichedCountry);
-
-    if (schoolPath) {
-      const schoolSnapLb = await getSnapshot([schoolPath]);
-      const schoolVal = schoolSnapLb?.val ? schoolSnapLb.val() : null;
-      const enrichedSchool = schoolVal ? await enrichRows(schoolVal) : [];
-      setSchoolRows(enrichedSchool);
-    } else {
-      setSchoolRows([]);
-    }
-
-    setLoading(false);
   }, [enrichRows]);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    let active = true;
+
+    (async () => {
+      const hadCache = await hydrateCachedLeaderboard();
+      if (!active) return;
+      await load({ silent: hadCache });
+    })();
+
+    return () => {
+      active = false;
+    };
+  }, [hydrateCachedLeaderboard, load]);
+
+  useEffect(() => {
+    if (requestedScope === "country") {
+      setScope("country");
+      return;
+    }
+
+    if (requestedScope === "school") {
+      setScope(schoolCode ? "school" : "country");
+    }
+  }, [requestedScope, schoolCode]);
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
@@ -284,38 +452,65 @@ export default function LeaderboardScreen() {
     setRefreshing(false);
   }, [load]);
 
+  useEffect(() => {
+    if (loading) return;
+
+    (async () => {
+      const sid =
+        (await AsyncStorage.getItem("studentNodeKey")) ||
+        (await AsyncStorage.getItem("studentId")) ||
+        (await AsyncStorage.getItem("username")) ||
+        "anonymous";
+
+      await writeScreenCache("leaderboard", [sid], {
+        country,
+        schoolCode,
+        schoolName,
+        grade,
+        scope,
+        countryRows,
+        schoolRows,
+        myUserId,
+      });
+    })();
+  }, [loading, country, schoolCode, schoolName, grade, scope, countryRows, schoolRows, myUserId]);
+
   const rows = useMemo(
     () => (scope === "school" ? schoolRows : countryRows),
     [scope, schoolRows, countryRows]
   );
 
-  const filteredRows = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    if (!q) return rows;
-    return rows.filter((r) =>
-      String(r.name || "").toLowerCase().includes(q) ||
-      String(r.userId || "").toLowerCase().includes(q)
-    );
-  }, [rows, search]);
-
-  const top3 = useMemo(() => rows.filter((r) => r.rank <= 3).sort((a, b) => a.rank - b.rank), [rows]);
-  const myRow = useMemo(() => rows.find((r) => r.userId === myUserId) || null, [rows, myUserId]);
+  const podiumGroups = useMemo(() => {
+    const byRank = { 1: [], 2: [], 3: [] };
+    rows.forEach((r) => {
+      if (r.rank >= 1 && r.rank <= 3) byRank[r.rank].push(r);
+    });
+    byRank[1].sort((a, b) => b.totalPoints - a.totalPoints);
+    byRank[2].sort((a, b) => b.totalPoints - a.totalPoints);
+    byRank[3].sort((a, b) => b.totalPoints - a.totalPoints);
+    return byRank;
+  }, [rows]);
 
   const podium = useMemo(() => {
-    const first = top3.find((x) => x.rank === 1) || null;
-    const second = top3.find((x) => x.rank === 2) || null;
-    const third = top3.find((x) => x.rank === 3) || null;
+    const second = podiumGroups[2]?.[0] ? { ...podiumGroups[2][0], tiedItems: podiumGroups[2] } : null;
+    const first = podiumGroups[1]?.[0] ? { ...podiumGroups[1][0], tiedItems: podiumGroups[1] } : null;
+    const third = podiumGroups[3]?.[0] ? { ...podiumGroups[3][0], tiedItems: podiumGroups[3] } : null;
     return { first, second, third };
-  }, [top3]);
+  }, [podiumGroups]);
 
-  const hasPodium = !!(podium.first || podium.second || podium.third);
+  const hasPodium = !!((podiumGroups[1] && podiumGroups[1].length) || (podiumGroups[2] && podiumGroups[2].length) || (podiumGroups[3] && podiumGroups[3].length));
 
   useEffect(() => {
+    if (!hasPodium) {
+      firstAnim.setValue(1);
+      secondAnim.setValue(1);
+      thirdAnim.setValue(1);
+      return;
+    }
+
     firstAnim.setValue(0);
     secondAnim.setValue(0);
     thirdAnim.setValue(0);
-
-    if (!hasPodium) return;
 
     Animated.stagger(120, [
       Animated.timing(secondAnim, {
@@ -396,19 +591,42 @@ export default function LeaderboardScreen() {
   const rankColor = (rank) =>
     rank === 1 ? C.gold : rank === 2 ? C.silver : rank === 3 ? C.bronze : C.primary;
 
+  const handlePodiumPress = (rank, group) => {
+    if (!group?.length) return;
+    if (group.length === 1) {
+      openStudentProfile(group[0]);
+      return;
+    }
+    setTieRank(rank);
+    setTieCandidates(group);
+    setTiePickerVisible(true);
+  };
+
   const openStudentProfile = async (item) => {
     setProfileModalVisible(true);
     setProfileLoading(true);
     setSelectedProfile(null);
 
-    const { student, schoolInfo } = await resolveStudentAndSchoolDetails(item.userId, item.schoolCode);
+    const { student, schoolInfo, schoolCode: resolvedSchoolCode, user } =
+      await resolveStudentAndSchoolDetails(item.userId, item.schoolCode);
 
-    const gender = student?.basicStudentInformation?.gender || student?.gender || "";
-    const dob = student?.basicStudentInformation?.dob || student?.dob || "";
-    const age = yearsFromDob(dob);
+    const gender =
+      student?.basicStudentInformation?.gender ||
+      student?.gender ||
+      user?.gender ||
+      "";
+    const gradeLabel = extractStudentGrade(student);
+    const schoolName =
+      schoolInfo?.name ||
+      schoolInfo?.schoolName ||
+      user?.schoolName ||
+      user?.schoolCode ||
+      item.schoolName ||
+      resolvedSchoolCode ||
+      item.schoolCode ||
+      "";
 
     const city =
-      student?.addressInformation?.city ||
       schoolInfo?.city ||
       schoolInfo?.address?.city ||
       "";
@@ -425,9 +643,8 @@ export default function LeaderboardScreen() {
       points: item.totalPoints,
       avatar: item.avatar,
       gender,
-      age,
-      schoolName: schoolInfo?.name || "",
-      schoolCode: item.schoolCode || "",
+      grade: gradeLabel,
+      school: schoolName,
       city,
       region,
     });
@@ -436,34 +653,29 @@ export default function LeaderboardScreen() {
 
   if (loading) {
     return (
-      <SafeAreaView style={[styles.screen, { paddingTop: safeTop }]}>
-        <StatusBar barStyle="dark-content" backgroundColor={C.bg} />
-        <View style={styles.center}>
-          <ActivityIndicator color={C.primary} />
-        </View>
-      </SafeAreaView>
+      <PageLoadingSkeleton variant="list" style={styles.screen} />
     );
   }
 
   return (
-    <SafeAreaView style={[styles.screen, { paddingTop: safeTop }]}>
-      <StatusBar barStyle="dark-content" backgroundColor={C.bg} />
+    <SafeAreaView style={styles.screen}>
+      <StatusBar barStyle={statusBarStyle} backgroundColor={colors.background} />
 
       <View style={styles.header}>
-        <TouchableOpacity onPress={() => router.back()} style={styles.backBtn}>
-          <Ionicons name="chevron-back" size={22} color={C.text} />
+        <TouchableOpacity onPress={() => router.replace("/dashboard/exam")} style={styles.backBtn}>
+          <Ionicons name="chevron-back" size={22} color={colors.text} />
         </TouchableOpacity>
         <View style={{ flex: 1 }}>
           <Text style={styles.title}>Leaderboard</Text>
           <Text style={styles.sub}>
             {scope === "country"
               ? `${country} • Grade ${grade}`
-              : `${schoolCode || "My School"} • Grade ${grade}`}
+              : `${schoolName || "My School"} • Grade ${grade}`}
           </Text>
         </View>
       </View>
 
-      <View style={styles.toggleWrap}>
+      <View style={styles.toggleWrapTopOnly}>
         <TouchableOpacity
           onPress={() => setScope("country")}
           style={[styles.toggleBtn, scope === "country" ? styles.toggleOn : styles.toggleOff]}
@@ -475,44 +687,44 @@ export default function LeaderboardScreen() {
 
         <TouchableOpacity
           onPress={() => setScope("school")}
-          style={[styles.toggleBtn, scope === "school" ? styles.toggleOn : styles.toggleOff]}
+          style={[styles.toggleBtn, scope === "school" ? styles.toggleOn : styles.toggleOff, !schoolCode ? styles.toggleDisabled : null]}
           disabled={!schoolCode}
         >
           <Text style={scope === "school" ? styles.toggleTextOn : styles.toggleTextOff}>
-            School
+            Your School
           </Text>
         </TouchableOpacity>
       </View>
 
-      <View style={styles.searchWrap}>
-        <Ionicons name="search-outline" size={18} color={C.muted} />
-        <TextInput
-          value={search}
-          onChangeText={setSearch}
-          placeholder="Search student by name or ID"
-          placeholderTextColor="#9CA7CF"
-          style={styles.searchInput}
+      <View style={styles.podiumWrap}>
+        <PodiumItem
+          item={podium.second}
+          place={2}
+          rankColor={rankColor}
+          animatedStyle={secondAnimatedStyle}
+          onPress={() => handlePodiumPress(2, podiumGroups[2])}
+          styles={styles}
+        />
+        <PodiumItem
+          item={podium.first}
+          place={1}
+          rankColor={rankColor}
+          animatedStyle={firstAnimatedStyle}
+          onPress={() => handlePodiumPress(1, podiumGroups[1])}
+          styles={styles}
+        />
+        <PodiumItem
+          item={podium.third}
+          place={3}
+          rankColor={rankColor}
+          animatedStyle={thirdAnimatedStyle}
+          onPress={() => handlePodiumPress(3, podiumGroups[3])}
+          styles={styles}
         />
       </View>
 
-      {myRow ? (
-        <View style={styles.meCard}>
-          <Text style={styles.meText}>Your Rank</Text>
-          <Text style={styles.meRank}>#{myRow.rank}</Text>
-          <Text style={styles.mePts}>{myRow.totalPoints} pts</Text>
-        </View>
-      ) : null}
-
-      {hasPodium ? (
-        <View style={styles.podiumWrap}>
-          <PodiumItem item={podium.second} place={2} rankColor={rankColor} animatedStyle={secondAnimatedStyle} />
-          <PodiumItem item={podium.first} place={1} rankColor={rankColor} animatedStyle={firstAnimatedStyle} />
-          <PodiumItem item={podium.third} place={3} rankColor={rankColor} animatedStyle={thirdAnimatedStyle} />
-        </View>
-      ) : null}
-
       <FlatList
-        data={filteredRows}
+        data={rows}
         keyExtractor={(i) => i.userId}
         contentContainerStyle={{ padding: 16, paddingBottom: 26 }}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={C.primary} />}
@@ -525,7 +737,9 @@ export default function LeaderboardScreen() {
         renderItem={({ item }) => (
           <TouchableOpacity activeOpacity={0.9} onPress={() => openStudentProfile(item)}>
             <View style={[styles.row, item.userId === myUserId ? styles.myRow : null]}>
-              <Text style={[styles.rank, { color: rankColor(item.rank) }]}>#{item.rank}</Text>
+              <View style={[styles.rankPill, { backgroundColor: `${rankColor(item.rank)}1E` }]}>
+                <Text style={[styles.rank, { color: rankColor(item.rank) }]}>#{item.rank}</Text>
+              </View>
               {item.avatar ? (
                 <Image source={{ uri: item.avatar }} style={styles.avatar} />
               ) : (
@@ -535,9 +749,14 @@ export default function LeaderboardScreen() {
               )}
               <View style={{ flex: 1, marginLeft: 10 }}>
                 <Text numberOfLines={1} style={styles.name}>{item.name}</Text>
-                <Text style={styles.points}>{item.totalPoints} points</Text>
+                <View style={styles.pointsChip}>
+                  <Ionicons name="trophy-outline" size={12} color={C.primary} />
+                  <Text style={styles.points}>{item.totalPoints} points</Text>
+                </View>
               </View>
-              <Ionicons name="chevron-forward" size={18} color={C.muted} />
+              <View style={styles.rowChevronWrap}>
+                <Ionicons name="chevron-forward" size={16} color={colors.muted} />
+              </View>
             </View>
           </TouchableOpacity>
         )}
@@ -571,12 +790,11 @@ export default function LeaderboardScreen() {
                 </View>
 
                 <View style={styles.infoGrid}>
-                  <InfoRow label="Age" value={selectedProfile?.age || "-"} />
-                  <InfoRow label="Gender" value={selectedProfile?.gender || "-"} />
-                  <InfoRow label="School" value={selectedProfile?.schoolName || "-"} />
-                  <InfoRow label="School Code" value={selectedProfile?.schoolCode || "-"} />
-                  <InfoRow label="Region" value={selectedProfile?.region || "-"} />
-                  <InfoRow label="City" value={selectedProfile?.city || "-"} />
+                  <InfoRow label="Grade" value={selectedProfile?.grade || "-"} styles={styles} />
+                  <InfoRow label="Gender" value={selectedProfile?.gender || "-"} styles={styles} />
+                  <InfoRow label="School" value={selectedProfile?.school || "-"} styles={styles} />
+                  <InfoRow label="Region" value={selectedProfile?.region || "-"} styles={styles} />
+                  <InfoRow label="City" value={selectedProfile?.city || "-"} styles={styles} />
                 </View>
 
                 <TouchableOpacity style={styles.closeBtn} onPress={() => setProfileModalVisible(false)}>
@@ -587,11 +805,59 @@ export default function LeaderboardScreen() {
           </View>
         </View>
       </Modal>
+
+      <Modal
+        visible={tiePickerVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setTiePickerVisible(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.tieModalCard}>
+            <Text style={styles.tieModalTitle}>Rank #{tieRank} is tied</Text>
+            <Text style={styles.tieModalSubtitle}>Choose a student to view full profile details.</Text>
+
+            <FlatList
+              data={tieCandidates}
+              keyExtractor={(i, idx) => `${i.userId}-${idx}`}
+              ItemSeparatorComponent={() => <View style={{ height: 8 }} />}
+              style={{ maxHeight: 280, width: "100%" }}
+              renderItem={({ item }) => (
+                <TouchableOpacity
+                  style={styles.tieOptionRow}
+                  activeOpacity={0.9}
+                  onPress={() => {
+                    setTiePickerVisible(false);
+                    setTimeout(() => openStudentProfile(item), 120);
+                  }}
+                >
+                  {item.avatar ? (
+                    <Image source={{ uri: item.avatar }} style={styles.tieOptionAvatar} />
+                  ) : (
+                    <View style={[styles.tieOptionAvatar, styles.avatarFallback]}>
+                      <Text style={styles.initial}>{(item.name || "U")[0]}</Text>
+                    </View>
+                  )}
+                  <View style={{ flex: 1, marginLeft: 10 }}>
+                    <Text numberOfLines={1} style={styles.tieOptionName}>{item.name}</Text>
+                    <Text style={styles.tieOptionPoints}>{item.totalPoints} points</Text>
+                  </View>
+                  <Ionicons name="chevron-forward" size={16} color={colors.muted} />
+                </TouchableOpacity>
+              )}
+            />
+
+            <TouchableOpacity style={styles.closeBtn} onPress={() => setTiePickerVisible(false)}>
+              <Text style={styles.closeBtnText}>Close</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
 
-function InfoRow({ label, value }) {
+function InfoRow({ label, value, styles }) {
   return (
     <View style={styles.infoRow}>
       <Text style={styles.infoLabel}>{label}</Text>
@@ -600,16 +866,17 @@ function InfoRow({ label, value }) {
   );
 }
 
-const styles = StyleSheet.create({
-  screen: { flex: 1, backgroundColor: C.bg },
+function createStyles(colors) {
+  return StyleSheet.create({
+  screen: { flex: 1, backgroundColor: colors.background },
   center: { flex: 1, alignItems: "center", justifyContent: "center" },
 
   header: {
     flexDirection: "row",
     alignItems: "center",
     paddingHorizontal: 16,
-    paddingTop: 10,
-    paddingBottom: 8,
+    paddingTop: 2,
+    paddingBottom: 6,
   },
   backBtn: {
     width: 36,
@@ -618,48 +885,149 @@ const styles = StyleSheet.create({
     marginRight: 10,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "#F7F9FF",
+    backgroundColor: colors.inputBackground,
   },
-  title: { fontSize: 22, fontWeight: "900", color: C.text },
-  sub: { color: C.muted, marginTop: 2 },
+  title: { fontSize: 22, fontWeight: "900", color: colors.text },
+  sub: { color: colors.muted, marginTop: 2 },
 
-  toggleWrap: { flexDirection: "row", paddingHorizontal: 16, gap: 8, marginTop: 6 },
-  toggleBtn: { paddingVertical: 8, paddingHorizontal: 14, borderRadius: 10, borderWidth: 1 },
-  toggleOn: { backgroundColor: C.primary, borderColor: C.primary },
-  toggleOff: { backgroundColor: "#fff", borderColor: C.border },
-  toggleTextOn: { color: "#fff", fontWeight: "800" },
-  toggleTextOff: { color: C.text, fontWeight: "800" },
+  heroPanel: {
+    marginHorizontal: 16,
+    marginTop: 8,
+    borderRadius: 22,
+    borderWidth: 1,
+    borderColor: colors.infoBorder,
+    backgroundColor: colors.elevatedSurface,
+    padding: 14,
+    overflow: "hidden",
+  },
+  heroGlowA: {
+    position: "absolute",
+    width: 150,
+    height: 150,
+    borderRadius: 75,
+    backgroundColor: "rgba(11,114,255,0.12)",
+    top: -70,
+    right: -32,
+  },
+  heroGlowB: {
+    position: "absolute",
+    width: 120,
+    height: 120,
+    borderRadius: 60,
+    backgroundColor: "rgba(59,130,246,0.09)",
+    bottom: -55,
+    left: -22,
+  },
+  heroTopRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  heroChip: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: colors.soft,
+    borderWidth: 1,
+    borderColor: colors.infoBorder,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+  },
+  heroChipText: {
+    marginLeft: 6,
+    color: colors.primary,
+    fontSize: 11,
+    fontWeight: "800",
+  },
+  heroMeta: {
+    color: colors.muted,
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  toggleWrapTopOnly: {
+    flexDirection: "row",
+    gap: 8,
+    marginTop: 6,
+    paddingHorizontal: 16,
+    paddingBottom: 10,
+  },
+  toggleWrap: { flexDirection: "row", gap: 8, marginTop: 12 },
+  toggleBtn: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.card,
+    alignItems: "center",
+    justifyContent: "center",
+    flex: 1,
+  },
+  toggleOn: { backgroundColor: colors.soft, borderColor: colors.primary },
+  toggleOff: { backgroundColor: colors.card, borderColor: colors.border },
+  toggleDisabled: { opacity: 0.55 },
+  toggleTextOn: { color: colors.primary, fontSize: 12, fontWeight: "700" },
+  toggleTextOff: { color: colors.muted, fontSize: 12, fontWeight: "700" },
 
   searchWrap: {
-    marginHorizontal: 16,
     marginTop: 10,
     flexDirection: "row",
     alignItems: "center",
     borderWidth: 1,
-    borderColor: C.border,
+    borderColor: colors.border,
     borderRadius: 12,
     paddingHorizontal: 10,
     paddingVertical: 8,
-    backgroundColor: "#fff",
+    backgroundColor: colors.card,
   },
-  searchInput: { marginLeft: 8, flex: 1, color: C.text, fontWeight: "600" },
+  searchInput: { marginLeft: 8, flex: 1, color: colors.text, fontWeight: "600" },
+
+  heroStatsRow: {
+    marginTop: 10,
+    flexDirection: "row",
+    gap: 8,
+  },
+  heroStatCard: {
+    flex: 1,
+    backgroundColor: colors.card,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 14,
+    paddingVertical: 8,
+    alignItems: "center",
+  },
+  heroStatValue: {
+    color: colors.primary,
+    fontSize: 16,
+    fontWeight: "900",
+  },
+  heroStatLabel: {
+    marginTop: 2,
+    color: colors.muted,
+    fontSize: 11,
+    fontWeight: "700",
+  },
 
   meCard: {
     marginHorizontal: 16,
     marginTop: 10,
     marginBottom: 8,
     borderWidth: 1,
-    borderColor: C.border,
+    borderColor: colors.border,
     borderRadius: 14,
     padding: 12,
-    backgroundColor: "#F8FAFF",
+    backgroundColor: colors.elevatedSurface,
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.03,
+    shadowRadius: 8,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
   },
-  meText: { color: C.muted, fontWeight: "700" },
-  meRank: { color: C.primary, fontWeight: "900", fontSize: 20 },
-  mePts: { color: C.text, fontWeight: "800" },
+  meText: { color: colors.muted, fontWeight: "700" },
+  meRank: { color: colors.primary, fontWeight: "900", fontSize: 20 },
+  mePts: { color: colors.text, fontWeight: "800" },
 
   podiumWrap: {
     flexDirection: "row",
@@ -671,6 +1039,7 @@ const styles = StyleSheet.create({
   },
   podiumCol: { flex: 1, alignItems: "center" },
   podiumCenter: { marginHorizontal: 4 },
+  podiumTouch: { width: "100%", alignItems: "center" },
 
   podiumAvatarWrap: {
     width: 66,
@@ -679,7 +1048,7 @@ const styles = StyleSheet.create({
     borderWidth: 2.5,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "#fff",
+    backgroundColor: colors.card,
   },
   podiumAvatarWrapFirst: { width: 78, height: 78, borderRadius: 39 },
   podiumAvatar: { width: "100%", height: "100%", borderRadius: 999 },
@@ -700,7 +1069,7 @@ const styles = StyleSheet.create({
     height: 24,
     borderRadius: 12,
     borderWidth: 1.5,
-    borderColor: "#fff",
+    borderColor: colors.card,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -709,12 +1078,49 @@ const styles = StyleSheet.create({
   podiumName: {
     marginTop: 8,
     fontWeight: "800",
-    color: C.text,
+    color: colors.text,
     fontSize: 12,
     width: 90,
     textAlign: "center",
   },
-  podiumPts: { marginTop: 2, color: C.muted, fontSize: 11, fontWeight: "700" },
+  podiumPts: { marginTop: 2, color: colors.muted, fontSize: 11, fontWeight: "700" },
+  tiePreviewWrap: {
+    marginTop: 6,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  tiePreviewAvatarWrap: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    borderWidth: 1.5,
+    backgroundColor: colors.card,
+    overflow: "hidden",
+  },
+  tiePreviewAvatar: {
+    width: "100%",
+    height: "100%",
+    borderRadius: 12,
+  },
+  tiePreviewFallback: {
+    width: "100%",
+    height: "100%",
+    borderRadius: 12,
+    backgroundColor: C.primary,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  tiePreviewInitial: {
+    color: "#fff",
+    fontSize: 10,
+    fontWeight: "900",
+  },
+  tiePreviewText: {
+    marginLeft: 6,
+    fontSize: 11,
+    fontWeight: "800",
+  },
 
   podiumBlock: {
     marginTop: 8,
@@ -730,16 +1136,29 @@ const styles = StyleSheet.create({
 
   row: {
     borderWidth: 1,
-    borderColor: C.border,
-    borderRadius: 14,
-    backgroundColor: "#fff",
+    borderColor: colors.border,
+    borderRadius: 16,
+    backgroundColor: colors.card,
     paddingHorizontal: 12,
-    paddingVertical: 10,
+    paddingVertical: 11,
     flexDirection: "row",
     alignItems: "center",
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.02,
+    shadowRadius: 6,
   },
-  myRow: { backgroundColor: "#F1F7FF", borderColor: "#CFE1FF" },
-  rank: { width: 44, fontWeight: "900", fontSize: 16 },
+  myRow: { backgroundColor: colors.soft, borderColor: colors.primary },
+  rankPill: {
+    minWidth: 50,
+    height: 32,
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 10,
+  },
+  rank: { fontWeight: "900", fontSize: 15 },
   avatar: { width: 42, height: 42, borderRadius: 21 },
   avatarFallback: {
     width: 42,
@@ -750,15 +1169,37 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   initial: { color: "#fff", fontWeight: "900" },
-  name: { color: C.text, fontWeight: "800", fontSize: 14 },
-  points: { color: C.muted, marginTop: 2, fontSize: 12 },
+  name: { color: colors.text, fontWeight: "800", fontSize: 14 },
+  pointsChip: {
+    marginTop: 4,
+    alignSelf: "flex-start",
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: colors.soft,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+  },
+  points: { color: C.primary, marginLeft: 5, fontSize: 11, fontWeight: "800" },
+  rowChevronWrap: {
+    width: 30,
+    height: 30,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.inputBackground,
+    alignItems: "center",
+    justifyContent: "center",
+  },
 
   emptyWrap: { alignItems: "center", paddingVertical: 30 },
-  emptyText: { color: C.muted, fontWeight: "700" },
+  emptyText: { color: colors.muted, fontWeight: "700" },
 
   modalOverlay: {
     flex: 1,
-    backgroundColor: "rgba(0,0,0,0.45)",
+    backgroundColor: colors.overlay,
     justifyContent: "center",
     alignItems: "center",
     padding: 20,
@@ -766,9 +1207,61 @@ const styles = StyleSheet.create({
   modalCard: {
     width: "100%",
     maxWidth: 420,
-    backgroundColor: "#fff",
+    backgroundColor: colors.card,
     borderRadius: 22,
     padding: 18,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  tieModalCard: {
+    width: "100%",
+    maxWidth: 420,
+    backgroundColor: colors.card,
+    borderRadius: 22,
+    padding: 18,
+    borderWidth: 1,
+    borderColor: colors.border,
+    alignItems: "center",
+  },
+  tieModalTitle: {
+    color: colors.text,
+    fontSize: 18,
+    fontWeight: "900",
+  },
+  tieModalSubtitle: {
+    marginTop: 6,
+    marginBottom: 14,
+    color: colors.muted,
+    fontSize: 12,
+    fontWeight: "700",
+    textAlign: "center",
+  },
+  tieOptionRow: {
+    width: "100%",
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 12,
+    backgroundColor: colors.card,
+    paddingHorizontal: 10,
+    paddingVertical: 9,
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  tieOptionAvatar: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+  },
+  tieOptionName: {
+    color: colors.text,
+    fontSize: 13,
+    fontWeight: "800",
+  },
+  tieOptionPoints: {
+    marginTop: 2,
+    color: colors.muted,
+    fontSize: 11,
+    fontWeight: "700",
   },
   profileHero: {
     alignItems: "center",
@@ -778,12 +1271,14 @@ const styles = StyleSheet.create({
   modalName: {
     marginTop: 12,
     fontWeight: "900",
-    color: C.text,
+    color: colors.text,
     fontSize: 19,
   },
   modalRankBadge: {
     marginTop: 8,
-    backgroundColor: "#EEF4FF",
+    backgroundColor: colors.soft,
+    borderWidth: 1,
+    borderColor: colors.border,
     borderRadius: 999,
     paddingHorizontal: 12,
     paddingVertical: 7,
@@ -792,40 +1287,56 @@ const styles = StyleSheet.create({
 
 
   emptyPodiumAvatarWrap: {
-  backgroundColor: "#F8FAFF",
-  borderStyle: "dashed",
-},
-
-podiumNameEmpty: {
-  marginTop: 8,
-  fontWeight: "800",
-  color: C.muted,
-  fontSize: 12,
-  width: 90,
-  textAlign: "center",
-},
-
-podiumPtsEmpty: {
-  marginTop: 2,
-  color: "#98A2B3",
-  fontSize: 11,
-  fontWeight: "700",
-},
+    backgroundColor: colors.inputBackground,
+    borderStyle: "dashed",
+  },
+  podiumNameEmpty: {
+    marginTop: 10,
+    fontWeight: "900",
+    color: colors.text,
+    fontSize: 12,
+    width: 98,
+    textAlign: "center",
+  },
+  podiumPtsEmpty: {
+    marginTop: 3,
+    color: colors.muted,
+    fontSize: 11,
+    fontWeight: "700",
+  },
+  emptyPodiumHint: {
+    marginTop: 7,
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 999,
+    backgroundColor: colors.inputBackground,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  emptyPodiumHintText: {
+    marginLeft: 4,
+    fontSize: 10,
+    fontWeight: "800",
+  },
   infoGrid: { marginTop: 16, gap: 8 },
   infoRow: {
     borderWidth: 1,
-    borderColor: C.border,
+    borderColor: colors.border,
     borderRadius: 12,
     paddingHorizontal: 12,
     paddingVertical: 10,
     flexDirection: "row",
     justifyContent: "space-between",
   },
-  infoLabel: { color: C.muted, fontWeight: "700" },
-  infoValue: { color: C.text, fontWeight: "800", maxWidth: "60%", textAlign: "right" },
+  infoLabel: { color: colors.muted, fontWeight: "700" },
+  infoValue: { color: colors.text, fontWeight: "800", maxWidth: "60%", textAlign: "right" },
 
   closeBtn: {
     marginTop: 16,
+    width: "100%",
+    alignSelf: "stretch",
     backgroundColor: C.primary,
     borderRadius: 12,
     alignItems: "center",
@@ -833,3 +1344,4 @@ podiumPtsEmpty: {
   },
   closeBtnText: { color: "#fff", fontWeight: "900" },
 });
+} 

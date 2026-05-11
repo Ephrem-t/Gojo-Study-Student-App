@@ -1,31 +1,36 @@
 // app/messages.jsx
-import React, { useEffect, useState, useRef, useMemo } from "react";
+import React, { useCallback, useEffect, useState, useRef, useMemo } from "react";
 import {
   View,
   Text,
   StyleSheet,
   FlatList,
   TouchableOpacity,
-  ActivityIndicator,
   Image,
   StatusBar,
   TextInput,
   Platform,
   Alert,
-  Keyboard,
   Modal,
+  KeyboardAvoidingView,
+  InteractionManager,
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
-import { ref, push, update, get, onValue, off } from "firebase/database";
+import { ref, push, update, get, onValue, off, runTransaction } from "../lib/offlineDatabase";
 import { getStorage, ref as storageRef, uploadBytes, getDownloadURL } from "firebase/storage";
 import * as ImagePicker from "expo-image-picker";
 import { database } from "../constants/firebaseConfig";
 import { getOpenedChat, clearOpenedChat } from "./lib/chatStore";
-import { useSafeAreaInsets, SafeAreaView } from "react-native-safe-area-context";
+import { SafeAreaView } from "react-native-safe-area-context";
 // school-aware helpers
 import { getUserVal } from "./lib/userHelpers";
+import { useAppTheme } from "../hooks/use-app-theme";
+import PageLoadingSkeleton from "../components/ui/page-loading-skeleton";
+import { extractProfileImage, normalizeProfileImageUri } from "./lib/profileImage";
+import { persistChatMessages, persistChatsCache, readCachedChatMessages, readChatsCache } from "../lib/chatCache";
+import { queueChatImageUpload, readPendingChatMessages } from "../lib/mediaUploadQueue";
 
 /**
  * app/messages.jsx
@@ -40,13 +45,6 @@ import { getUserVal } from "./lib/userHelpers";
  * - Avoids inline `await` inside template literals — builds a prefix string first.
  */
 
-const PRIMARY = "#007AFB";
-const MUTED = "#6B78A8";
-const BG = "#FFFFFF";
-const INCOMING_BG = "#F6F7FB";
-const OUTGOING_BG = "#007AFB";
-const INCOMING_TEXT = "#111";
-const OUTGOING_TEXT = "#fff";
 const AVATAR_PLACEHOLDER = require("../assets/images/avatar_placeholder.png");
 
 function fmtTime12(ts) {
@@ -89,10 +87,48 @@ async function getDbRef(subPath) {
   return ref(database, `${prefix}${subPath}`);
 }
 
+function mergeMessagesWithPending(messages = [], pendingMessages = []) {
+  const mergedById = new Map();
+
+  (Array.isArray(messages) ? messages : []).forEach((message) => {
+    const fallbackKey = `${message?.timeStamp || 0}:${message?.senderId || ""}:${message?.imageUrl || message?.text || ""}`;
+    mergedById.set(String(message?.messageId || fallbackKey), message);
+  });
+
+  (Array.isArray(pendingMessages) ? pendingMessages : []).forEach((message) => {
+    const fallbackKey = `${message?.timeStamp || 0}:${message?.senderId || ""}:${message?.imageUrl || message?.text || ""}`;
+    const mergedKey = String(message?.messageId || fallbackKey);
+    if (!mergedById.has(mergedKey)) {
+      mergedById.set(mergedKey, message);
+    }
+  });
+
+  return Array.from(mergedById.values()).sort(
+    (left, right) => Number(left?.timeStamp || 0) - Number(right?.timeStamp || 0)
+  );
+}
+
+function isRetryableUploadError(error) {
+  const code = String(error?.code || "").toLowerCase();
+  const message = String(error?.message || error || "").toLowerCase();
+
+  return (
+    code.includes("network") ||
+    code.includes("storage/") ||
+    message.includes("network") ||
+    message.includes("offline") ||
+    message.includes("timeout") ||
+    message.includes("disconnected") ||
+    message.includes("failed to get")
+  );
+}
+
 export default function MessagesScreen(props) {
   const router = useRouter();
-  const insets = useSafeAreaInsets();
   const storage = getStorage();
+  const { colors, statusBarStyle } = useAppTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
+  const MUTED = colors.muted;
 
   const opened = getOpenedChat() || {};
   const routeParams = (props && props.route && props.route.params) ? props.route.params : {};
@@ -109,7 +145,7 @@ export default function MessagesScreen(props) {
   const [currentUserNodeKey, setCurrentUserNodeKey] = useState(null);
   const [chatId, setChatId] = useState(chatFromStore.chatId || "");
   const [contactUserId, setContactUserId] = useState(chatFromStore.contactUserId || "");
-  const [contactKey, setContactKey] = useState(chatFromStore.contactKey || "");
+  const [contactKey] = useState(chatFromStore.contactKey || "");
   const [contactName, setContactName] = useState(chatFromStore.contactName || "");
   const [contactImage, setContactImage] = useState(chatFromStore.contactImage || null);
   const [contactSubtitle, setContactSubtitle] = useState(""); // subject/role to show under name
@@ -120,14 +156,10 @@ export default function MessagesScreen(props) {
   const [text, setText] = useState("");
   const [lastMessageMeta, setLastMessageMeta] = useState(null);
 
-  const [keyboardHeight, setKeyboardHeight] = useState(0);
-  const [keyboardVisible, setKeyboardVisible] = useState(false);
-
   const [viewerVisible, setViewerVisible] = useState(false);
   const [viewerImages, setViewerImages] = useState([]);
-  const [viewerIndex, setViewerIndex] = useState(0);
   const [viewerFallbackUri, setViewerFallbackUri] = useState(null);
-  const [viewerLibAvailable, setViewerLibAvailable] = useState(null);
+  const safeContactImage = useMemo(() => normalizeProfileImageUri(contactImage), [contactImage]);
 
   const messagesRefRef = useRef(null);
   const lastMessageRefRef = useRef(null);
@@ -177,12 +209,12 @@ export default function MessagesScreen(props) {
         if (v && mounted) {
           if (v.userId) setContactUserId(v.userId);
           setContactName((prev) => prev || v.name || v.username || "");
-          setContactImage((prev) => prev || v.profileImage || null);
+          setContactImage((prev) => prev || extractProfileImage(v));
           const subtitle = (v.subject && String(v.subject).trim()) ? v.subject : (v.role || v.designation || "");
           setContactSubtitle(subtitle || "");
           return;
         }
-      } catch (e) {
+      } catch {
         // ignore
       }
       if (mounted) setContactSubtitle("");
@@ -191,7 +223,7 @@ export default function MessagesScreen(props) {
   }, [contactKey]);
 
   // findOrCreateChatId
-  async function findOrCreateChatId(userA, userB, createIfMissing = true) {
+  const findOrCreateChatId = useCallback(async (userA, userB, createIfMissing = true) => {
     if (!userA || !userB) return null;
     const c1 = makeDeterministicChatId(userA, userB);
     const c2 = makeDeterministicChatId(userB, userA);
@@ -220,69 +252,130 @@ export default function MessagesScreen(props) {
       console.warn("[Messages] findOrCreateChatId error", err);
       return null;
     }
-  }
+  }, []);
+
+  useEffect(() => {
+    if (chatId || !currentUserId || !contactUserId) return undefined;
+
+    let cancelled = false;
+    const task = InteractionManager.runAfterInteractions(() => {
+      findOrCreateChatId(currentUserId, contactUserId, false)
+        .then((resolvedChatId) => {
+          if (!cancelled && resolvedChatId) {
+            setChatId(resolvedChatId);
+          }
+        })
+        .catch((error) => {
+          console.warn("[Messages] resolve existing chat error", error);
+        });
+    });
+
+    return () => {
+      cancelled = true;
+      task?.cancel?.();
+    };
+  }, [chatId, contactUserId, currentUserId, findOrCreateChatId]);
 
   // Attach listener and normalize messages
   useEffect(() => {
     let mounted = true;
+
     const attach = async () => {
       if (!chatId) {
         setMessages([]);
         setLoading(false);
         return;
       }
-      setLoading(true);
+
+      const [cachedMessages, pendingMessages] = await Promise.all([
+        readCachedChatMessages(chatId),
+        readPendingChatMessages(chatId),
+      ]);
+      const warmMessages = mergeMessagesWithPending(cachedMessages, pendingMessages);
+
+      if (mounted && warmMessages.length) {
+        setMessages(warmMessages);
+        setLoading(false);
+      } else {
+        setLoading(true);
+      }
+
       const msgsRef = await getDbRef(`Chats/${chatId}/messages`);
       messagesRefRef.current = msgsRef;
 
       const listener = onValue(msgsRef, (snap) => {
         if (!mounted) return;
-        const arr = [];
+
+        const nextMessages = [];
         if (snap.exists()) {
           snap.forEach((child) => {
             const data = child.val() || {};
-            const m = { ...data, messageId: data.messageId || child.key };
-            arr.push(m);
+            nextMessages.push({ ...data, messageId: data.messageId || child.key });
           });
         }
-        arr.sort((a, b) => Number(a.timeStamp || 0) - Number(b.timeStamp || 0));
-        setMessages(arr);
-        setLoading(false);
+
+        nextMessages.sort((left, right) => Number(left.timeStamp || 0) - Number(right.timeStamp || 0));
+        persistChatMessages(chatId, nextMessages, Date.now()).catch(() => {});
+        readPendingChatMessages(chatId)
+          .then((pendingSnapshot) => {
+            if (!mounted) return;
+            setMessages(mergeMessagesWithPending(nextMessages, pendingSnapshot));
+            setLoading(false);
+          })
+          .catch(() => {
+            if (!mounted) return;
+            setMessages(nextMessages);
+            setLoading(false);
+          });
+
+        const latestMessage = nextMessages[nextMessages.length - 1] || null;
+        updateChatsCacheWithLastMessage({
+          contactKeyLocal: contactKey || null,
+          contactUserIdLocal: contactUserId || null,
+          lastMessageText: latestMessage?.type === "image" ? "📷 Image" : (latestMessage?.text || ""),
+          timeStamp: latestMessage?.timeStamp || Date.now(),
+          lastSenderId: latestMessage?.senderId || null,
+          lastSeen: latestMessage?.seen || false,
+          unread: 0,
+          chatKeyLocal: chatId,
+        }).catch(() => {});
 
         if (currentUserId) {
-          try {
-            // mark unread 0 at chat path (school-aware)
-            (async () => {
-              try {
-                const prefix = await getPathPrefix();
-                await update(ref(database), { [`${prefix}Chats/${chatId}/unread/${currentUserId}`]: 0 });
-              } catch {}
-            })();
+          InteractionManager.runAfterInteractions(() => {
+            void (async () => {
+            try {
+              const prefix = await getPathPrefix();
+              const fullUpdates = {};
+              const unreadCountSnap = await get(ref(database, `${prefix}Chats/${chatId}/unread/${currentUserId}`)).catch(() => null);
+              const previousUnreadCount = unreadCountSnap?.exists()
+                ? Math.max(0, Number(unreadCountSnap.val() || 0))
+                : 0;
 
-            const updates = {};
-            arr.forEach((m) => {
-              if ((String(m.receiverId) === String(currentUserId) || String(m.receiverId) === String(currentUserNodeKey)) && !m.seen) {
-                updates[`Chats/${chatId}/messages/${m.messageId}/seen`] = true; // this will be written relative to root prefix below
+              if (previousUnreadCount > 0) {
+                fullUpdates[`${prefix}Chats/${chatId}/unread/${currentUserId}`] = 0;
               }
-            });
-            // write seen flags using path prefix
-            if (Object.keys(updates).length) {
-              (async () => {
-                try {
-                  const prefix = await getPathPrefix();
-                  const fullUpdates = {};
-                  Object.keys(updates).forEach((k) => {
-                    fullUpdates[`${prefix}${k}`] = true;
-                  });
-                  await update(ref(database), fullUpdates);
-                } catch {}
-              })();
+
+              nextMessages.forEach((message) => {
+                if ((String(message.receiverId) === String(currentUserId) || String(message.receiverId) === String(currentUserNodeKey)) && !message.seen) {
+                  fullUpdates[`${prefix}Chats/${chatId}/messages/${message.messageId}/seen`] = true;
+                }
+              });
+
+              if (Object.keys(fullUpdates).length) {
+                await update(ref(database), fullUpdates);
+              }
+
+              if (previousUnreadCount > 0) {
+                await decrementUnreadTotalNode(currentUserId, previousUnreadCount);
+              }
+            } catch (error) {
+              console.warn("[Messages] mark seen error", error);
             }
-          } catch (err) {
-            console.warn("[Messages] mark seen error", err);
-          }
+            })();
+          });
         }
       });
+
       messagesRefRef.current._listener = listener;
     };
 
@@ -291,161 +384,215 @@ export default function MessagesScreen(props) {
     return () => {
       mounted = false;
       if (messagesRefRef.current) {
-        try { off(messagesRefRef.current); } catch (e) {}
+        try { off(messagesRefRef.current); } catch {}
       }
     };
-  }, [chatId, currentUserId, currentUserNodeKey]);
+  }, [chatId, contactKey, contactUserId, currentUserId, currentUserNodeKey, decrementUnreadTotalNode, updateChatsCacheWithLastMessage]);
 
-  // lastMessage meta listener
   useEffect(() => {
     if (!chatId) {
       setLastMessageMeta(null);
       return;
     }
+
     (async () => {
       const lastRef = await getDbRef(`Chats/${chatId}/lastMessage`);
       lastMessageRefRef.current = lastRef;
-      const unsub = onValue(lastRef, (snap) => {
+      onValue(lastRef, (snap) => {
         if (snap.exists()) setLastMessageMeta(snap.val());
         else setLastMessageMeta(null);
       });
-      // cleanup will be handled by return
     })();
+
     return () => {
-      try { if (lastMessageRefRef.current) off(lastMessageRefRef.current); } catch (e) {}
+      try { if (lastMessageRefRef.current) off(lastMessageRefRef.current); } catch {}
       lastMessageRefRef.current = null;
     };
   }, [chatId]);
 
-  // Auto-scroll
   useEffect(() => {
     setTimeout(() => {
-      try { flatListRef.current && flatListRef.current.scrollToEnd({ animated: true }); } catch (e) {}
+      try { flatListRef.current && flatListRef.current.scrollToEnd({ animated: true }); } catch {}
     }, 120);
   }, [messages]);
 
-  // Keyboard listeners
-  useEffect(() => {
-    const onShow = (e) => {
-      setKeyboardVisible(true);
-      const h = (e && e.endCoordinates && e.endCoordinates.height) ? e.endCoordinates.height : 300;
-      setKeyboardHeight(h);
-    };
-    const onHide = () => {
-      setKeyboardVisible(false);
-      setKeyboardHeight(0);
-    };
-
-    const showEvent = Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow";
-    const hideEvent = Platform.OS === "ios" ? "keyboardWillHide" : "keyboardDidHide";
-
-    const subShow = Keyboard.addListener(showEvent, onShow);
-    const subHide = Keyboard.addListener(hideEvent, onHide);
-
-    return () => {
-      subShow.remove();
-      subHide.remove();
-    };
-  }, []);
-
   const getResolvedUserId = async () => {
     if (currentUserId) return currentUserId;
-    let uId = await AsyncStorage.getItem("userId");
-    if (uId) return uId;
-    const nodeKey = await AsyncStorage.getItem("userNodeKey") || await AsyncStorage.getItem("studentNodeKey") || await AsyncStorage.getItem("studentId") || null;
+
+    let userId = await AsyncStorage.getItem("userId");
+    if (userId) return userId;
+
+    const nodeKey =
+      (await AsyncStorage.getItem("userNodeKey")) ||
+      (await AsyncStorage.getItem("studentNodeKey")) ||
+      (await AsyncStorage.getItem("studentId")) ||
+      null;
+
     if (!nodeKey) return null;
+
     try {
-      const v = await getUserVal(nodeKey);
-      if (v) return v.userId || nodeKey;
+      const userValue = await getUserVal(nodeKey);
+      if (userValue) return userValue.userId || nodeKey;
     } catch {}
+
     return nodeKey;
   };
 
-  // helper: update chatsCache in AsyncStorage so Chats shows optimistic lastMessage instantly
-  async function updateChatsCacheWithLastMessage({ contactKeyLocal, contactUserIdLocal, lastMessageText, timeStamp, lastSenderId = null, lastSeen = false }) {
+  const updateUnreadTotalNode = useCallback(async (targetUserId, updater) => {
+    const normalizedUserId = String(targetUserId || "").trim();
+    if (!normalizedUserId) return null;
+
+    const prefix = await getPathPrefix();
+    const unreadTotalRef = ref(database, `${prefix}ChatUnreadTotals/${normalizedUserId}`);
+    const result = await runTransaction(unreadTotalRef, (current) => {
+      const currentValue = Math.max(0, Number(current || 0));
+      const nextValue = typeof updater === "function" ? updater(currentValue) : updater;
+      return Math.max(0, Number(nextValue || 0));
+    }).catch(() => null);
+
+    if (!result?.snapshot?.exists?.()) return 0;
+    return Math.max(0, Number(result.snapshot.val() || 0));
+  }, []);
+
+  const incrementUnreadTotalNode = useCallback(async (targetUserId, delta = 1) => {
+    const amount = Math.max(0, Number(delta || 0));
+    if (!amount) return null;
+    return updateUnreadTotalNode(targetUserId, (current) => current + amount);
+  }, [updateUnreadTotalNode]);
+
+  const decrementUnreadTotalNode = useCallback(async (targetUserId, delta = 1) => {
+    const amount = Math.max(0, Number(delta || 0));
+    if (!amount) return null;
+    return updateUnreadTotalNode(targetUserId, (current) => Math.max(0, current - amount));
+  }, [updateUnreadTotalNode]);
+
+  async function buildUnreadUpdates(chatKeyLocal, senderId, fallbackReceiverId = null) {
+    const prefix = await getPathPrefix();
+    const chatSnap = await get(await getDbRef(`Chats/${chatKeyLocal}`));
+    const unreadObj = chatSnap.exists() ? chatSnap.child("unread").val() || {} : {};
+    const unreadUpdates = {};
+    const aggregateDeltas = {};
+
+    if (chatSnap.exists()) {
+      const participants = chatSnap.child("participants").val() || {};
+      const participantIds = Object.keys(participants || {});
+
+      if (!participantIds.length && fallbackReceiverId) {
+        participantIds.push(String(fallbackReceiverId));
+      }
+
+      participantIds.forEach((participantId) => {
+        if (!participantId) return;
+
+        if (String(participantId) === String(senderId)) {
+          unreadUpdates[`${prefix}Chats/${chatKeyLocal}/unread/${participantId}`] = 0;
+          return;
+        }
+
+        const previousUnread = typeof unreadObj[participantId] === "number" ? unreadObj[participantId] : 0;
+        unreadUpdates[`${prefix}Chats/${chatKeyLocal}/unread/${participantId}`] = previousUnread + 1;
+        aggregateDeltas[participantId] = (aggregateDeltas[participantId] || 0) + 1;
+      });
+    }
+
+    if (!Object.keys(unreadUpdates).length && fallbackReceiverId) {
+      unreadUpdates[`${prefix}Chats/${chatKeyLocal}/unread/${fallbackReceiverId}`] =
+        Math.max(0, Number(unreadObj?.[fallbackReceiverId] || 0)) + 1;
+      unreadUpdates[`${prefix}Chats/${chatKeyLocal}/unread/${senderId}`] = 0;
+      aggregateDeltas[fallbackReceiverId] = 1;
+    }
+
+    return {
+      unreadUpdates,
+      aggregateDeltas,
+    };
+  }
+
+  const updateChatsCacheWithLastMessage = useCallback(async ({ contactKeyLocal, contactUserIdLocal, lastMessageText, timeStamp, lastSenderId = null, lastSeen = false, unread = null, chatKeyLocal = "" }) => {
     try {
-      const raw = await AsyncStorage.getItem("chatsCache");
-      const cache = raw ? JSON.parse(raw) : [];
+      const cache = await readChatsCache();
       let updated = false;
       const tsNum = Number(timeStamp || Date.now());
 
-      for (let i = 0; i < cache.length; i++) {
-        const it = cache[i];
-        // match by node key or by userId
-        if ((contactKeyLocal && it.key && String(it.key) === String(contactKeyLocal)) || (contactUserIdLocal && it.userId && String(it.userId) === String(contactUserIdLocal))) {
-          // only update if our timestamp is newer
-          const existingTs = Number(it.lastTime || 0);
+      for (let index = 0; index < cache.length; index += 1) {
+        const item = cache[index];
+        if ((contactKeyLocal && item.key && String(item.key) === String(contactKeyLocal)) || (contactUserIdLocal && item.userId && String(item.userId) === String(contactUserIdLocal))) {
+          const existingTs = Number(item.lastTime || 0);
           if (tsNum >= existingTs) {
-            it.lastMessage = lastMessageText;
-            it.lastTime = tsNum;
-            it.lastSenderId = lastSenderId;
-            it.lastSeen = !!lastSeen;
-            cache[i] = it;
+            item.lastMessage = lastMessageText;
+            item.lastTime = tsNum;
+            item.lastSenderId = lastSenderId;
+            item.lastSeen = !!lastSeen;
+            if (chatKeyLocal) item.chatId = chatKeyLocal;
+            if (unread != null) item.unread = Math.max(0, Number(unread || 0));
+            cache[index] = item;
             updated = true;
           }
           break;
         }
       }
+
       if (!updated) {
-        // if contact not present, append new cached contact entry so Chats shows it
-        const newItem = {
+        cache.unshift({
           key: contactKeyLocal || contactUserIdLocal || `u_${Date.now()}`,
           userId: contactUserIdLocal || "",
           name: contactName || "Conversation",
           role: "",
           profileImage: contactImage || null,
           type: "unknown",
-          chatId: chatId || "",
+          chatId: chatKeyLocal || chatId || "",
           lastMessage: lastMessageText,
           lastTime: tsNum,
-          lastSenderId: lastSenderId,
+          lastSenderId,
           lastSeen: !!lastSeen,
-          unread: 0,
-        };
-        cache.unshift(newItem);
+          unread: unread != null ? Math.max(0, Number(unread || 0)) : 0,
+        });
         updated = true;
       }
-      if (updated) {
-        await AsyncStorage.setItem("chatsCache", JSON.stringify(cache));
-        await AsyncStorage.setItem("chatsCacheFetchedAt", String(Date.now()));
-      }
-    } catch (e) {
-      // ignore cache update errors
-      console.warn("[Messages] updateChatsCacheWithLastMessage error", e);
-    }
-  }
 
-  // helper: uri -> blob
+      if (updated) {
+        await persistChatsCache(cache, Date.now());
+      }
+    } catch (error) {
+      console.warn("[Messages] updateChatsCacheWithLastMessage error", error);
+    }
+  }, [chatId, contactImage, contactName]);
+
   async function uriToBlob(uri) {
-    return await new Promise((resolve, reject) => {
+    return new Promise((resolve, reject) => {
       try {
         const xhr = new XMLHttpRequest();
-        xhr.onload = function () {
+        xhr.onload = function onLoad() {
           resolve(xhr.response);
         };
-        xhr.onerror = function () {
+        xhr.onerror = function onError() {
           reject(new TypeError("Network request failed"));
         };
         xhr.responseType = "blob";
         xhr.open("GET", uri, true);
         xhr.send(null);
-      } catch (err) {
-        reject(err);
+      } catch (error) {
+        reject(error);
       }
     });
   }
 
-  // pickImageAndSend (keeps robust behavior)
   async function pickImageAndSend() {
+    let localUri = null;
+    let chatKeyLocal = chatId;
+    let currentResolvedUserId = null;
+    let messageId = null;
+    let now = 0;
+
     try {
-      const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
-      if (!perm.granted) {
+      const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (!permission.granted) {
         Alert.alert("Permission required", "Please allow access to photos to attach images.");
         return;
       }
 
       const result = await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: ImagePicker.MediaType?.Images ?? ImagePicker.MediaTypeOptions?.Images ?? ImagePicker.MediaTypeOptions.Images,
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
         quality: 0.7,
         allowsEditing: false,
       });
@@ -453,17 +600,17 @@ export default function MessagesScreen(props) {
       const cancelled = result.cancelled ?? result.canceled;
       if (cancelled) return;
 
-      const localUri = result.uri ?? (result.assets && result.assets[0] && result.assets[0].uri);
+      localUri = result.uri ?? result.assets?.[0]?.uri;
       if (!localUri) return;
 
-      const cu = await getResolvedUserId();
-      if (!cu) {
+      currentResolvedUserId = await getResolvedUserId();
+      if (!currentResolvedUserId) {
         Alert.alert("Missing user id", "Cannot determine current user id.");
         return;
       }
-      let chatKeyLocal = chatId;
+
       if (!chatKeyLocal) {
-        chatKeyLocal = await findOrCreateChatId(cu, contactUserId, true);
+        chatKeyLocal = await findOrCreateChatId(currentResolvedUserId, contactUserId, true);
         if (!chatKeyLocal) {
           Alert.alert("Chat error", "Could not find or create chat");
           return;
@@ -471,12 +618,12 @@ export default function MessagesScreen(props) {
         setChatId(chatKeyLocal);
       }
 
-      const messageId = push(await getDbRef(`Chats/${chatKeyLocal}/messages`)).key;
-      const now = Date.now();
+      messageId = push(await getDbRef(`Chats/${chatKeyLocal}/messages`)).key;
+      now = Date.now();
 
       const localMessage = {
         messageId,
-        senderId: cu,
+        senderId: currentResolvedUserId,
         receiverId: contactUserId,
         text: "",
         timeStamp: now,
@@ -484,30 +631,29 @@ export default function MessagesScreen(props) {
         imageUrl: localUri,
         uploading: true,
       };
-      // optimistic append
-      setMessages((prev) => (prev.some((m) => m.messageId === messageId) ? prev : [...prev, localMessage]));
 
-      // update local chats cache immediately (non-blocking) including lastSenderId & lastSeen
+      setMessages((prev) => mergeMessagesWithPending(prev, [localMessage]));
+
       updateChatsCacheWithLastMessage({
         contactKeyLocal: contactKey || null,
         contactUserIdLocal: contactUserId || null,
         lastMessageText: "📷 Image",
         timeStamp: now,
-        lastSenderId: cu,
+        lastSenderId: currentResolvedUserId,
         lastSeen: false,
+        unread: 0,
+        chatKeyLocal,
       }).catch(() => {});
 
       const blob = await uriToBlob(localUri);
-
       const prefix = await getPathPrefix();
-      const path = `chatImages/${chatKeyLocal}/${messageId}.jpg`;
-      const storageReference = storageRef(storage, path);
+      const storageReference = storageRef(storage, `chatImages/${chatKeyLocal}/${messageId}.jpg`);
       await uploadBytes(storageReference, blob);
       const downloadUrl = await getDownloadURL(storageReference);
 
       const messageObj = {
         messageId,
-        senderId: cu,
+        senderId: currentResolvedUserId,
         receiverId: contactUserId,
         text: "",
         timeStamp: now,
@@ -520,116 +666,45 @@ export default function MessagesScreen(props) {
 
       const lastMessage = {
         seen: false,
-        senderId: cu,
+        senderId: currentResolvedUserId,
         text: "📷 Image",
         timeStamp: now,
         type: "image",
       };
 
+      const { unreadUpdates, aggregateDeltas } = await buildUnreadUpdates(chatKeyLocal, currentResolvedUserId, contactUserId);
       const updates = {};
       updates[`${prefix}Chats/${chatKeyLocal}/messages/${messageId}`] = messageObj;
       updates[`${prefix}Chats/${chatKeyLocal}/lastMessage`] = lastMessage;
-      updates[`${prefix}Chats/${chatKeyLocal}/unread/${contactUserId}`] = 1;
-      updates[`${prefix}Chats/${chatKeyLocal}/unread/${cu}`] = 0;
+      Object.assign(updates, unreadUpdates);
 
       await update(ref(database), updates);
+      await Promise.allSettled(
+        Object.entries(aggregateDeltas).map(([participantId, delta]) => incrementUnreadTotalNode(participantId, delta))
+      );
+    } catch (error) {
+      console.warn("[Messages:pickImageAndSend] error", error);
 
-      // resync
-      setTimeout(async () => {
+      if (localUri && chatKeyLocal && messageId && currentResolvedUserId && isRetryableUploadError(error)) {
         try {
-          const snap = await get(await getDbRef(`Chats/${chatKeyLocal}/messages`));
-          if (snap.exists()) {
-            const arr = [];
-            snap.forEach((c) => {
-              const data = c.val() || {};
-              arr.push({ ...data, messageId: data.messageId || c.key });
-            });
-            arr.sort((a, b) => Number(a.timeStamp || 0) - Number(b.timeStamp || 0));
-            setMessages(arr);
-          }
-        } catch (e) {
-          console.warn("[Messages:upload] resync error", e);
+          const schoolKey = (await AsyncStorage.getItem("schoolKey")) || null;
+          await queueChatImageUpload({
+            schoolKey,
+            chatId: chatKeyLocal,
+            messageId,
+            senderId: currentResolvedUserId,
+            receiverId: contactUserId,
+            timeStamp: now || Date.now(),
+            localUri,
+          });
+          Alert.alert("Queued to send", "Image will upload automatically when the connection returns.");
+          return;
+        } catch (queueError) {
+          console.warn("[Messages:pickImageAndSend] queue fallback error", queueError);
         }
-      }, 900);
-    } catch (err) {
-      console.warn("[Messages:pickImageAndSend] error", err);
+      }
+
       Alert.alert("Upload failed", "Could not upload image. Try again.");
-    }
-  }
-
-  // createChatAndSend & sendMessage
-  async function createChatAndSend(messagePayload) {
-    const cu = await getResolvedUserId();
-    if (!cu || !contactUserId) {
-      Alert.alert("Missing IDs", `currentUserId=${cu}\ncontactUserId=${contactUserId}\nCannot create chat`);
-      return;
-    }
-
-    const chatKeyLocal = await findOrCreateChatId(cu, contactUserId, true);
-    if (!chatKeyLocal) {
-      Alert.alert("Create failed", "Could not create/find chat id");
-      return;
-    }
-
-    const now = Date.now();
-    const messageId = push(await getDbRef(`Chats/${chatKeyLocal}/messages`)).key;
-    const messageObj = {
-      messageId,
-      senderId: cu,
-      receiverId: contactUserId,
-      text: messagePayload.text || "",
-      timeStamp: messagePayload.timeStamp || now,
-      type: messagePayload.type || "text",
-      seen: false,
-      edited: false,
-      deleted: false,
-    };
-
-    const lastMessage = {
-      seen: false,
-      senderId: cu,
-      text: messagePayload.type === "image" ? "📷 Image" : messageObj.text,
-      timeStamp: messageObj.timeStamp,
-      type: messageObj.type,
-    };
-
-    const prefix = await getPathPrefix();
-    const updates = {};
-    updates[`${prefix}Chats/${chatKeyLocal}/messages/${messageId}`] = messageObj;
-    updates[`${prefix}Chats/${chatKeyLocal}/lastMessage`] = lastMessage;
-
-    try {
-      await update(ref(database), updates);
-      setChatId(chatKeyLocal);
-      setMessages((prev) => (prev.some((m) => m.messageId === messageId) ? prev : [...prev, messageObj]));
-
-      // update cache so Chats shows the new message immediately (non-blocking)
-      updateChatsCacheWithLastMessage({
-        contactKeyLocal: contactKey || null,
-        contactUserIdLocal: contactUserId || null,
-        lastMessageText: lastMessage.text,
-        timeStamp: lastMessage.timeStamp,
-        lastSenderId: cu,
-        lastSeen: false,
-      }).catch(() => {});
-
-      setTimeout(async () => {
-        try {
-          const snap = await get(await getDbRef(`Chats/${chatKeyLocal}/messages`));
-          if (snap.exists()) {
-            const arr = [];
-            snap.forEach((c) => {
-              const data = c.val() || {};
-              arr.push({ ...data, messageId: data.messageId || c.key });
-            });
-            arr.sort((a, b) => Number(a.timeStamp || 0) - Number(b.timeStamp || 0));
-            setMessages(arr);
-          }
-        } catch (e) {}
-      }, 900);
-    } catch (err) {
-      console.warn("[Messages:createChatAndSend] error", err);
-      Alert.alert("Send failed", "Could not create chat. Try again.");
     }
   }
 
@@ -640,8 +715,8 @@ export default function MessagesScreen(props) {
     const payload = { text: text.trim(), timeStamp: now, type: "text" };
 
     try {
-      const cu = await getResolvedUserId();
-      if (!cu) {
+      const currentResolvedUserId = await getResolvedUserId();
+      if (!currentResolvedUserId) {
         Alert.alert("Missing user id", "Cannot determine current user id.");
         setSending(false);
         return;
@@ -649,7 +724,7 @@ export default function MessagesScreen(props) {
 
       let chatKeyLocal = chatId;
       if (!chatKeyLocal) {
-        chatKeyLocal = await findOrCreateChatId(cu, contactUserId, true);
+        chatKeyLocal = await findOrCreateChatId(currentResolvedUserId, contactUserId, true);
         if (!chatKeyLocal) {
           Alert.alert("Chat error", "Could not find or create chat");
           setSending(false);
@@ -661,7 +736,7 @@ export default function MessagesScreen(props) {
       const messageId = push(await getDbRef(`Chats/${chatKeyLocal}/messages`)).key;
       const messageObj = {
         messageId,
-        senderId: cu,
+        senderId: currentResolvedUserId,
         receiverId: contactUserId,
         text: payload.text,
         timeStamp: payload.timeStamp,
@@ -671,88 +746,51 @@ export default function MessagesScreen(props) {
         deleted: false,
       };
 
-      // read chat snapshot under school-aware path
-      const chatSnap = await get(await getDbRef(`Chats/${chatKeyLocal}`));
-      let unreadObj = {};
-      if (chatSnap.exists()) unreadObj = chatSnap.child("unread").val() || {};
-
-      const unreadUpdates = {};
-      const prefix = await getPathPrefix();
-      if (chatSnap.exists()) {
-        const parts = chatSnap.child("participants").val() || {};
-        Object.keys(parts).forEach((p) => {
-          if (p === cu) unreadUpdates[`${prefix}Chats/${chatKeyLocal}/unread/${p}`] = 0;
-          else {
-            const prev = typeof unreadObj[p] === "number" ? unreadObj[p] : 0;
-            unreadUpdates[`${prefix}Chats/${chatKeyLocal}/unread/${p}`] = prev + 1;
-          }
-        });
-      } else {
-        unreadUpdates[`${prefix}Chats/${chatKeyLocal}/unread/${contactUserId}`] = (unreadObj[contactUserId] || 0) + 1;
-        unreadUpdates[`${prefix}Chats/${chatKeyLocal}/unread/${cu}`] = 0;
-      }
-
       const lastMessage = {
         seen: false,
-        senderId: cu,
+        senderId: currentResolvedUserId,
         text: payload.text,
         timeStamp: payload.timeStamp,
         type: payload.type,
       };
 
+      const prefix = await getPathPrefix();
+      const { unreadUpdates, aggregateDeltas } = await buildUnreadUpdates(chatKeyLocal, currentResolvedUserId, contactUserId);
       const updates = {};
       updates[`${prefix}Chats/${chatKeyLocal}/messages/${messageId}`] = messageObj;
       updates[`${prefix}Chats/${chatKeyLocal}/lastMessage`] = lastMessage;
       Object.assign(updates, unreadUpdates);
 
-      // optimistic append locally
-      setMessages((prev) => (prev.some((m) => m.messageId === messageId) ? prev : [...prev, messageObj]));
+      setMessages((prev) => (prev.some((message) => message.messageId === messageId) ? prev : [...prev, messageObj]));
 
-      // update local cache immediately (non-blocking) so Chats reflects the new message instantly
       updateChatsCacheWithLastMessage({
         contactKeyLocal: contactKey || null,
         contactUserIdLocal: contactUserId || null,
         lastMessageText: lastMessage.text,
         timeStamp: lastMessage.timeStamp,
-        lastSenderId: cu,
+        lastSenderId: currentResolvedUserId,
         lastSeen: false,
+        unread: 0,
+        chatKeyLocal,
       }).catch(() => {});
 
-      // write to server
       await update(ref(database), updates);
-
-      // re-sync after short delay
-      setTimeout(async () => {
-        try {
-          const snap = await get(await getDbRef(`Chats/${chatKeyLocal}/messages`));
-          if (snap.exists()) {
-            const arr = [];
-            snap.forEach((c) => {
-              const data = c.val() || {};
-              arr.push({ ...data, messageId: data.messageId || c.key });
-            });
-            arr.sort((a, b) => Number(a.timeStamp || 0) - Number(b.timeStamp || 0));
-            setMessages(arr);
-          }
-        } catch (e) {
-          console.warn("[Messages:send] resync error", e);
-        }
-      }, 900);
+      await Promise.allSettled(
+        Object.entries(aggregateDeltas).map(([participantId, delta]) => incrementUnreadTotalNode(participantId, delta))
+      );
 
       setText("");
-    } catch (err) {
-      console.warn("[Messages:send] error", err);
+    } catch (error) {
+      console.warn("[Messages:send] error", error);
       Alert.alert("Send failed", "Could not send message — try again.");
     } finally {
       setSending(false);
     }
   }
 
-  // image viewer open/close (fallback modal used if viewer lib missing)
   function closeViewer() {
     setViewerVisible(false);
     setViewerImages([]);
-    setViewerIndex(0);
     setViewerFallbackUri(null);
   }
 
@@ -760,39 +798,24 @@ export default function MessagesScreen(props) {
     const uri = message.imageUrl || message.imageUri || message.image || null;
     if (!uri) return;
 
-    if (viewerLibAvailable === null) {
-      try {
-        await import("react-native-image-viewing");
-        setViewerLibAvailable(true);
-      } catch (e) {
-        setViewerLibAvailable(false);
-      }
-    }
-
-    if (viewerLibAvailable) {
-      setViewerImages([{ uri }]);
-      setViewerIndex(0);
-      setViewerVisible(true);
-      return;
-    }
-
-    // fallback modal
+    setViewerImages([{ uri }]);
     setViewerFallbackUri(uri);
     setViewerVisible(true);
   }
 
-  // Build display items with date separators
   const displayItems = useMemo(() => {
     const items = [];
     let lastDateLabel = null;
-    messages.forEach((m) => {
-      const label = dateLabelForTs(m.timeStamp);
+
+    messages.forEach((message) => {
+      const label = dateLabelForTs(message.timeStamp);
       if (label !== lastDateLabel) {
-        items.push({ type: "date", id: `date-${m.timeStamp}`, label });
+        items.push({ type: "date", id: `date-${message.timeStamp}`, label });
         lastDateLabel = label;
       }
-      items.push({ type: "message", ...m });
+      items.push({ type: "message", ...message });
     });
+
     return items;
   }, [messages]);
 
@@ -805,32 +828,34 @@ export default function MessagesScreen(props) {
   );
 
   const renderMessage = ({ item, index }) => {
-    if (item.type === "date") return <View style={{ paddingVertical: 10 }}>{renderDateSeparator(item.label)}</View>;
-    const m = item;
-    const isMe =
-      (currentUserId && String(m.senderId) === String(currentUserId)) ||
-      (currentUserNodeKey && String(m.senderId) === String(currentUserNodeKey));
+    if (item.type === "date") {
+      return <View style={{ paddingVertical: 10 }}>{renderDateSeparator(item.label)}</View>;
+    }
 
-    const prev = index > 0 ? displayItems[index - 1] : null;
-    const prevSameSender = prev && prev.type === "message" && String(prev.senderId) === String(m.senderId);
-    const showAvatar = !isMe && !prevSameSender;
+    const message = item;
+    const isMe =
+      (currentUserId && String(message.senderId) === String(currentUserId)) ||
+      (currentUserNodeKey && String(message.senderId) === String(currentUserNodeKey));
+    const previousItem = index > 0 ? displayItems[index - 1] : null;
+    const previousSameSender = previousItem && previousItem.type === "message" && String(previousItem.senderId) === String(message.senderId);
+    const showAvatar = !isMe && !previousSameSender;
 
     const isLastMessage =
-      lastMessageMeta && m.messageId && lastMessageMeta.timeStamp && Number(lastMessageMeta.timeStamp) === Number(m.timeStamp);
-    const seenFlag = !!m.seen || (isLastMessage && !!lastMessageMeta?.seen);
+      lastMessageMeta && message.messageId && lastMessageMeta.timeStamp && Number(lastMessageMeta.timeStamp) === Number(message.timeStamp);
+    const seenFlag = !!message.seen || (isLastMessage && !!lastMessageMeta?.seen);
 
-    // image message
-    if (m.type === "image") {
-      const imageSource = m.imageUrl ? { uri: m.imageUrl } : (m.imageUrlLocal ? { uri: m.imageUrlLocal } : AVATAR_PLACEHOLDER);
+    if (message.type === "image") {
+      const imageSource = message.imageUrl ? { uri: message.imageUrl } : AVATAR_PLACEHOLDER;
+
       if (isMe) {
         return (
           <View style={[styles.messageRow, styles.messageRowRight]}>
             <View style={{ flex: 1 }} />
             <View style={{ marginRight: 8 }}>
-              <TouchableOpacity activeOpacity={0.9} onPress={() => openImageViewer(m)}>
+              <TouchableOpacity activeOpacity={0.9} onPress={() => openImageViewer(message)}>
                 <Image source={imageSource} style={styles.outgoingImage} />
                 <View style={styles.imageMeta}>
-                  <Text style={styles.imageTime}>{fmtTime12(m.timeStamp)}</Text>
+                  <Text style={styles.imageTime}>{fmtTime12(message.timeStamp)}</Text>
                   <Ionicons
                     name={seenFlag ? "checkmark-done" : "checkmark"}
                     size={14}
@@ -844,72 +869,66 @@ export default function MessagesScreen(props) {
             <View style={{ width: 36 }} />
           </View>
         );
-      } else {
-        return (
-          <View style={[styles.messageRow, styles.messageRowLeft]}>
-            {showAvatar ? <Image source={contactImage ? { uri: contactImage } : AVATAR_PLACEHOLDER} style={styles.msgAvatar} /> : <View style={{ width: 36 }} />}
-            <View style={{ width: 8 }} />
-            <View>
-              <TouchableOpacity activeOpacity={0.9} onPress={() => openImageViewer(m)}>
-                <Image source={imageSource} style={styles.incomingImage} />
-                <View style={styles.incomingImageMeta}>
-                  <Text style={styles.imageTimeIncoming}>{fmtTime12(m.timeStamp)}</Text>
-                </View>
-              </TouchableOpacity>
-              <View style={styles.leftTailContainer}><View style={styles.leftTail} /></View>
-            </View>
-            <View style={{ flex: 1 }} />
-          </View>
-        );
       }
+
+      return (
+        <View style={[styles.messageRow, styles.messageRowLeft]}>
+          {showAvatar ? <Image source={safeContactImage ? { uri: safeContactImage } : AVATAR_PLACEHOLDER} style={styles.msgAvatar} /> : <View style={{ width: 36 }} />}
+          <View style={{ width: 8 }} />
+          <View>
+            <TouchableOpacity activeOpacity={0.9} onPress={() => openImageViewer(message)}>
+              <Image source={imageSource} style={styles.incomingImage} />
+              <View style={styles.incomingImageMeta}>
+                <Text style={styles.imageTimeIncoming}>{fmtTime12(message.timeStamp)}</Text>
+              </View>
+            </TouchableOpacity>
+            <View style={styles.leftTailContainer}><View style={styles.leftTail} /></View>
+          </View>
+          <View style={{ flex: 1 }} />
+        </View>
+      );
     }
 
-    // text message
     return (
       <View style={[styles.messageRow, isMe ? styles.messageRowRight : styles.messageRowLeft]}>
-        {!isMe && showAvatar && <Image source={contactImage ? { uri: contactImage } : AVATAR_PLACEHOLDER} style={styles.msgAvatar} />}
+        {!isMe && showAvatar && <Image source={safeContactImage ? { uri: safeContactImage } : AVATAR_PLACEHOLDER} style={styles.msgAvatar} />}
         {!isMe && !showAvatar && <View style={{ width: 36 }} />}
 
         <View style={[styles.bubbleWrap, isMe ? { alignItems: "flex-end" } : { alignItems: "flex-start" }]}>
           <View style={[styles.bubble, isMe ? styles.bubbleRight : styles.bubbleLeft]}>
-            <Text style={[styles.bubbleText, isMe ? styles.bubbleTextRight : styles.bubbleTextLeft]}>{m.deleted ? "Message deleted" : m.text}</Text>
+            <Text style={[styles.bubbleText, isMe ? styles.bubbleTextRight : styles.bubbleTextLeft]}>{message.deleted ? "Message deleted" : message.text}</Text>
             <View style={styles.bubbleMetaRow}>
-              <Text style={[styles.bubbleTime, isMe ? styles.bubbleTimeRight : styles.bubbleTimeLeft]}>{fmtTime12(m.timeStamp)}</Text>
-              {isMe && (
+              <Text style={[styles.bubbleTime, isMe ? styles.bubbleTimeRight : styles.bubbleTimeLeft]}>{fmtTime12(message.timeStamp)}</Text>
+              {isMe ? (
                 <Ionicons
                   name={seenFlag ? "checkmark-done" : "checkmark"}
                   size={14}
                   color={seenFlag ? "#CBE8FF" : "rgba(255,255,255,0.75)"}
                   style={{ marginLeft: 8 }}
                 />
-              )}
+              ) : null}
             </View>
           </View>
 
           {!isMe ? (
-            <View style={styles.leftTailContainer}>
-              <View style={styles.leftTail} />
-            </View>
+            <View style={styles.leftTailContainer}><View style={styles.leftTail} /></View>
           ) : (
-            <View style={styles.rightTailContainer}>
-              <View style={styles.rightTail} />
-            </View>
+            <View style={styles.rightTailContainer}><View style={styles.rightTail} /></View>
           )}
         </View>
 
-        {isMe && <View style={{ width: 36 }} />}
+        {isMe ? <View style={{ width: 36 }} /> : null}
       </View>
     );
   };
 
   return (
-    <SafeAreaView style={[styles.safe, { paddingTop: insets.top }]} edges={["bottom"]}>
-      <StatusBar barStyle="dark-content" backgroundColor={BG} translucent={false} />
-      <View style={[styles.container, { paddingBottom: insets.bottom }]}>
-        {/* Header */}
+    <SafeAreaView style={styles.safe} edges={["top", "bottom"]}>
+      <StatusBar barStyle={statusBarStyle === "dark" ? "dark-content" : "light-content"} backgroundColor={colors.background} translucent={false} />
+      <View style={styles.container}>
         <View style={styles.header}>
           <TouchableOpacity style={styles.back} onPress={() => router.back()}>
-            <Ionicons name="chevron-back" size={22} color="#222" />
+            <Ionicons name="chevron-back" size={22} color={colors.text} />
           </TouchableOpacity>
 
           <View style={styles.headerCenter}>
@@ -918,57 +937,62 @@ export default function MessagesScreen(props) {
           </View>
 
           <TouchableOpacity style={styles.headerRight} onPress={() => Alert.alert("Contact", "Open contact profile")}>
-            <Image source={contactImage ? { uri: contactImage } : AVATAR_PLACEHOLDER} style={styles.headerAvatar} />
+            <Image source={safeContactImage ? { uri: safeContactImage } : AVATAR_PLACEHOLDER} style={styles.headerAvatar} />
           </TouchableOpacity>
         </View>
 
-        {/* Messages */}
-        <View style={styles.messagesWrap}>
-          {loading ? (
-            <ActivityIndicator size="small" color={PRIMARY} style={{ marginTop: 24 }} />
-          ) : (
-            <FlatList
-              ref={flatListRef}
-              data={displayItems}
-              renderItem={renderMessage}
-              keyExtractor={(it, idx) => (it.type === "date" ? it.id : it.messageId || `${it.timeStamp}-${idx}`)}
-              showsVerticalScrollIndicator={false}
-              contentContainerStyle={{ paddingVertical: 12, paddingBottom: 12 + (keyboardVisible ? keyboardHeight : 0) }}
-              onContentSizeChange={() => flatListRef.current && flatListRef.current.scrollToEnd({ animated: true })}
+        <KeyboardAvoidingView
+          style={styles.chatArea}
+          behavior={Platform.OS === "ios" ? "padding" : undefined}
+          keyboardVerticalOffset={0}
+        >
+          <View style={styles.messagesWrap}>
+            {loading ? (
+              <PageLoadingSkeleton variant="chat" showHeader={false} style={{ flex: 1, backgroundColor: colors.background }} />
+            ) : (
+              <FlatList
+                ref={flatListRef}
+                data={displayItems}
+                renderItem={renderMessage}
+                keyExtractor={(item, index) => (item.type === "date" ? item.id : item.messageId || `${item.timeStamp}-${index}`)}
+                showsVerticalScrollIndicator={false}
+                contentContainerStyle={styles.messagesContent}
+                keyboardDismissMode={Platform.OS === "ios" ? "interactive" : "on-drag"}
+                keyboardShouldPersistTaps="handled"
+                onContentSizeChange={() => flatListRef.current && flatListRef.current.scrollToEnd({ animated: true })}
+              />
+            )}
+          </View>
+
+          <View style={styles.inputRow}>
+            <TouchableOpacity onPress={pickImageAndSend} style={styles.attachmentBtn}>
+              <Ionicons name="image-outline" size={22} color={MUTED} />
+            </TouchableOpacity>
+
+            <TextInput
+              placeholder="Message"
+              placeholderTextColor={colors.muted}
+              value={text}
+              onChangeText={setText}
+              style={styles.input}
+              multiline
+              returnKeyType="send"
+              onSubmitEditing={sendMessage}
             />
-          )}
-        </View>
+            <TouchableOpacity
+              style={[styles.sendBtn, text.trim() ? styles.sendBtnActive : styles.sendBtnDisabled]}
+              onPress={sendMessage}
+              disabled={!text.trim() || sending}
+            >
+              <Ionicons name="send" size={20} color={text.trim() ? colors.white : colors.muted} />
+            </TouchableOpacity>
+          </View>
+        </KeyboardAvoidingView>
 
-        {/* Input */}
-        <View style={[styles.inputRow, { paddingBottom: Math.max(insets.bottom, 8), marginBottom: keyboardVisible ? keyboardHeight : 0 }]}>
-          <TouchableOpacity onPress={pickImageAndSend} style={styles.attachmentBtn}>
-            <Ionicons name="image-outline" size={22} color={MUTED} />
-          </TouchableOpacity>
-
-          <TextInput
-            placeholder="Message"
-            placeholderTextColor="#9AA4C0"
-            value={text}
-            onChangeText={setText}
-            style={styles.input}
-            multiline
-            returnKeyType="send"
-            onSubmitEditing={sendMessage}
-          />
-          <TouchableOpacity
-            style={[styles.sendBtn, (text.trim() ? styles.sendBtnActive : styles.sendBtnDisabled)]}
-            onPress={sendMessage}
-            disabled={!text.trim() || sending}
-          >
-            <Ionicons name="send" size={20} color={text.trim() ? "#fff" : "#BFCBEF"} />
-          </TouchableOpacity>
-        </View>
-
-        {/* Viewer fallback modal */}
-        <Modal visible={viewerVisible && !viewerLibAvailable} transparent animationType="fade" onRequestClose={closeViewer}>
+        <Modal visible={viewerVisible} transparent animationType="fade" onRequestClose={closeViewer}>
           <View style={styles.modalOverlay}>
             <TouchableOpacity style={styles.modalCloseBtn} onPress={closeViewer}>
-              <Ionicons name="close" size={28} color="#fff" />
+              <Ionicons name="close" size={28} color={colors.white} />
             </TouchableOpacity>
             <View style={styles.modalContent}>
               {viewerFallbackUri ? (
@@ -984,26 +1008,28 @@ export default function MessagesScreen(props) {
   );
 }
 
-/* Styles (unchanged from previous) */
-const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: BG },
-  container: { flex: 1, backgroundColor: BG },
+function createStyles(colors) {
+  return StyleSheet.create({
+  safe: { flex: 1, backgroundColor: colors.background },
+  container: { flex: 1, backgroundColor: colors.background },
+  chatArea: { flex: 1 },
 
-  header: { height: 62, flexDirection: "row", alignItems: "center", paddingHorizontal: 12, borderBottomColor: "#F1F4FF", borderBottomWidth: 1, backgroundColor: BG },
+  header: { height: 62, flexDirection: "row", alignItems: "center", paddingHorizontal: 12, borderBottomColor: colors.separator, borderBottomWidth: 1, backgroundColor: colors.background },
   back: { width: 36, height: 36, alignItems: "center", justifyContent: "center" },
   headerCenter: { flex: 1, alignItems: "center" },
-  headerName: { fontSize: 16, fontWeight: "700", color: "#111", letterSpacing: 0.1 },
-  headerSub: { fontSize: 12, color: MUTED, marginTop: 2 },
+  headerName: { fontSize: 16, fontWeight: "700", color: colors.text, letterSpacing: 0.1 },
+  headerSub: { fontSize: 12, color: colors.muted, marginTop: 2 },
   headerRight: { width: 36, alignItems: "center", justifyContent: "center" },
-  headerAvatar: { width: 36, height: 36, borderRadius: 18, backgroundColor: "#F1F3F8" },
+  headerAvatar: { width: 36, height: 36, borderRadius: 18, backgroundColor: colors.surfaceMuted },
 
-  messagesWrap: { flex: 1, paddingHorizontal: 12, backgroundColor: BG },
+  messagesWrap: { flex: 1, paddingHorizontal: 12, backgroundColor: colors.background },
+  messagesContent: { paddingVertical: 12, paddingBottom: 12 },
 
   messageRow: { flexDirection: "row", marginVertical: 6, alignItems: "flex-end" },
   messageRowLeft: { justifyContent: "flex-start" },
   messageRowRight: { justifyContent: "flex-end" },
 
-  msgAvatar: { width: 36, height: 36, borderRadius: 18, marginRight: 8, backgroundColor: "#F1F3F8" },
+  msgAvatar: { width: 36, height: 36, borderRadius: 18, marginRight: 8, backgroundColor: colors.surfaceMuted },
 
   bubbleWrap: { maxWidth: "78%", position: "relative" },
   bubble: {
@@ -1016,16 +1042,16 @@ const styles = StyleSheet.create({
     shadowRadius: 2,
     elevation: 0,
   },
-  bubbleLeft: { backgroundColor: INCOMING_BG, borderTopLeftRadius: 6, borderTopRightRadius: 14, borderBottomRightRadius: 14, borderBottomLeftRadius: 14 },
-  bubbleRight: { backgroundColor: OUTGOING_BG, borderTopRightRadius: 6, borderTopLeftRadius: 14, borderBottomRightRadius: 14, borderBottomLeftRadius: 14, marginRight: -12 },
+  bubbleLeft: { backgroundColor: colors.incomingBubble, borderTopLeftRadius: 6, borderTopRightRadius: 14, borderBottomRightRadius: 14, borderBottomLeftRadius: 14 },
+  bubbleRight: { backgroundColor: colors.outgoingBubble, borderTopRightRadius: 6, borderTopLeftRadius: 14, borderBottomRightRadius: 14, borderBottomLeftRadius: 14, marginRight: -12 },
 
   bubbleText: { fontSize: 15, lineHeight: 20 },
-  bubbleTextLeft: { color: INCOMING_TEXT, fontWeight: "500" },
-  bubbleTextRight: { color: OUTGOING_TEXT, fontWeight: "500" },
+  bubbleTextLeft: { color: colors.incomingText, fontWeight: "500" },
+  bubbleTextRight: { color: colors.outgoingText, fontWeight: "500" },
 
   bubbleMetaRow: { flexDirection: "row", alignItems: "center", justifyContent: "flex-end", marginTop: 6 },
   bubbleTime: { fontSize: 10, opacity: 0.9 },
-  bubbleTimeLeft: { color: MUTED, textAlign: "left" },
+  bubbleTimeLeft: { color: colors.muted, textAlign: "left" },
   bubbleTimeRight: { color: "rgba(255,255,255,0.85)", textAlign: "right" },
 
   leftTailContainer: { position: "absolute", left: -6, bottom: -2, width: 12, height: 8, overflow: "hidden", alignItems: "flex-start" },
@@ -1037,7 +1063,7 @@ const styles = StyleSheet.create({
     borderBottomWidth: 8,
     borderLeftColor: "transparent",
     borderRightColor: "transparent",
-    borderBottomColor: INCOMING_BG,
+    borderBottomColor: colors.incomingBubble,
     transform: [{ rotate: "180deg" }],
   },
 
@@ -1050,22 +1076,22 @@ const styles = StyleSheet.create({
     borderBottomWidth: 8,
     borderLeftColor: "transparent",
     borderRightColor: "transparent",
-    borderBottomColor: OUTGOING_BG,
+    borderBottomColor: colors.outgoingBubble,
     transform: [{ rotate: "0deg" }],
   },
 
-  incomingImage: { width: 220, height: 140, borderRadius: 12, resizeMode: "cover", backgroundColor: "#eaeefb" },
-  outgoingImage: { width: 220, height: 140, borderRadius: 12, resizeMode: "cover", backgroundColor: "#005ecc" , marginRight: -12},
+  incomingImage: { width: 220, height: 140, borderRadius: 12, resizeMode: "cover", backgroundColor: colors.surfaceMuted },
+  outgoingImage: { width: 220, height: 140, borderRadius: 12, resizeMode: "cover", backgroundColor: colors.outgoingBubble , marginRight: -12},
   imageMeta: { position: "absolute", right: 8, bottom: 6, flexDirection: "row", alignItems: "center" },
   incomingImageMeta: { position: "absolute", left: 8, bottom: 6, flexDirection: "row", alignItems: "center" },
   imageTime: { color: "rgba(255,255,255,0.9)", fontSize: 11 },
-  imageTimeIncoming: { color: MUTED, fontSize: 11 },
+  imageTimeIncoming: { color: colors.muted, fontSize: 11 },
 
   dateSeparator: { flexDirection: "row", alignItems: "center", justifyContent: "center" },
-  dateLine: { height: 1, backgroundColor: "#EEF4FF", flex: 1, marginHorizontal: 12 },
-  dateText: { color: MUTED, fontSize: 12 },
+  dateLine: { height: 1, backgroundColor: colors.separator, flex: 1, marginHorizontal: 12 },
+  dateText: { color: colors.muted, fontSize: 12 },
 
-  inputRow: { flexDirection: "row", alignItems: "flex-end", paddingHorizontal: 8, paddingVertical: 10, borderTopColor: "#F1F4FF", borderTopWidth: 1, backgroundColor: BG },
+  inputRow: { flexDirection: "row", alignItems: "flex-end", paddingHorizontal: 8, paddingVertical: 10, borderTopColor: colors.separator, borderTopWidth: 1, backgroundColor: colors.background },
   attachmentBtn: { width: 40, height: 40, alignItems: "center", justifyContent: "center", marginRight: 6 },
   input: {
     flex: 1,
@@ -1074,18 +1100,19 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingVertical: Platform.OS === "ios" ? 8 : 6,
     borderRadius: 20,
-    backgroundColor: "#F8FAFF",
-    color: "#111",
+    backgroundColor: colors.inputBackground,
+    color: colors.text,
     fontSize: 15,
     marginRight: 8,
   },
   sendBtn: { width: 44, height: 44, borderRadius: 22, alignItems: "center", justifyContent: "center" },
-  sendBtnActive: { backgroundColor: PRIMARY },
-  sendBtnDisabled: { backgroundColor: "#F1F4FF" },
+  sendBtnActive: { backgroundColor: colors.primary },
+  sendBtnDisabled: { backgroundColor: colors.surfaceMuted },
 
   // modal fallback styles
-  modalOverlay: { flex: 1, backgroundColor: "rgba(0,0,0,0.95)", justifyContent: "center", alignItems: "center" },
+  modalOverlay: { flex: 1, backgroundColor: colors.imageOverlay, justifyContent: "center", alignItems: "center" },
   modalContent: { flex: 1, justifyContent: "center", alignItems: "center", width: "100%", padding: 12 },
   modalImage: { width: "100%", height: "100%" },
   modalCloseBtn: { position: "absolute", top: 40, right: 20, zIndex: 20 },
 });
+}

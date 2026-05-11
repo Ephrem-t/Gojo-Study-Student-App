@@ -8,29 +8,37 @@ import {
   TouchableOpacity,
   ActivityIndicator,
   RefreshControl,
-  Dimensions,
   Alert,
   Animated,
   Modal,
   Pressable,
+  Dimensions,
 } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import * as FileSystem from "expo-file-system/legacy";
+import * as MediaLibrary from "expo-media-library";
 import {
   ref,
   query,
   orderByChild,
   limitToLast,
-  equalTo,
   endAt,
   onValue,
   off,
   get,
   update,
   runTransaction,
-} from "firebase/database";
+} from "../../lib/offlineDatabase";
 import { database } from "../../constants/firebaseConfig";
 import { queryUserByUsernameInSchool, queryUserByChildInSchool } from "../lib/userHelpers";
+import { useAppTheme } from "../../hooks/use-app-theme";
+import useUserProfileCard from "../../hooks/use-user-profile-card";
+import { extractProfileImage, normalizeProfileImageUri } from "../lib/profileImage";
+import { getSavedPostsLocation, toggleSavedPostEntry } from "../lib/savedPosts";
+import { readScreenCache, writeScreenCache } from "../../lib/appOfflineCache";
+import PageLoadingSkeleton from "../../components/ui/page-loading-skeleton";
 
 /**
  * Home feed with pagination ("load more") for older posts.
@@ -39,9 +47,23 @@ import { queryUserByUsernameInSchool, queryUserByChildInSchool } from "../lib/us
  * 2) Image tap opens full-screen viewer
  */
 
+const PAGE_SIZE = 20;
+const DESCRIPTION_PREVIEW_LENGTH = 140;
 const SCREEN_WIDTH = Dimensions.get("window").width;
 const IMAGE_HEIGHT = Math.round(SCREEN_WIDTH * 0.9 * 0.65);
-const PAGE_SIZE = 20;
+
+function getScreenCacheScope(value) {
+  const normalized = String(value || "").trim();
+  return normalized || "global";
+}
+
+function getFileExtensionFromUrl(url) {
+  if (!url) return "jpg";
+  const cleanUrl = url.split("?")[0] || "";
+  const ext = cleanUrl.split(".").pop()?.toLowerCase();
+  if (!ext || ext.length > 5) return "jpg";
+  return ext;
+}
 
 function timeAgo(iso) {
   if (!iso) return "";
@@ -61,7 +83,54 @@ function timeAgo(iso) {
   return `${years}y`;
 }
 
+function formatTargetRoleLabel(data) {
+  const raw = data?.targetRole ?? data?.target ?? "all";
+  const normalized = String(raw).trim().toLowerCase();
+
+  if (!normalized || normalized === "all") return "Visible to everyone";
+  if (normalized === "student") return "Visible to student";
+  return `Visible to ${normalized}`;
+}
+
+function getPosterName(admin, postData) {
+  const fullFromAdmin = [admin?.personal?.firstName, admin?.personal?.middleName, admin?.personal?.lastName]
+    .filter(Boolean)
+    .join(" ")
+    .trim();
+
+  return admin?.name || admin?.username || fullFromAdmin || postData?.adminName || "School Admin";
+}
+
+function getPosterImage(admin, postData) {
+  const candidates = [
+    extractProfileImage(admin),
+    postData?.adminProfile,
+  ];
+
+  for (const candidate of candidates) {
+    const normalized = normalizeProfileImageUri(candidate);
+    if (normalized) return normalized;
+  }
+  return null;
+}
+
+function getPosterLookupKeys(postData) {
+  return [postData?.adminId, postData?.userId, postData?.createdBy].filter(Boolean);
+}
+
+function getCachedPoster(cache, postData) {
+  const keys = getPosterLookupKeys(postData);
+  for (const key of keys) {
+    if (cache[key]) return cache[key];
+  }
+  return null;
+}
+
 export default function HomeScreen() {
+  const { colors } = useAppTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
+  const insets = useSafeAreaInsets();
+  const { openUserProfile, profileCardModal } = useUserProfileCard();
   const [postsLatest, setPostsLatest] = useState([]);
   const [postsOlder, setPostsOlder] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -69,6 +138,9 @@ export default function HomeScreen() {
   const [loadingMore, setLoadingMore] = useState(false);
   const [hasMore, setHasMore] = useState(true);
   const [userId, setUserId] = useState(null);
+  const [savedPostsMap, setSavedPostsMap] = useState({});
+  const [expandedDescriptions, setExpandedDescriptions] = useState({});
+  const [postMenuPostId, setPostMenuPostId] = useState(null);
 
   // large image viewer state
   const [viewerVisible, setViewerVisible] = useState(false);
@@ -76,6 +148,41 @@ export default function HomeScreen() {
 
   const adminCacheRef = useRef({});
   const postsQueryRef = useRef(null);
+  const savedPostsQueryRef = useRef(null);
+  const hasUserScrolledFeedRef = useRef(false);
+  const savedPostsReadyRef = useRef(false);
+
+  useEffect(() => {
+    let mounted = true;
+
+    (async () => {
+      const schoolKey = await AsyncStorage.getItem("schoolKey");
+      const scope = getScreenCacheScope(schoolKey);
+      const [cachedFeed, cachedSavedPosts] = await Promise.all([
+        readScreenCache("home-feed", [scope]),
+        readScreenCache("home-saved-posts", [scope]),
+      ]);
+
+      if (!mounted) return;
+
+      if (cachedFeed) {
+        adminCacheRef.current = cachedFeed.adminCache || {};
+        setPostsLatest(Array.isArray(cachedFeed.postsLatest) ? cachedFeed.postsLatest : []);
+        setPostsOlder(Array.isArray(cachedFeed.postsOlder) ? cachedFeed.postsOlder : []);
+        setHasMore(cachedFeed.hasMore !== false);
+        setLoading(false);
+      }
+
+      if (cachedSavedPosts?.savedPostsMap && typeof cachedSavedPosts.savedPostsMap === "object") {
+        savedPostsReadyRef.current = true;
+        setSavedPostsMap(cachedSavedPosts.savedPostsMap);
+      }
+    })();
+
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   const loadUserContext = useCallback(async () => {
     const uid = await AsyncStorage.getItem("userId");
@@ -93,9 +200,12 @@ export default function HomeScreen() {
       }
       if (userSnap && userSnap.exists()) {
         const u = userSnap.val();
-        if (u.profileImage) {
-          await AsyncStorage.setItem("profileImage", u.profileImage);
-          Image.prefetch(u.profileImage).catch(() => {});
+        const safeProfileImage = normalizeProfileImageUri(extractProfileImage(u));
+        if (safeProfileImage) {
+          await AsyncStorage.setItem("profileImage", safeProfileImage);
+          Image.prefetch(safeProfileImage).catch(() => {});
+        } else {
+          await AsyncStorage.removeItem("profileImage").catch(() => {});
         }
       }
     } catch {}
@@ -105,11 +215,87 @@ export default function HomeScreen() {
 
   const combinedPosts = useMemo(() => [...postsLatest, ...postsOlder], [postsLatest, postsOlder]);
 
+  const findLoadedPost = useCallback((postId) => {
+    return postsLatest.find((item) => item.postId === postId)
+      || postsOlder.find((item) => item.postId === postId)
+      || null;
+  }, [postsLatest, postsOlder]);
+
   const postsRefForSchool = async () => {
     const sk = await AsyncStorage.getItem("schoolKey");
     if (sk) return ref(database, `Platform1/Schools/${sk}/Posts`);
     return ref(database, "Posts");
   };
+
+  const cacheResolvedPoster = useCallback((keys, userVal, nodeKey, schoolKey) => {
+    if (!userVal) return;
+    const payload = { ...userVal, _nodeKey: nodeKey || null, _schoolKey: schoolKey || null };
+    const allKeys = Array.from(
+      new Set([
+        ...(Array.isArray(keys) ? keys : []),
+        nodeKey,
+        userVal.userId,
+        userVal.username,
+      ].filter(Boolean))
+    );
+    allKeys.forEach((k) => {
+      adminCacheRef.current[k] = payload;
+    });
+  }, []);
+
+  const resolvePosterForPost = useCallback(async (postData, schoolKey) => {
+    const keys = getPosterLookupKeys(postData);
+    if (!keys.length) return;
+
+    const cached = keys.find((k) => adminCacheRef.current[k]);
+    if (cached) return;
+
+    for (const key of keys) {
+      try {
+        const byUserId = await queryUserByChildInSchool("userId", key, schoolKey);
+        if (byUserId && byUserId.exists()) {
+          let found = false;
+          byUserId.forEach((c) => {
+            cacheResolvedPoster(keys, c.val(), c.key, schoolKey);
+            found = true;
+            return true;
+          });
+          if (found) return;
+        }
+      } catch {}
+
+      try {
+        const byUsername = await queryUserByUsernameInSchool(key, schoolKey);
+        if (byUsername && byUsername.exists()) {
+          let found = false;
+          byUsername.forEach((c) => {
+            cacheResolvedPoster(keys, c.val(), c.key, schoolKey);
+            found = true;
+            return true;
+          });
+          if (found) return;
+        }
+      } catch {}
+
+      try {
+        const directSchoolSnap = schoolKey
+          ? await get(ref(database, `Platform1/Schools/${schoolKey}/Users/${key}`))
+          : null;
+        if (directSchoolSnap && directSchoolSnap.exists()) {
+          cacheResolvedPoster(keys, directSchoolSnap.val(), key, schoolKey);
+          return;
+        }
+      } catch {}
+
+      try {
+        const directGlobalSnap = await get(ref(database, `Users/${key}`));
+        if (directGlobalSnap && directGlobalSnap.exists()) {
+          cacheResolvedPoster(keys, directGlobalSnap.val(), key, null);
+          return;
+        }
+      } catch {}
+    }
+  }, [cacheResolvedPoster]);
 
   // helper: targetRole filtering
   const isStudentVisiblePost = (data) => {
@@ -158,64 +344,11 @@ export default function HomeScreen() {
           // FEATURE #1: targetRole filter for student
           const filteredTmp = tmp.filter((p) => isStudentVisiblePost(p.data));
 
-          const adminIds = Array.from(new Set(filteredTmp.map((p) => p.data.adminId).filter(Boolean)));
           const schoolKey = await AsyncStorage.getItem("schoolKey");
 
-          await Promise.all(
-            adminIds.map(async (aid) => {
-              if (adminCacheRef.current[aid]) return;
-              try {
-                let snapUser = null;
-                try {
-                  snapUser = await queryUserByUsernameInSchool(aid, schoolKey);
-                } catch {
-                  snapUser = null;
-                }
+          await Promise.all(filteredTmp.map((p) => resolvePosterForPost(p.data, schoolKey)));
 
-                if (snapUser && snapUser.exists()) {
-                  snapUser.forEach((c) => {
-                    adminCacheRef.current[aid] = { ...c.val(), _nodeKey: c.key, _schoolKey: schoolKey || null };
-                    return true;
-                  });
-                  return;
-                }
-
-                try {
-                  const snapByUserId = await queryUserByChildInSchool("userId", aid, schoolKey);
-                  if (snapByUserId && snapByUserId.exists()) {
-                    snapByUserId.forEach((c) => {
-                      adminCacheRef.current[aid] = { ...c.val(), _nodeKey: c.key, _schoolKey: schoolKey || null };
-                      return true;
-                    });
-                    return;
-                  }
-                } catch {}
-
-                try {
-                  const qGlobal = query(ref(database, "Users"), orderByChild("username"), equalTo(aid));
-                  const sGlobal = await get(qGlobal);
-                  if (sGlobal.exists()) {
-                    sGlobal.forEach((c) => {
-                      adminCacheRef.current[aid] = { ...c.val(), _nodeKey: c.key, _schoolKey: null };
-                      return true;
-                    });
-                    return;
-                  }
-                  const qGlobal2 = query(ref(database, "Users"), orderByChild("userId"), equalTo(aid));
-                  const sGlobal2 = await get(qGlobal2);
-                  if (sGlobal2.exists()) {
-                    sGlobal2.forEach((c) => {
-                      adminCacheRef.current[aid] = { ...c.val(), _nodeKey: c.key, _schoolKey: null };
-                      return true;
-                    });
-                    return;
-                  }
-                } catch {}
-              } catch {}
-            })
-          );
-
-          const enriched = filteredTmp.map((p) => {
+          const enriched = await Promise.all(filteredTmp.map(async (p) => {
             const likesNode = p.data.likes || {};
             const seenNode = p.data.seenBy || {};
 
@@ -232,13 +365,15 @@ export default function HomeScreen() {
               seenNode[currentUserId] = true;
             }
 
-            const admin = adminCacheRef.current[p.data.adminId] || null;
-            return { postId: p.postId, data: p.data, admin, likesMap: likesNode, seenMap: seenNode };
-          });
+            const admin = getCachedPoster(adminCacheRef.current, p.data);
+            return { postId: p.postId, data: p.data, admin, likesMap: likesNode, seenMap: seenNode, schoolKey };
+          }));
 
           enriched.forEach((e) => {
-            if (e.data.postUrl) Image.prefetch(e.data.postUrl).catch(() => {});
-            if (e.admin && e.admin.profileImage) Image.prefetch(e.admin.profileImage).catch(() => {});
+            const safePostImage = normalizeProfileImageUri(e.data.postUrl);
+            const safeAdminImage = normalizeProfileImageUri(extractProfileImage(e.admin));
+            if (safePostImage) Image.prefetch(safePostImage).catch(() => {});
+            if (safeAdminImage) Image.prefetch(safeAdminImage).catch(() => {});
           });
 
           if (mounted) {
@@ -264,7 +399,68 @@ export default function HomeScreen() {
       if (unsubscribe) unsubscribe();
       if (postsQueryRef.current) off(postsQueryRef.current);
     };
-  }, [loadUserContext]);
+  }, [loadUserContext, resolvePosterForPost]);
+
+  useEffect(() => {
+    let unsubscribe = null;
+    let mounted = true;
+
+    (async () => {
+      const location = await getSavedPostsLocation();
+      if (!location?.basePath) {
+        savedPostsReadyRef.current = true;
+        if (mounted) setSavedPostsMap({});
+        return;
+      }
+
+      const savedRef = ref(database, location.basePath);
+      savedPostsQueryRef.current = savedRef;
+
+      unsubscribe = onValue(
+        savedRef,
+        (snap) => {
+          if (!mounted) return;
+          savedPostsReadyRef.current = true;
+          setSavedPostsMap(snap.exists() ? snap.val() || {} : {});
+        },
+        () => {
+          savedPostsReadyRef.current = true;
+          if (mounted) setSavedPostsMap({});
+        }
+      );
+    })();
+
+    return () => {
+      mounted = false;
+      if (unsubscribe) unsubscribe();
+      if (savedPostsQueryRef.current) off(savedPostsQueryRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (loading) return;
+
+    (async () => {
+      const schoolKey = await AsyncStorage.getItem("schoolKey");
+      await writeScreenCache("home-feed", [getScreenCacheScope(schoolKey)], {
+        postsLatest,
+        postsOlder,
+        hasMore,
+        adminCache: adminCacheRef.current,
+      });
+    })();
+  }, [loading, postsLatest, postsOlder, hasMore]);
+
+  useEffect(() => {
+    if (!savedPostsReadyRef.current) return;
+
+    (async () => {
+      const schoolKey = await AsyncStorage.getItem("schoolKey");
+      await writeScreenCache("home-saved-posts", [getScreenCacheScope(schoolKey)], {
+        savedPostsMap,
+      });
+    })();
+  }, [savedPostsMap]);
 
   const onRefresh = async () => {
     setRefreshing(true);
@@ -321,72 +517,22 @@ export default function HomeScreen() {
         return;
       }
 
-      const adminIds = Array.from(new Set(filteredByTarget.map((p) => p.data.adminId).filter(Boolean)));
       const schoolKey = await AsyncStorage.getItem("schoolKey");
 
-      await Promise.all(
-        adminIds.map(async (aid) => {
-          if (adminCacheRef.current[aid]) return;
-          try {
-            let snapUser = null;
-            try {
-              snapUser = await queryUserByUsernameInSchool(aid, schoolKey);
-            } catch {
-              snapUser = null;
-            }
-            if (snapUser && snapUser.exists()) {
-              snapUser.forEach((c) => {
-                adminCacheRef.current[aid] = { ...c.val(), _nodeKey: c.key, _schoolKey: schoolKey || null };
-                return true;
-              });
-              return;
-            }
+      await Promise.all(filteredByTarget.map((p) => resolvePosterForPost(p.data, schoolKey)));
 
-            try {
-              const snapByUserId = await queryUserByChildInSchool("userId", aid, schoolKey);
-              if (snapByUserId && snapByUserId.exists()) {
-                snapByUserId.forEach((c) => {
-                  adminCacheRef.current[aid] = { ...c.val(), _nodeKey: c.key, _schoolKey: schoolKey || null };
-                  return true;
-                });
-                return;
-              }
-            } catch {}
-
-            try {
-              const qGlobal = query(ref(database, "Users"), orderByChild("username"), equalTo(aid));
-              const sGlobal = await get(qGlobal);
-              if (sGlobal.exists()) {
-                sGlobal.forEach((c) => {
-                  adminCacheRef.current[aid] = { ...c.val(), _nodeKey: c.key, _schoolKey: null };
-                  return true;
-                });
-                return;
-              }
-              const qGlobal2 = query(ref(database, "Users"), orderByChild("userId"), equalTo(aid));
-              const sGlobal2 = await get(qGlobal2);
-              if (sGlobal2.exists()) {
-                sGlobal2.forEach((c) => {
-                  adminCacheRef.current[aid] = { ...c.val(), _nodeKey: c.key, _schoolKey: null };
-                  return true;
-                });
-                return;
-              }
-            } catch {}
-          } catch {}
-        })
-      );
-
-      const enrichedOlder = filteredByTarget.map((p) => {
+      const enrichedOlder = await Promise.all(filteredByTarget.map(async (p) => {
         const likesNode = p.data.likes || {};
         const seenNode = p.data.seenBy || {};
-        const admin = adminCacheRef.current[p.data.adminId] || null;
-        return { postId: p.postId, data: p.data, admin, likesMap: likesNode, seenMap: seenNode };
-      });
+        const admin = getCachedPoster(adminCacheRef.current, p.data);
+        return { postId: p.postId, data: p.data, admin, likesMap: likesNode, seenMap: seenNode, schoolKey };
+      }));
 
       enrichedOlder.forEach((e) => {
-        if (e.data.postUrl) Image.prefetch(e.data.postUrl).catch(() => {});
-        if (e.admin && e.admin.profileImage) Image.prefetch(e.admin.profileImage).catch(() => {});
+        const safePostImage = normalizeProfileImageUri(e.data.postUrl);
+        const safeAdminImage = normalizeProfileImageUri(extractProfileImage(e.admin));
+        if (safePostImage) Image.prefetch(safePostImage).catch(() => {});
+        if (safeAdminImage) Image.prefetch(safeAdminImage).catch(() => {});
       });
 
       setPostsOlder((prev) => {
@@ -410,17 +556,9 @@ export default function HomeScreen() {
       return;
     }
 
-    const findPost = () => {
-      let p = postsLatest.find((x) => x.postId === postId);
-      if (p) return { which: "latest", p };
-      p = postsOlder.find((x) => x.postId === postId);
-      if (p) return { which: "older", p };
-      return null;
-    };
-
-    const found = findPost();
+    const found = findLoadedPost(postId);
     if (!found) return;
-    const currentlyLiked = !!(found.p.likesMap && found.p.likesMap[uid]);
+    const currentlyLiked = !!(found.likesMap && found.likesMap[uid]);
 
     const optimisticUpdater = (post) => {
       const likes = { ...(post.likesMap || {}) };
@@ -429,8 +567,8 @@ export default function HomeScreen() {
       return { ...post, likesMap: likes, data: { ...post.data, likeCount: Object.keys(likes).length } };
     };
 
-    if (found.which === "latest") setPostsLatest((prev) => prev.map((p) => (p.postId === postId ? optimisticUpdater(p) : p)));
-    else setPostsOlder((prev) => prev.map((p) => (p.postId === postId ? optimisticUpdater(p) : p)));
+    setPostsLatest((prev) => prev.map((p) => (p.postId === postId ? optimisticUpdater(p) : p)));
+    setPostsOlder((prev) => prev.map((p) => (p.postId === postId ? optimisticUpdater(p) : p)));
 
     try {
       const sk = await AsyncStorage.getItem("schoolKey");
@@ -457,7 +595,14 @@ export default function HomeScreen() {
         const snap = await get(pRef);
         if (snap.exists()) {
           const val = snap.val();
-          const updated = { postId: val.postId || postId, data: val, likesMap: val.likes || {}, seenMap: val.seenBy || {} };
+          const updated = {
+            postId: val.postId || postId,
+            data: val,
+            admin: found?.admin || getCachedPoster(adminCacheRef.current, val),
+            likesMap: val.likes || {},
+            seenMap: val.seenBy || {},
+            schoolKey: found?.schoolKey || null,
+          };
           setPostsLatest((prev) => prev.map((p) => (p.postId === postId ? updated : p)));
           setPostsOlder((prev) => prev.map((p) => (p.postId === postId ? updated : p)));
         }
@@ -466,12 +611,155 @@ export default function HomeScreen() {
     }
   };
 
+  const toggleSavePost = useCallback(async (postId) => {
+    const uid = userId || (await loadUserContext());
+    if (!uid) {
+      Alert.alert("Not signed in", "You must be signed in to save posts.");
+      return;
+    }
+
+    const post = findLoadedPost(postId);
+    if (!post) return;
+
+    const wasSaved = !!savedPostsMap[postId];
+
+    setSavedPostsMap((prev) => {
+      const next = { ...prev };
+      if (wasSaved) delete next[postId];
+      else next[postId] = { postId, savedAt: Date.now() };
+      return next;
+    });
+
+    try {
+      const result = await toggleSavedPostEntry(postId, post.data);
+      setSavedPostsMap((prev) => {
+        const next = { ...prev };
+        if (result.saved) next[postId] = result.payload || { postId, savedAt: Date.now() };
+        else delete next[postId];
+        return next;
+      });
+    } catch (error) {
+      console.warn("toggle save post failed:", error);
+      setSavedPostsMap((prev) => {
+        const next = { ...prev };
+        if (wasSaved) next[postId] = prev[postId] || { postId, savedAt: Date.now() };
+        else delete next[postId];
+        return next;
+      });
+      Alert.alert("Error", "Unable to update saved posts. Please try again.");
+    }
+  }, [findLoadedPost, loadUserContext, savedPostsMap, userId]);
+
+  const toggleDescription = useCallback((postId) => {
+    setExpandedDescriptions((prev) => ({
+      ...prev,
+      [postId]: !prev[postId],
+    }));
+  }, []);
+
+  const closePostMenu = useCallback(() => {
+    setPostMenuPostId(null);
+  }, []);
+
+  const openPostMenu = useCallback((postId) => {
+    setPostMenuPostId(postId);
+  }, []);
+
+  const markFeedScrollStarted = useCallback(() => {
+    hasUserScrolledFeedRef.current = true;
+  }, []);
+
+  const handleReportPost = useCallback(() => {
+    (async () => {
+      const uid = userId || (await loadUserContext());
+      const postId = postMenuPostId;
+
+      closePostMenu();
+
+      if (!uid) {
+        Alert.alert("Not signed in", "You must be signed in to report posts.");
+        return;
+      }
+
+      if (!postId) return;
+
+      try {
+        const schoolKey = await AsyncStorage.getItem("schoolKey");
+        const reportPath = schoolKey
+          ? `Platform1/Schools/${schoolKey}/Posts/${postId}/reportBy/${uid}`
+          : `Posts/${postId}/reportBy/${uid}`;
+
+        const updates = {};
+        updates[reportPath] = true;
+        await update(ref(database), updates);
+
+        Alert.alert("Report", "This post has been reported.");
+      } catch (error) {
+        console.warn("report post failed:", error);
+        Alert.alert("Error", "Unable to report this post. Please try again.");
+      }
+    })();
+  }, [closePostMenu, loadUserContext, postMenuPostId, userId]);
+
+  const handleAboutAccount = useCallback(() => {
+    const selectedPost = combinedPosts.find((post) => post.postId === postMenuPostId);
+    closePostMenu();
+
+    if (!selectedPost) return;
+
+    const accountName = getPosterName(selectedPost.admin, selectedPost.data);
+    const targetRole = formatTargetRoleLabel(selectedPost.data);
+
+    Alert.alert("About this account", `Posted by ${accountName}\nAudience: ${targetRole}`);
+  }, [combinedPosts, postMenuPostId, closePostMenu]);
+
+  const handleDownloadPost = useCallback(async () => {
+    const selectedPost = combinedPosts.find((post) => post.postId === postMenuPostId);
+    closePostMenu();
+
+    const downloadableUrl = normalizeProfileImageUri(selectedPost?.data?.postUrl);
+    if (!downloadableUrl) {
+      Alert.alert("Download", "This post does not have an image to download.");
+      return;
+    }
+
+    try {
+      const permission = await MediaLibrary.requestPermissionsAsync();
+      if (permission.status !== "granted") {
+        Alert.alert("Permission needed", "Allow photo access to save downloaded images.");
+        return;
+      }
+
+      const ext = getFileExtensionFromUrl(downloadableUrl);
+      const fileName = `gojo-post-${selectedPost.postId || Date.now()}.${ext}`;
+      const downloadPath = `${FileSystem.cacheDirectory}${fileName}`;
+
+      await FileSystem.downloadAsync(downloadableUrl, downloadPath);
+      await MediaLibrary.saveToLibraryAsync(downloadPath);
+      await FileSystem.deleteAsync(downloadPath, { idempotent: true });
+
+      Alert.alert("Download", "Image saved to your gallery.");
+    } catch (error) {
+      console.warn("download post failed:", error);
+      Alert.alert("Error", "Unable to download this image. Please try again.");
+    }
+  }, [combinedPosts, postMenuPostId, closePostMenu]);
+
   function PostCard({ item }) {
-    const { postId, data, admin, likesMap = {}, seenMap = {} } = item;
+    const { postId, data, admin, likesMap = {} } = item;
     const likesCount = data.likeCount || Object.keys(likesMap || {}).length;
-    const seenCount = Object.keys(seenMap || {}).length;
     const isLiked = userId ? !!likesMap[userId] : false;
-    const imageUri = data.postUrl || null;
+    const isSaved = !!savedPostsMap[postId];
+    const imageUri = normalizeProfileImageUri(data.postUrl);
+    const message = String(data.message || "").trim();
+    const targetRoleLabel = formatTargetRoleLabel(data);
+    const posterName = getPosterName(admin, data);
+    const posterImage = getPosterImage(admin, data);
+    const isExpanded = !!expandedDescriptions[postId];
+    const shouldTruncate = message.length > DESCRIPTION_PREVIEW_LENGTH;
+    const previewMessage = shouldTruncate && !isExpanded
+      ? `${message.slice(0, DESCRIPTION_PREVIEW_LENGTH).trimEnd()}...`
+      : message;
 
     const scale = useRef(new Animated.Value(1)).current;
     const animateHeart = () => {
@@ -488,44 +776,80 @@ export default function HomeScreen() {
     return (
       <View style={styles.card}>
         <View style={styles.cardHeader}>
-          <Image
-            source={(admin && admin.profileImage) ? { uri: admin.profileImage } : require("../../assets/images/avatar_placeholder.png")}
-            style={styles.avatar}
-          />
-          <View style={{ flex: 1 }}>
-            <Text style={styles.username}>{admin?.name || admin?.username || "School Admin"}</Text>
-            <Text style={styles.time}>{timeAgo(data.time)}</Text>
-          </View>
+          <TouchableOpacity
+            style={styles.headerProfileTap}
+            activeOpacity={0.85}
+            onPress={() => openUserProfile({
+              candidates: [
+                item.admin?._nodeKey,
+                item.admin?.userId,
+                item.admin?.username,
+                item.data?.adminId,
+                item.data?.userId,
+                item.data?.createdBy,
+              ].filter(Boolean),
+              fallbackSchoolCode: item.admin?._schoolKey || item.schoolKey || null,
+              fallbackUser: item.admin,
+              fallbackName: posterName,
+              fallbackAvatar: posterImage,
+              fallbackRole: item.admin?.role || "School Account",
+              fallbackRoleTitle: item.admin?.designation || item.admin?.subject || item.admin?.role || "School Account",
+              fallbackContactKey: item.admin?._nodeKey || item.data?.adminId || item.data?.createdBy || "",
+              fallbackContactUserId: item.admin?.userId || item.data?.adminId || item.data?.userId || item.data?.createdBy || "",
+            })}
+          >
+            <Image
+              source={posterImage ? { uri: posterImage } : require("../../assets/images/avatar_placeholder.png")}
+              style={styles.avatar}
+            />
+            <View style={styles.headerTextWrap}>
+              <Text style={styles.username}>{posterName}</Text>
+              <View style={styles.headerMetaRow}>
+                <Text style={styles.time}>{timeAgo(data.time)}</Text>
+                <Text style={styles.headerDot}>·</Text>
+                <Text style={styles.targetRoleText}>{targetRoleLabel}</Text>
+              </View>
+            </View>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.moreBtn} activeOpacity={0.8} onPress={() => openPostMenu(postId)}>
+            <Ionicons name="ellipsis-horizontal" size={20} color={colors.muted} />
+          </TouchableOpacity>
         </View>
 
-        {/* FEATURE #2: tap to open large view */}
-        {imageUri ? (
-          <TouchableOpacity activeOpacity={0.95} onPress={() => { setViewerImage(imageUri); setViewerVisible(true); }}>
-            <Image source={{ uri: imageUri }} style={styles.postImage} resizeMode="cover" />
-          </TouchableOpacity>
+        {message ? (
+          <View style={styles.messageWrap}>
+            <Text style={styles.messageText}>{previewMessage}</Text>
+            {shouldTruncate ? (
+              <TouchableOpacity activeOpacity={0.8} onPress={() => toggleDescription(postId)}>
+                <Text style={styles.seeMoreText}>{isExpanded ? "See less" : "See more"}</Text>
+              </TouchableOpacity>
+            ) : null}
+          </View>
         ) : null}
 
-        <View style={styles.actionsRow}>
-          <View style={styles.leftActions}>
-            <TouchableOpacity onPress={onHeartPress} style={styles.iconBtn} activeOpacity={0.8}>
+        {imageUri ? (
+          <Pressable
+            onPress={() => {
+              setViewerImage(imageUri);
+              setViewerVisible(true);
+            }}
+          >
+            <Image source={{ uri: imageUri }} style={styles.postImage} resizeMode="contain" />
+          </Pressable>
+        ) : null}
+
+        <View style={styles.reactionsSummary}>
+          <View style={styles.reactionsLeft}>
+            <TouchableOpacity style={styles.likeIconOnlyBtn} activeOpacity={0.85} onPress={onHeartPress}>
               <Animated.View style={{ transform: [{ scale }] }}>
-                <Ionicons name={isLiked ? "heart" : "heart-outline"} size={28} color={isLiked ? "#E0245E" : "#111"} />
+                <Ionicons name={isLiked ? "heart" : "heart-outline"} size={24} color={isLiked ? "#ED4956" : colors.text} />
               </Animated.View>
             </TouchableOpacity>
+            <Text style={styles.reactionCountText}>{likesCount} {likesCount === 1 ? "like" : "likes"}</Text>
           </View>
-        </View>
-
-        <View style={styles.meta}>
-          <Text style={styles.likesText}>{likesCount} {likesCount === 1 ? "like" : "likes"}</Text>
-          <Text style={styles.messageText}>
-            <Text style={styles.username}>{admin?.username || admin?.name || ""}</Text>
-            {"  "}
-            {data.message}
-          </Text>
-          <View style={styles.bottomMetaRow}>
-            <Text style={styles.seenText}>{seenCount} seen</Text>
-            <Text style={styles.timeSmall}> • {new Date(data.time).toLocaleString?.() ?? ""}</Text>
-          </View>
+          <TouchableOpacity style={styles.actionIconBtn} activeOpacity={0.85} onPress={() => toggleSavePost(postId)}>
+            <Ionicons name={isSaved ? "bookmark" : "bookmark-outline"} size={20} color={colors.text} />
+          </TouchableOpacity>
         </View>
       </View>
     );
@@ -550,24 +874,20 @@ export default function HomeScreen() {
   );
 
   if (loading) {
-    return (
-      <View style={styles.center}>
-        <ActivityIndicator size="large" color="#007AFB" />
-      </View>
-    );
+    return <PageLoadingSkeleton variant="feed" showHeader={false} style={{ flex: 1, backgroundColor: colors.feedBackground }} />;
   }
 
   if (!combinedPosts || combinedPosts.length === 0) {
     return (
-      <View style={{ flex: 1, backgroundColor: "#fff" }}>
+      <View style={{ flex: 1, backgroundColor: colors.feedBackground }}>
         <EmptyState />
       </View>
     );
   }
 
   const ListFooter = () => {
-    if (loadingMore) return <ActivityIndicator style={{ margin: 16 }} color="#007AFB" />;
-    if (!hasMore) return <Text style={{ textAlign: "center", color: "#888", padding: 12 }}>No more posts</Text>;
+    if (loadingMore) return <ActivityIndicator style={{ margin: 16 }} color={colors.primary} />;
+    if (!hasMore) return <Text style={{ textAlign: "center", color: colors.muted, padding: 12 }}>No more posts</Text>;
     return null;
   };
 
@@ -577,21 +897,49 @@ export default function HomeScreen() {
         data={combinedPosts}
         keyExtractor={(i) => i.postId}
         renderItem={({ item }) => <PostCard item={item} />}
-        contentContainerStyle={styles.list}
-        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={["#007AFB"]} />}
-        onEndReachedThreshold={0.6}
+        contentContainerStyle={[styles.list, { paddingBottom: 74 + Math.max(insets.bottom, 6) }]}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={[colors.primary]} tintColor={colors.primary} />}
+        onScrollBeginDrag={markFeedScrollStarted}
+        onMomentumScrollBegin={markFeedScrollStarted}
+        onEndReachedThreshold={0.18}
         onEndReached={() => {
+          if (!hasUserScrolledFeedRef.current) return;
           if (!loadingMore && hasMore) loadMore();
         }}
         ListFooterComponent={<ListFooter />}
       />
+
+      <Modal visible={!!postMenuPostId} transparent animationType="fade" onRequestClose={closePostMenu}>
+        <View style={styles.menuOverlay}>
+          <Pressable style={styles.menuBackdrop} onPress={closePostMenu} />
+          <View style={styles.menuSheetWrap}>
+            <View style={styles.menuSheetHandle} />
+            <View style={styles.menuSheet}>
+              <TouchableOpacity style={styles.menuItem} activeOpacity={0.85} onPress={handleAboutAccount}>
+                <Ionicons name="information-circle-outline" size={20} color={colors.text} />
+                <Text style={styles.menuItemText}>About this account</Text>
+              </TouchableOpacity>
+              <View style={styles.menuDivider} />
+              <TouchableOpacity style={styles.menuItem} activeOpacity={0.85} onPress={handleDownloadPost}>
+                <Ionicons name="download-outline" size={20} color={colors.text} />
+                <Text style={styles.menuItemText}>Download</Text>
+              </TouchableOpacity>
+              <View style={styles.menuDivider} />
+              <TouchableOpacity style={styles.menuItem} activeOpacity={0.85} onPress={handleReportPost}>
+                <Ionicons name="flag-outline" size={20} color="#ED4956" />
+                <Text style={[styles.menuItemText, styles.menuItemDanger]}>Report</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
 
       {/* FEATURE #2: full-screen image modal */}
       <Modal visible={viewerVisible} transparent animationType="fade" onRequestClose={() => setViewerVisible(false)}>
         <View style={styles.viewerBg}>
           <View style={styles.viewerTop}>
             <TouchableOpacity style={styles.viewerClose} onPress={() => setViewerVisible(false)}>
-              <Ionicons name="close" size={26} color="#fff" />
+              <Ionicons name="close" size={26} color={colors.white} />
             </TouchableOpacity>
           </View>
           <Pressable style={{ flex: 1, width: "100%" }} onPress={() => setViewerVisible(false)}>
@@ -601,65 +949,161 @@ export default function HomeScreen() {
           </Pressable>
         </View>
       </Modal>
+      {profileCardModal}
     </>
   );
 }
 
-const styles = StyleSheet.create({
-  list: { paddingVertical: 12, paddingHorizontal: 12, backgroundColor: "#fff" },
-  center: { flex: 1, alignItems: "center", justifyContent: "center", padding: 20, backgroundColor: "#fff" },
+function createStyles(colors) {
+  return StyleSheet.create({
+  list: { paddingVertical: 0, backgroundColor: colors.feedBackground },
+  center: { flex: 1, alignItems: "center", justifyContent: "center", padding: 20, backgroundColor: colors.feedBackground },
   card: {
-    backgroundColor: "#fff",
-    borderRadius: 12,
-    marginBottom: 16,
+    backgroundColor: colors.card,
+    marginBottom: 6,
+    marginHorizontal: 0,
     overflow: "hidden",
-    borderColor: "#F1F3F8",
-    borderWidth: 1,
+    borderRadius: 0,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.border,
   },
   cardHeader: {
     flexDirection: "row",
     alignItems: "center",
-    padding: 12,
+    paddingHorizontal: 12,
+    paddingTop: 10,
+    paddingBottom: 6,
   },
-  avatar: { width: 46, height: 46, borderRadius: 23, marginRight: 10, backgroundColor: "#F6F8FF" },
+  headerProfileTap: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  avatar: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    marginRight: 10,
+    backgroundColor: colors.surfaceMuted,
+  },
 
-  username: { fontWeight: "700", color: "#111" },
-  time: { color: "#888", fontSize: 12, marginTop: 2 },
+  headerTextWrap: { flex: 1 },
+  username: { fontWeight: "700", color: colors.text, fontSize: 15 },
+  headerMetaRow: { flexDirection: "row", alignItems: "center", marginTop: 2 },
+  time: { color: colors.muted, fontSize: 12 },
+  headerDot: { color: colors.muted, fontSize: 12, marginHorizontal: 4 },
+  targetRoleText: { color: colors.muted, fontSize: 12 },
+  moreBtn: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  messageWrap: { paddingHorizontal: 12, paddingBottom: 8 },
+  messageText: { color: colors.text, lineHeight: 20, fontSize: 15 },
+  seeMoreText: {
+    color: colors.muted,
+    fontSize: 14,
+    marginTop: 4,
+  },
 
   postImage: {
     width: "100%",
     height: IMAGE_HEIGHT,
-    backgroundColor: "#EEE",
+    backgroundColor: colors.surfaceMuted,
   },
-
-  actionsRow: {
+  reactionsSummary: {
     flexDirection: "row",
     justifyContent: "space-between",
-    paddingHorizontal: 10,
-    paddingVertical: 8,
     alignItems: "center",
+    paddingHorizontal: 12,
+    paddingTop: 4,
+    paddingBottom: 4,
   },
-  leftActions: { flexDirection: "row", alignItems: "center" },
+  reactionsLeft: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+  },
+  reactionCountText: {
+    color: colors.text,
+    fontSize: 13,
+    fontWeight: "700",
+  },
+  likeIconOnlyBtn: {
+    alignItems: "center",
+    justifyContent: "center",
+    width: 28,
+    height: 28,
+  },
+  actionIconBtn: {
+    alignItems: "center",
+    justifyContent: "center",
+    width: 26,
+    height: 26,
+  },
+  menuOverlay: {
+    flex: 1,
+    backgroundColor: colors.overlay,
+  },
+  menuBackdrop: {
+    flex: 1,
+  },
+  menuSheetWrap: {
+    paddingHorizontal: 8,
+    paddingBottom: 10,
+  },
+  menuSheetHandle: {
+    alignSelf: "center",
+    width: 38,
+    height: 4,
+    borderRadius: 999,
+    backgroundColor: colors.tabGlassHighlight,
+    marginBottom: 10,
+  },
+  menuSheet: {
+    backgroundColor: colors.card,
+    borderRadius: 22,
+    paddingVertical: 6,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: -4 },
+    shadowOpacity: 0.08,
+    shadowRadius: 18,
+    elevation: 12,
+  },
+  menuItem: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    paddingHorizontal: 18,
+    paddingVertical: 16,
+  },
+  menuItemText: {
+    color: colors.text,
+    fontSize: 16,
+    fontWeight: "600",
+  },
+  menuItemDanger: {
+    color: "#ED4956",
+  },
+  menuDivider: {
+    height: 1,
+    backgroundColor: colors.border,
+    marginHorizontal: 18,
+  },
 
-  iconBtn: { padding: 6 },
-
-  meta: { paddingHorizontal: 12, paddingBottom: 12 },
-  likesText: { fontWeight: "700", marginBottom: 6, color: "#111" },
-  messageText: { color: "#222", lineHeight: 20 },
-
-  bottomMetaRow: { flexDirection: "row", marginTop: 8, alignItems: "center" },
-  seenText: { color: "#888", fontSize: 12 },
-  timeSmall: { color: "#888", fontSize: 12 },
-
-  emptyContainer: { flex: 1, backgroundColor: "#fff", alignItems: "center", justifyContent: "center", padding: 28 },
+  emptyContainer: { flex: 1, backgroundColor: colors.feedBackground, alignItems: "center", justifyContent: "center", padding: 28 },
   emptyImage: { width: 220, height: 160, marginBottom: 18 },
-  emptyFallbackIcon: { width: 120, height: 120, borderRadius: 60, backgroundColor: "#F6F8FF", alignItems: "center", justifyContent: "center", marginBottom: 12 },
-  emptyTitle: { fontSize: 20, fontWeight: "700", color: "#222", marginBottom: 6 },
-  emptySubtitle: { fontSize: 14, color: "#8B93B3", textAlign: "center" },
+  emptyFallbackIcon: { width: 120, height: 120, borderRadius: 60, backgroundColor: colors.soft, alignItems: "center", justifyContent: "center", marginBottom: 12 },
+  emptyTitle: { fontSize: 20, fontWeight: "700", color: colors.text, marginBottom: 6 },
+  emptySubtitle: { fontSize: 14, color: colors.muted, textAlign: "center" },
 
   viewerBg: {
     flex: 1,
-    backgroundColor: "rgba(0,0,0,0.96)",
+    backgroundColor: colors.imageOverlay,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -673,7 +1117,7 @@ const styles = StyleSheet.create({
     width: 40,
     height: 40,
     borderRadius: 20,
-    backgroundColor: "rgba(255,255,255,0.18)",
+    backgroundColor: colors.tabGlassHighlight,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -681,4 +1125,145 @@ const styles = StyleSheet.create({
     width: "100%",
     height: "100%",
   },
+  profileModalOverlay: {
+    flex: 1,
+    backgroundColor: colors.modalBackdrop,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 18,
+  },
+  profileModalCard: {
+    width: "100%",
+    maxWidth: 344,
+    backgroundColor: colors.card,
+    borderRadius: 24,
+    paddingHorizontal: 16,
+    paddingTop: 18,
+    paddingBottom: 14,
+    overflow: "hidden",
+    borderWidth: 1,
+    borderColor: colors.tabGlassActive,
+    shadowColor: "#001845",
+    shadowOffset: { width: 0, height: 14 },
+    shadowOpacity: 0.16,
+    shadowRadius: 28,
+    elevation: 18,
+  },
+  profileModalAccent: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    height: 68,
+    backgroundColor: colors.soft,
+  },
+  profileHero: {
+    alignItems: "center",
+    marginBottom: 12,
+  },
+  profileModalAvatar: {
+    width: 68,
+    height: 68,
+    borderRadius: 34,
+    marginBottom: 10,
+    backgroundColor: colors.soft,
+    borderWidth: 2,
+    borderColor: colors.white,
+  },
+  profileAvatarFallback: {
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  profileAvatarLetter: {
+    fontSize: 24,
+    fontWeight: "800",
+    color: colors.primary,
+  },
+  profileModalName: {
+    fontSize: 20,
+    fontWeight: "800",
+    color: colors.text,
+    textAlign: "center",
+  },
+  roleLine: {
+    marginTop: 8,
+    fontSize: 13,
+    textAlign: "center",
+  },
+  roleLineLabel: {
+    color: colors.muted,
+    fontWeight: "700",
+  },
+  roleLineDot: {
+    color: colors.muted,
+  },
+  roleLineValue: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: colors.primary,
+  },
+  infoGrid: {
+    gap: 8,
+  },
+  infoRow: {
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 14,
+    backgroundColor: colors.elevatedSurface,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  infoLabel: {
+    fontSize: 10,
+    fontWeight: "800",
+    color: colors.muted,
+    textTransform: "uppercase",
+    marginBottom: 3,
+  },
+  infoValue: {
+    fontSize: 14,
+    fontWeight: "700",
+    color: colors.text,
+  },
+  profileModalActions: {
+    flexDirection: "row",
+    gap: 10,
+    marginTop: 12,
+  },
+  messageProfileBtn: {
+    flex: 1,
+    minHeight: 40,
+    borderRadius: 12,
+    backgroundColor: colors.primary,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    shadowColor: colors.primary,
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.2,
+    shadowRadius: 16,
+    elevation: 8,
+  },
+  messageProfileBtnText: {
+    color: colors.white,
+    fontSize: 14,
+    fontWeight: "800",
+  },
+  closeProfileBtn: {
+    flex: 1,
+    minHeight: 40,
+    borderRadius: 12,
+    backgroundColor: colors.subduedButton,
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  closeProfileBtnText: {
+    color: colors.text,
+    fontSize: 14,
+    fontWeight: "800",
+  },
 });
+}

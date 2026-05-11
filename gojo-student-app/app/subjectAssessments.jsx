@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback, useMemo } from "react";
+import React, { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import {
   View,
   Text,
@@ -6,27 +6,37 @@ import {
   SafeAreaView,
   FlatList,
   TouchableOpacity,
-  ActivityIndicator,
   RefreshControl,
+  ActivityIndicator,
+  InteractionManager,
+  Alert,
 } from "react-native";
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { ref, get } from "firebase/database";
+import { ref, get } from "../lib/offlineDatabase";
 import { database } from "../constants/firebaseConfig";
-import { getSnapshot } from "./lib/dbHelpers";
+import { resolveSchoolKeyFromStudentId } from "./lib/dbHelpers";
+import { useAppTheme } from "../hooks/use-app-theme";
+import PageLoadingSkeleton from "../components/ui/page-loading-skeleton";
+import {
+  downloadAssessmentBundle,
+  readDownloadedAssessmentStateMap,
+  persistCachedSubjectAssessments,
+  readAssessmentSubmissionIndex,
+  readCachedSubjectAssessments,
+} from "../lib/schoolAssessments";
 
 const PRIMARY = "#0B72FF";
 const MUTED = "#6B78A8";
-const TEXT = "#0B2540";
-const BORDER = "#EAF0FF";
-const BG = "#FFFFFF";
-const CARD = "#FFFFFF";
 const SUCCESS = "#12B76A";
 const WARNING = "#F59E0B";
 const DANGER = "#EF4444";
 const INFO = "#0EA5E9";
+const SUBJECT_ASSESSMENTS_CACHE_TTL_MS = 2 * 60 * 1000;
+const SUBJECT_ASSESSMENTS_NODE_CACHE_MS = 90 * 1000;
+const SUBJECT_ASSESSMENTS_SUBMISSION_CACHE_MS = 90 * 1000;
 
 const SUBJECT_ICON_MAP = [
   { keys: ["english", "literature"], icon: "book-open-page-variant", color: "#6C5CE7" },
@@ -95,6 +105,32 @@ function getTypeMeta(type = "") {
   return { label: type || "Assessment", icon: "reader-outline" };
 }
 
+function getAssessmentSortTimestamp(item = {}, fallbackIndex = 0) {
+  return Math.max(
+    normalizeUnixTimestamp(item?.publishedAt) || 0,
+    normalizeUnixTimestamp(item?.createdAt) || 0,
+    normalizeUnixTimestamp(item?.updatedAt) || 0,
+    normalizeUnixTimestamp(item?.openAt || item?.startAt || item?.availableFrom) || 0,
+    Number(fallbackIndex || 0)
+  );
+}
+
+function sortAssessmentsNewestFirst(items = []) {
+  return [...items]
+    .sort((left, right) => {
+      const leftIndex = Number(left?.__sourceIndex || 0);
+      const rightIndex = Number(right?.__sourceIndex || 0);
+      const timeDiff = getAssessmentSortTimestamp(right, rightIndex) - getAssessmentSortTimestamp(left, leftIndex);
+      if (timeDiff !== 0) return timeDiff;
+
+      const indexDiff = rightIndex - leftIndex;
+      if (indexDiff !== 0) return indexDiff;
+
+      return String(right?.assessmentId || "").localeCompare(String(left?.assessmentId || ""));
+    })
+    .map(({ __sourceIndex, ...rest }) => rest);
+}
+
 async function resolveSchoolKeyFast(studentId) {
   if (!studentId) return null;
 
@@ -104,72 +140,239 @@ async function resolveSchoolKeyFast(studentId) {
   } catch {}
 
   try {
-    const schoolsSnap = await getSnapshot([`Platform1/Schools`]);
-    const schools = schoolsSnap?.val ? schoolsSnap.val() || {} : {};
-    for (const schoolKey of Object.keys(schools)) {
-      const s = await get(ref(database, `Platform1/Schools/${schoolKey}/Students/${studentId}`));
-      if (s.exists()) {
-        try { await AsyncStorage.setItem("schoolKey", schoolKey); } catch {}
-        return schoolKey;
-      }
+    const resolvedSchoolKey = await resolveSchoolKeyFromStudentId(studentId);
+    if (resolvedSchoolKey) {
+      try {
+        await AsyncStorage.setItem("schoolKey", resolvedSchoolKey);
+      } catch {}
+      return resolvedSchoolKey;
     }
   } catch {}
 
   return null;
 }
 
+async function readAssessmentSession() {
+  const pairs = await AsyncStorage.multiGet(["studentNodeKey", "studentId", "username", "schoolKey"]);
+  const session = Object.fromEntries(pairs || []);
+  return {
+    studentId: session.studentNodeKey || session.studentId || session.username || null,
+    schoolKey: session.schoolKey || null,
+  };
+}
+
 export default function SubjectAssessmentsScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
-  const { courseId, subject, grade, section } = useLocalSearchParams();
+  const params = useLocalSearchParams();
+  const { colors } = useAppTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
+  const { courseId, subject, grade, section, returnTo, returnExamFilter } = params;
+  const warmStats = useMemo(() => {
+    const total = Math.max(0, Number(params?.warmAssessmentCount || 0));
+    const pending = Math.max(0, Number(params?.warmPendingAssessmentCount || 0));
+    return {
+      total,
+      pending,
+      submitted: Math.max(0, total - pending),
+    };
+  }, [params?.warmAssessmentCount, params?.warmPendingAssessmentCount]);
+  const hasWarmShell = useMemo(
+    () => !!subject || !!grade || !!section || warmStats.total > 0,
+    [grade, section, subject, warmStats.total]
+  );
+  const cacheRouteParams = useMemo(() => ({
+    courseId: String(courseId || ""),
+    subject: String(subject || ""),
+    grade: String(grade || ""),
+    section: String(section || ""),
+  }), [courseId, grade, section, subject]);
+
+  const handleBackNavigation = useCallback(() => {
+    if (String(returnTo || "") === "exam") {
+      if (router.canGoBack()) {
+        router.back();
+        return;
+      }
+
+      router.replace({
+        pathname: "/dashboard/exam",
+        params: { activeFilter: String(returnExamFilter || "school") },
+      });
+      return;
+    }
+
+    if (router.canGoBack()) {
+      router.back();
+      return;
+    }
+
+    router.replace({
+      pathname: "/dashboard/exam",
+      params: { activeFilter: String(returnExamFilter || "school") },
+    });
+  }, [returnTo, returnExamFilter, router]);
 
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [items, setItems] = useState([]);
+  const [sessionInfo, setSessionInfo] = useState(null);
+  const [downloadedMap, setDownloadedMap] = useState({});
+  const [downloadProgressMap, setDownloadProgressMap] = useState({});
+  const sessionInfoRef = useRef(null);
 
-  const loadData = useCallback(async () => {
-    setLoading(true);
+  const storeSessionInfo = useCallback((nextSession) => {
+    const normalized = nextSession
+      ? {
+          studentId: nextSession?.studentId || null,
+          schoolKey: nextSession?.schoolKey || null,
+        }
+      : null;
+
+    sessionInfoRef.current = normalized;
+
+    setSessionInfo((prev) => {
+      const prevStudentId = prev?.studentId || null;
+      const prevSchoolKey = prev?.schoolKey || null;
+      const nextStudentId = normalized?.studentId || null;
+      const nextSchoolKey = normalized?.schoolKey || null;
+
+      if (prevStudentId === nextStudentId && prevSchoolKey === nextSchoolKey) {
+        return prev;
+      }
+
+      return normalized;
+    });
+  }, []);
+
+  const hydrateDownloadedMap = useCallback(async (assessmentItems = [], session = null) => {
+    const activeSession = session || sessionInfoRef.current || await readAssessmentSession();
+    const sid = activeSession?.studentId || null;
+    if (!sid || !Array.isArray(assessmentItems) || !assessmentItems.length) {
+      setDownloadedMap({});
+      return;
+    }
+
+    const nextMap = await readDownloadedAssessmentStateMap(sid, assessmentItems);
+    setDownloadedMap(nextMap);
+  }, []);
+
+  const openAssessment = useCallback((item) => {
+    router.push({
+      pathname: "/takeAssessment",
+      params: {
+        assessmentId: item.assessmentId,
+        courseId: item.courseId,
+        title: item.title || "Assessment",
+        warmTitle: String(item.title || "Assessment"),
+        warmDueDate: String(item.dueDate || ""),
+        warmTotalPoints: String(item.totalPoints || 0),
+        warmQuestionCount: String(item.questionCount || 0),
+        warmType: String(item.type || ""),
+        warmSubmitted: item.submitted ? "1" : "0",
+        warmFinalScore: item.finalScore != null ? String(item.finalScore) : "",
+        returnTo: "subjectAssessments",
+        returnCourseId: String(courseId || ""),
+        returnSubject: String(subject || ""),
+        returnGrade: String(grade || ""),
+        returnSection: String(section || ""),
+        returnExamFilter: String(returnExamFilter || "school"),
+      },
+    });
+  }, [courseId, grade, returnExamFilter, router, section, subject]);
+
+  const downloadAssessmentToPhone = useCallback(async (item) => {
+    const assessmentKey = String(item?.assessmentId || "").trim();
+    if (!assessmentKey || Number(downloadProgressMap?.[assessmentKey] || 0) > 0) return;
+
+    const activeSession = sessionInfo || await readAssessmentSession();
+    const sid = activeSession?.studentId || null;
+    if (!sid) {
+      Alert.alert("Download unavailable", "Student account was not found on this phone.");
+      return;
+    }
+
+    let sk = activeSession?.schoolKey || null;
+    if (!sk) {
+      sk = await resolveSchoolKeyFast(sid);
+    }
+
+    storeSessionInfo({ studentId: sid, schoolKey: sk || null });
+    setDownloadProgressMap((prev) => ({ ...prev, [assessmentKey]: 8 }));
+
     try {
-      const sid =
-        (await AsyncStorage.getItem("studentNodeKey")) ||
-        (await AsyncStorage.getItem("studentId")) ||
-        (await AsyncStorage.getItem("username")) ||
-        null;
+      setDownloadProgressMap((prev) => ({ ...prev, [assessmentKey]: 34 }));
+      await downloadAssessmentBundle({
+        studentId: sid,
+        schoolKey: sk,
+        assessmentId: assessmentKey,
+        assessment: item,
+      });
+      setDownloadedMap((prev) => ({ ...prev, [assessmentKey]: true }));
+      setDownloadProgressMap((prev) => ({ ...prev, [assessmentKey]: 0 }));
+    } catch (error) {
+      setDownloadProgressMap((prev) => ({ ...prev, [assessmentKey]: 0 }));
+      Alert.alert("Download failed", error?.message || "Could not download this assessment.");
+    }
+  }, [downloadProgressMap, sessionInfo, storeSessionInfo]);
 
+  const handleAssessmentPress = useCallback((item, isDownloaded) => {
+    if (!isDownloaded) {
+      Alert.alert("Download first", "Download this assessment to the phone before opening it.");
+      return;
+    }
+
+    openAssessment(item);
+  }, [openAssessment]);
+
+  const loadData = useCallback(async (options = {}) => {
+    const background = Boolean(options?.background);
+    const force = Boolean(options?.force);
+    const session = options?.session || await readAssessmentSession();
+    const sid = session?.studentId || null;
+    storeSessionInfo(session || null);
+
+    if (!background) {
+      setLoading(true);
+    }
+
+    try {
       const sk = await resolveSchoolKeyFast(sid);
 
       let assessmentsObj = {};
       if (sk) {
-        const scoped = await get(ref(database, `Platform1/Schools/${sk}/SchoolExams/Assessments`));
+        const scoped = await get(
+          ref(database, `Platform1/Schools/${sk}/SchoolExams/Assessments`),
+          force ? null : { maxAgeMs: SUBJECT_ASSESSMENTS_NODE_CACHE_MS }
+        );
         if (scoped.exists()) assessmentsObj = scoped.val() || {};
       }
 
       if (!Object.keys(assessmentsObj).length) {
-        const global = await get(ref(database, `SchoolExams/Assessments`));
+        const global = await get(
+          ref(database, `SchoolExams/Assessments`),
+          force ? null : { maxAgeMs: SUBJECT_ASSESSMENTS_NODE_CACHE_MS }
+        );
         if (global.exists()) assessmentsObj = global.val() || {};
       }
 
-      const list = Object.keys(assessmentsObj)
-        .map((aid) => ({ assessmentId: aid, ...assessmentsObj[aid] }))
-        .filter((a) => String(a.courseId) === String(courseId))
-        .filter((a) => String(a.status || "").toLowerCase() !== "removed")
-        .sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0));
+      const list = sortAssessmentsNewestFirst(
+        Object.keys(assessmentsObj)
+          .map((aid, index) => ({ assessmentId: aid, __sourceIndex: index, ...assessmentsObj[aid] }))
+          .filter((a) => String(a.courseId) === String(courseId))
+          .filter((a) => String(a.status || "").toLowerCase() !== "removed")
+      );
 
       const enriched = await Promise.all(
         list.map(async (a) => {
-          let idx = null;
-
-          if (sk && sid) {
-            const scoped = await get(
-              ref(database, `Platform1/Schools/${sk}/SchoolExams/SubmissionIndex/${a.assessmentId}/${sid}`)
-            );
-            if (scoped.exists()) idx = scoped.val() || {};
-          }
-
-          if (!idx && sid) {
-            const global = await get(ref(database, `SchoolExams/SubmissionIndex/${a.assessmentId}/${sid}`));
-            if (global.exists()) idx = global.val() || {};
-          }
+          const idx = sid
+            ? await readAssessmentSubmissionIndex({
+                schoolKey: sk,
+                assessmentId: a.assessmentId,
+                studentId: sid,
+                maxAgeMs: force ? 0 : SUBJECT_ASSESSMENTS_SUBMISSION_CACHE_MS,
+              })
+            : null;
 
           return {
             ...a,
@@ -179,36 +382,88 @@ export default function SubjectAssessmentsScreen() {
         })
       );
 
-      setItems(enriched);
+      const sortedEnriched = sortAssessmentsNewestFirst(enriched);
+
+      setItems(sortedEnriched);
+      await hydrateDownloadedMap(sortedEnriched, { studentId: sid, schoolKey: sk || null });
+      if (sid && courseId) {
+        void persistCachedSubjectAssessments({
+          studentId: sid,
+          ...cacheRouteParams,
+          schoolKey: sk || "",
+          items: sortedEnriched,
+        });
+      }
     } finally {
-      setLoading(false);
+      if (!background) {
+        setLoading(false);
+      }
     }
-  }, [courseId]);
+  }, [cacheRouteParams, courseId, hydrateDownloadedMap, storeSessionInfo]);
 
   useEffect(() => {
-    loadData();
-  }, [loadData]);
+    let cancelled = false;
+    let task = null;
+
+    (async () => {
+      const session = await readAssessmentSession();
+      storeSessionInfo(session || null);
+      const sid = session?.studentId || null;
+      const cached = sid && courseId
+        ? await readCachedSubjectAssessments({ studentId: sid, ...cacheRouteParams })
+        : null;
+
+      if (cancelled) return;
+
+      const hasCachedSnapshot = !!cached && Array.isArray(cached.items);
+      if (hasCachedSnapshot) {
+        const sortedCachedItems = sortAssessmentsNewestFirst(cached.items);
+        setItems(sortedCachedItems);
+        void hydrateDownloadedMap(sortedCachedItems, session);
+        setLoading(false);
+      }
+
+      const fetchedAt = Number(cached?.fetchedAt || 0);
+      const cacheAgeMs = fetchedAt > 0 ? Date.now() - fetchedAt : Number.POSITIVE_INFINITY;
+      const shouldRefresh = !hasCachedSnapshot || cacheAgeMs > SUBJECT_ASSESSMENTS_CACHE_TTL_MS;
+      if (!shouldRefresh) return;
+
+      task = InteractionManager.runAfterInteractions(() => {
+        loadData({ background: hasCachedSnapshot, force: !hasCachedSnapshot, session }).catch(() => null);
+      });
+    })();
+
+    return () => {
+      cancelled = true;
+      task?.cancel?.();
+    };
+  }, [cacheRouteParams, courseId, hydrateDownloadedMap, loadData, storeSessionInfo]);
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
-    await loadData();
-    setRefreshing(false);
+    try {
+      await loadData({ force: true });
+    } finally {
+      setRefreshing(false);
+    }
   }, [loadData]);
 
   const visual = useMemo(() => getSubjectVisual(subject), [subject]);
 
   const stats = useMemo(() => {
+    if (loading && items.length === 0 && hasWarmShell) {
+      return warmStats;
+    }
+
     const total = items.length;
     const submitted = items.filter((x) => x.submitted).length;
     const pending = items.filter((x) => !x.submitted).length;
     return { total, submitted, pending };
-  }, [items]);
+  }, [hasWarmShell, items, loading, warmStats]);
 
-  if (loading) {
+  if (loading && !hasWarmShell) {
     return (
-      <SafeAreaView style={[styles.center, { paddingTop: insets.top, backgroundColor: BG }]}>
-        <ActivityIndicator color={PRIMARY} size="large" />
-      </SafeAreaView>
+      <PageLoadingSkeleton variant="list" style={[styles.screen, { paddingTop: insets.top }]} />
     );
   }
 
@@ -217,6 +472,9 @@ export default function SubjectAssessmentsScreen() {
       <FlatList
         data={items}
         keyExtractor={(i) => i.assessmentId}
+        initialNumToRender={8}
+        maxToRenderPerBatch={8}
+        windowSize={7}
         contentContainerStyle={{
           paddingBottom: Math.max(24, insets.bottom + 16),
         }}
@@ -226,9 +484,14 @@ export default function SubjectAssessmentsScreen() {
         ListHeaderComponent={
           <>
             <View style={[styles.header, { paddingTop: insets.top + 8 }]}>
-              <TouchableOpacity onPress={() => router.back()} style={styles.backIconBtn}>
+              <TouchableOpacity onPress={handleBackNavigation} style={styles.backIconBtn}>
                 <Ionicons name="arrow-back" size={20} color={PRIMARY} />
               </TouchableOpacity>
+
+              <View style={styles.headerTitleWrap}>
+                <Text numberOfLines={1} style={styles.headerTitle}>{subject || "Subject"}</Text>
+                <Text numberOfLines={1} style={styles.headerSubtitle}>School Assessments</Text>
+              </View>
 
               <TouchableOpacity onPress={onRefresh} style={styles.headerActionBtn}>
                 <Ionicons name="refresh-outline" size={18} color={PRIMARY} />
@@ -236,19 +499,19 @@ export default function SubjectAssessmentsScreen() {
             </View>
 
             <View style={styles.heroCard}>
-              <View style={[styles.heroIconWrap, { backgroundColor: `${visual.color}16` }]}>
-                <MaterialCommunityIcons name={visual.icon} size={26} color={visual.color} />
+              <View style={styles.heroGlowA} />
+              <View style={styles.heroGlowB} />
+
+              <View style={styles.heroRow}>
+                <Text numberOfLines={1} style={styles.heroTitleInline}>{subject || "Subject"}</Text>
+                <View style={styles.heroChip}>
+                  <MaterialCommunityIcons name={visual.icon} size={14} color={PRIMARY} />
+                  <Text style={styles.heroChipText}>School</Text>
+                </View>
               </View>
 
-              <View style={{ flex: 1 }}>
-                <Text style={styles.heroTitle}>{subject || "Subject"}</Text>
-                <Text style={styles.heroSubTitle}>
-                  Grade {grade || "--"} • Section {section || "--"}
-                </Text>
-                <Text style={styles.heroText}>
-                  View available school assessments and continue where needed.
-                </Text>
-              </View>
+              <Text style={styles.heroSubTitle}>Grade {grade || "--"} • Section {section || "--"}</Text>
+              <Text style={styles.heroText}>Download once and open from the phone.</Text>
             </View>
 
             <View style={styles.statsRow}>
@@ -269,23 +532,35 @@ export default function SubjectAssessmentsScreen() {
             <View style={styles.sectionHeader}>
               <Text style={styles.sectionTitle}>Assessments</Text>
               <Text style={styles.sectionSubtitle}>
-                {items.length ? "Tap any card to open it." : "No published assessments yet."}
+                {loading
+                  ? "Loading available assessments..."
+                  : items.length
+                  ? "Download first, then open offline."
+                  : "No published assessments yet."}
               </Text>
             </View>
           </>
         }
         ListEmptyComponent={
-          <View style={styles.emptyWrap}>
-            <View style={styles.emptyIconWrap}>
-              <MaterialCommunityIcons name="clipboard-text-outline" size={28} color={MUTED} />
+          loading ? (
+            <View style={styles.loadingStateWrap}>
+              <ActivityIndicator size="small" color={PRIMARY} />
+              <Text style={styles.loadingStateTitle}>Preparing assessments</Text>
+              <Text style={styles.loadingStateText}>Fetching the latest work for this subject.</Text>
             </View>
-            <Text style={styles.emptyTitle}>No assessments available</Text>
-            <Text style={styles.emptyText}>
-              Your teacher has not published assessments for this subject yet.
-            </Text>
-          </View>
+          ) : (
+            <View style={styles.emptyWrap}>
+              <View style={styles.emptyIconWrap}>
+                <MaterialCommunityIcons name="clipboard-text-outline" size={28} color={MUTED} />
+              </View>
+              <Text style={styles.emptyTitle}>No assessments available</Text>
+              <Text style={styles.emptyText}>
+                Your teacher has not published assessments for this subject yet.
+              </Text>
+            </View>
+          )
         }
-        renderItem={({ item }) => {
+        renderItem={({ item, index }) => {
           const status = getAssessmentStatus({
             submitted: item.submitted,
             finalScore: item.finalScore,
@@ -294,76 +569,98 @@ export default function SubjectAssessmentsScreen() {
 
           const typeMeta = getTypeMeta(item.type);
           const dueLabel = formatDueDate(item.dueDate);
+          const assessmentKey = String(item.assessmentId || "");
+          const downloadPct = Number(downloadProgressMap?.[assessmentKey] || 0);
+          const isDownloading = downloadPct > 0;
+          const isDownloaded = !!downloadedMap?.[assessmentKey];
 
           return (
             <TouchableOpacity
               style={styles.card}
               activeOpacity={0.92}
-              onPress={() =>
-                router.push({
-                  pathname: "/takeAssessment",
-                  params: {
-                    assessmentId: item.assessmentId,
-                    courseId: item.courseId,
-                    title: item.title || "Assessment",
-                  },
-                })
-              }
+              onPress={() => handleAssessmentPress(item, isDownloaded)}
             >
-              <View style={styles.cardTopRow}>
-                <View style={styles.typeBadge}>
-                  <Ionicons name={typeMeta.icon} size={11} color={PRIMARY} />
-                  <Text style={styles.typeText}>{typeMeta.label}</Text>
+              <View style={styles.cardMain}>
+                <View style={styles.cardOrderBadge}>
+                  <Text style={styles.cardOrderText}>{index + 1}</Text>
                 </View>
 
-                <View style={[styles.statusBadge, { backgroundColor: `${status.color}18` }]}>
-                  <Ionicons name={status.icon} size={11} color={status.color} />
-                  <Text style={[styles.statusText, { color: status.color }]}>{status.label}</Text>
-                </View>
-              </View>
-
-              <Text style={styles.cardTitle} numberOfLines={1}>
-                {item.title || "Assessment"}
-              </Text>
-
-              <View style={styles.metaGrid}>
-                <View style={styles.metaChip}>
-                  <Ionicons name="calendar-outline" size={12} color={MUTED} />
-                  <Text style={styles.metaChipText}>{dueLabel}</Text>
-                </View>
-
-                <View style={styles.metaChip}>
-                  <Ionicons name="help-circle-outline" size={12} color={MUTED} />
-                  <Text style={styles.metaChipText}>{Number(item.questionCount || 0)} Qs</Text>
-                </View>
-
-                <View style={styles.metaChip}>
-                  <Ionicons name="ribbon-outline" size={12} color={MUTED} />
-                  <Text style={styles.metaChipText}>{Number(item.totalPoints || 0)} pts</Text>
-                </View>
-
-                <View style={styles.metaChip}>
-                  <Ionicons name="time-outline" size={12} color={MUTED} />
-                  <Text style={styles.metaChipText}>
-                    {item.timeLimitMinutes ? `${item.timeLimitMinutes} min` : "No limit"}
+                <View style={styles.cardTextWrap}>
+                  <Text style={styles.cardTitle} numberOfLines={1}>
+                    {item.title || "Assessment"}
                   </Text>
+
+                  <Text style={styles.cardMetaPrimary} numberOfLines={1}>
+                    {typeMeta.label} • {Number(item.questionCount || 0)} Qs • {Number(item.totalPoints || 0)} pts
+                  </Text>
+
+                  <View style={styles.cardChipRow}>
+                    <View style={styles.metaChip}>
+                      <Ionicons name="calendar-outline" size={12} color={MUTED} />
+                      <Text style={styles.metaChipText}>{dueLabel}</Text>
+                    </View>
+
+                    <View style={[styles.statusBadge, { backgroundColor: `${status.color}18` }]}>
+                      <Ionicons name={status.icon} size={11} color={status.color} />
+                      <Text style={[styles.statusText, { color: status.color }]}>{status.label}</Text>
+                    </View>
+                  </View>
                 </View>
               </View>
 
               <View style={styles.cardFooter}>
-                <View style={{ flex: 1 }}>
+                <View style={styles.cardScoreWrap}>
                   {typeof item.finalScore === "number" ? (
                     <Text style={styles.scoreText}>Score: {item.finalScore}</Text>
                   ) : (
                     <Text style={styles.scoreHint}>
-                      {item.submitted ? "Waiting for result" : "Ready to start"}
+                      {item.submitted
+                        ? "Waiting for result"
+                        : item.timeLimitMinutes
+                        ? `${item.timeLimitMinutes} min limit`
+                        : "No time limit"}
                     </Text>
                   )}
                 </View>
 
-                <View style={styles.openWrap}>
-                  <Text style={styles.openText}>{item.submitted ? "Open" : "Start"}</Text>
-                  <Ionicons name="arrow-forward" size={14} color={PRIMARY} />
+                <View style={styles.cardActionRow}>
+                  <TouchableOpacity
+                    activeOpacity={0.9}
+                    disabled={isDownloading}
+                    style={[
+                      styles.downloadWrap,
+                      isDownloaded && styles.downloadWrapDone,
+                      isDownloading && styles.downloadWrapBusy,
+                    ]}
+                    onPress={() => downloadAssessmentToPhone(item)}
+                  >
+                    {isDownloading ? (
+                      <Text style={styles.downloadText}>{Math.round(downloadPct)}%</Text>
+                    ) : (
+                      <>
+                        <Ionicons
+                          name={isDownloaded ? "checkmark-circle" : "cloud-download-outline"}
+                          size={14}
+                          color={isDownloaded ? SUCCESS : PRIMARY}
+                        />
+                        <Text style={[styles.downloadText, isDownloaded && styles.downloadTextDone]}>
+                          {isDownloaded ? "Saved" : "Download"}
+                        </Text>
+                      </>
+                    )}
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    activeOpacity={0.9}
+                    disabled={!isDownloaded}
+                    style={[styles.openWrap, !isDownloaded && styles.openWrapDisabled]}
+                    onPress={() => openAssessment(item)}
+                  >
+                    <Text style={[styles.openText, !isDownloaded && styles.openTextDisabled]}>
+                      {item.submitted ? "Review" : "Open"}
+                    </Text>
+                    <Ionicons name="arrow-forward" size={14} color={!isDownloaded ? MUTED : PRIMARY} />
+                  </TouchableOpacity>
                 </View>
               </View>
             </TouchableOpacity>
@@ -374,141 +671,221 @@ export default function SubjectAssessmentsScreen() {
   );
 }
 
-const styles = StyleSheet.create({
-  screen: { flex: 1, backgroundColor: BG },
-  center: { flex: 1, alignItems: "center", justifyContent: "center" },
+function createStyles(colors) {
+  return StyleSheet.create({
+  screen: { flex: 1, backgroundColor: colors.background },
+  center: { flex: 1, alignItems: "center", justifyContent: "center", backgroundColor: colors.background },
 
   header: {
-    paddingHorizontal: 14,
+    paddingHorizontal: 16,
     paddingBottom: 8,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
   },
+  headerTitleWrap: {
+    flex: 1,
+    minWidth: 0,
+    marginHorizontal: 10,
+  },
+  headerTitle: {
+    fontSize: 18,
+    fontWeight: "900",
+    color: colors.text,
+  },
+  headerSubtitle: {
+    marginTop: 2,
+    color: colors.muted,
+    fontSize: 12,
+    fontWeight: "700",
+  },
   backIconBtn: {
-    width: 38,
-    height: 38,
-    borderRadius: 12,
-    backgroundColor: "#EEF4FF",
+    width: 34,
+    height: 34,
+    borderRadius: 10,
+    backgroundColor: colors.inputBackground,
     alignItems: "center",
     justifyContent: "center",
   },
   headerActionBtn: {
-    width: 38,
-    height: 38,
-    borderRadius: 12,
-    backgroundColor: "#F7FAFF",
+    width: 34,
+    height: 34,
+    borderRadius: 10,
+    backgroundColor: colors.inputBackground,
     borderWidth: 1,
-    borderColor: BORDER,
+    borderColor: colors.border,
     alignItems: "center",
     justifyContent: "center",
   },
 
   heroCard: {
-    marginHorizontal: 14,
-    marginTop: 4,
-    padding: 16,
+    marginHorizontal: 16,
+    marginTop: 6,
+    marginBottom: 4,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
     borderRadius: 22,
     borderWidth: 1,
-    borderColor: BORDER,
-    backgroundColor: "#F8FBFF",
-    flexDirection: "row",
-    alignItems: "flex-start",
+    borderColor: colors.border,
+    backgroundColor: colors.panel,
+    overflow: "hidden",
   },
-  heroIconWrap: {
-    width: 54,
-    height: 54,
-    borderRadius: 16,
+  heroGlowA: {
+    position: "absolute",
+    width: 150,
+    height: 150,
+    borderRadius: 75,
+    backgroundColor: "rgba(11,114,255,0.12)",
+    top: -70,
+    right: -32,
+  },
+  heroGlowB: {
+    position: "absolute",
+    width: 120,
+    height: 120,
+    borderRadius: 60,
+    backgroundColor: "rgba(59,130,246,0.09)",
+    bottom: -55,
+    left: -22,
+  },
+  heroRow: {
+    flexDirection: "row",
     alignItems: "center",
-    justifyContent: "center",
-    marginRight: 14,
+    justifyContent: "flex-start",
+  },
+  heroChip: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+    backgroundColor: colors.soft,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  heroChipText: {
+    marginLeft: 6,
+    fontSize: 11,
+    fontWeight: "800",
+    color: PRIMARY,
+  },
+  heroTitleInline: {
+    flex: 1,
+    marginRight: 10,
+    fontSize: 18,
+    fontWeight: "900",
+    color: colors.text,
   },
   heroTitle: {
-    fontSize: 21,
+    marginTop: 6,
+    fontSize: 18,
     fontWeight: "900",
-    color: TEXT,
+    color: colors.text,
   },
   heroSubTitle: {
     marginTop: 4,
     fontSize: 12,
-    color: MUTED,
+    color: colors.muted,
     fontWeight: "700",
   },
   heroText: {
-    marginTop: 8,
-    color: MUTED,
-    fontSize: 13,
-    lineHeight: 18,
+    marginTop: 2,
+    color: colors.muted,
+    fontSize: 12,
+    lineHeight: 16,
   },
 
   statsRow: {
     flexDirection: "row",
-    paddingHorizontal: 14,
-    marginTop: 12,
+    paddingHorizontal: 16,
+    marginTop: 8,
   },
   statCard: {
     flex: 1,
     marginRight: 10,
-    backgroundColor: CARD,
+    backgroundColor: colors.card,
     borderWidth: 1,
-    borderColor: BORDER,
-    borderRadius: 16,
-    paddingVertical: 13,
+    borderColor: colors.border,
+    borderRadius: 14,
+    paddingVertical: 8,
     alignItems: "center",
   },
   statCardLast: {
     flex: 1,
-    backgroundColor: CARD,
+    backgroundColor: colors.card,
     borderWidth: 1,
-    borderColor: BORDER,
-    borderRadius: 16,
-    paddingVertical: 13,
+    borderColor: colors.border,
+    borderRadius: 14,
+    paddingVertical: 8,
     alignItems: "center",
   },
   statValue: {
     fontSize: 17,
     fontWeight: "900",
-    color: TEXT,
+    color: colors.text,
   },
   statLabel: {
     marginTop: 4,
     fontSize: 12,
-    color: MUTED,
+    color: colors.muted,
     fontWeight: "700",
   },
 
   sectionHeader: {
-    paddingHorizontal: 14,
+    paddingHorizontal: 16,
     paddingTop: 18,
     paddingBottom: 8,
   },
   sectionTitle: {
     fontSize: 17,
     fontWeight: "900",
-    color: TEXT,
+    color: colors.text,
   },
   sectionSubtitle: {
     marginTop: 4,
     fontSize: 12,
-    color: MUTED,
+    color: colors.muted,
     fontWeight: "600",
   },
 
-  emptyWrap: {
-    marginHorizontal: 14,
+  loadingStateWrap: {
+    marginHorizontal: 16,
     marginTop: 8,
     borderWidth: 1,
-    borderColor: BORDER,
+    borderColor: colors.border,
     borderRadius: 18,
     padding: 22,
     alignItems: "center",
-    backgroundColor: "#FBFDFF",
+    backgroundColor: colors.card,
+  },
+  loadingStateTitle: {
+    marginTop: 10,
+    color: colors.text,
+    fontSize: 14,
+    fontWeight: "800",
+  },
+  loadingStateText: {
+    marginTop: 4,
+    color: colors.muted,
+    fontSize: 12,
+    textAlign: "center",
+  },
+
+  emptyWrap: {
+    marginHorizontal: 16,
+    marginTop: 8,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 18,
+    padding: 22,
+    alignItems: "center",
+    backgroundColor: colors.card,
   },
   emptyIconWrap: {
     width: 56,
     height: 56,
     borderRadius: 18,
-    backgroundColor: "#F1F5FF",
+    backgroundColor: colors.soft,
     alignItems: "center",
     justifyContent: "center",
     marginBottom: 12,
@@ -516,42 +893,69 @@ const styles = StyleSheet.create({
   emptyTitle: {
     fontSize: 16,
     fontWeight: "900",
-    color: TEXT,
+    color: colors.text,
   },
   emptyText: {
     marginTop: 6,
-    color: MUTED,
+    color: colors.muted,
     textAlign: "center",
     lineHeight: 19,
   },
 
   card: {
-    marginHorizontal: 14,
-    marginBottom: 10,
+    marginHorizontal: 16,
+    marginBottom: 12,
     borderWidth: 1,
-    borderColor: BORDER,
-    borderRadius: 18,
-    padding: 12,
-    backgroundColor: CARD,
+    borderColor: colors.border,
+    borderRadius: 16,
+    paddingVertical: 12,
+    paddingHorizontal: 10,
+    backgroundColor: colors.card,
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.018,
+    shadowRadius: 6,
+    elevation: 0,
   },
-  cardTopRow: {
+  cardMain: {
     flexDirection: "row",
+    alignItems: "center",
     justifyContent: "space-between",
-    alignItems: "center",
   },
-  typeBadge: {
+  cardOrderBadge: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    backgroundColor: colors.soft,
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 10,
+  },
+  cardOrderText: {
+    color: PRIMARY,
+    fontSize: 12,
+    fontWeight: "800",
+  },
+  cardTextWrap: {
+    flex: 1,
+    marginRight: 10,
+  },
+  cardTitle: {
+    fontSize: 14,
+    fontWeight: "800",
+    color: colors.text,
+  },
+  cardMetaPrimary: {
+    marginTop: 3,
+    color: colors.muted,
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  cardChipRow: {
+    marginTop: 8,
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "#EEF4FF",
-    borderRadius: 999,
-    paddingHorizontal: 9,
-    paddingVertical: 5,
-  },
-  typeText: {
-    marginLeft: 5,
-    color: PRIMARY,
-    fontSize: 10.5,
-    fontWeight: "800",
+    flexWrap: "wrap",
   },
   statusBadge: {
     flexDirection: "row",
@@ -565,34 +969,21 @@ const styles = StyleSheet.create({
     fontSize: 10.5,
     fontWeight: "800",
   },
-
-  cardTitle: {
-    marginTop: 10,
-    fontSize: 15,
-    fontWeight: "900",
-    color: TEXT,
-  },
-
-  metaGrid: {
-    marginTop: 10,
-    flexDirection: "row",
-    flexWrap: "wrap",
-  },
   metaChip: {
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "#F8FAFF",
+    backgroundColor: colors.inputBackground,
     borderWidth: 1,
-    borderColor: "#F1F4FA",
+    borderColor: colors.border,
     borderRadius: 999,
-    paddingHorizontal: 8,
-    paddingVertical: 6,
+    paddingHorizontal: 9,
+    paddingVertical: 5,
     marginRight: 8,
     marginBottom: 8,
   },
   metaChipText: {
     marginLeft: 6,
-    color: MUTED,
+    color: colors.muted,
     fontSize: 11,
     fontWeight: "700",
   },
@@ -601,10 +992,17 @@ const styles = StyleSheet.create({
     marginTop: 2,
     paddingTop: 10,
     borderTopWidth: 1,
-    borderTopColor: "#F2F5FB",
+    borderTopColor: colors.border,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
+  },
+  cardActionRow: {
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  cardScoreWrap: {
+    flex: 1,
   },
   scoreText: {
     color: SUCCESS,
@@ -612,17 +1010,46 @@ const styles = StyleSheet.create({
     fontSize: 12.5,
   },
   scoreHint: {
-    color: MUTED,
+    color: colors.muted,
     fontWeight: "700",
     fontSize: 11.5,
+  },
+  downloadWrap: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: colors.soft,
+    borderRadius: 999,
+    paddingHorizontal: 11,
+    paddingVertical: 7,
+    marginRight: 8,
+    minWidth: 88,
+  },
+  downloadWrapDone: {
+    backgroundColor: `${SUCCESS}14`,
+  },
+  downloadWrapBusy: {
+    opacity: 0.84,
+  },
+  downloadText: {
+    color: PRIMARY,
+    fontWeight: "800",
+    marginLeft: 6,
+    fontSize: 11.5,
+  },
+  downloadTextDone: {
+    color: SUCCESS,
   },
   openWrap: {
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "#EEF4FF",
+    backgroundColor: colors.soft,
     borderRadius: 999,
     paddingHorizontal: 11,
     paddingVertical: 7,
+  },
+  openWrapDisabled: {
+    backgroundColor: colors.inputBackground,
   },
   openText: {
     color: PRIMARY,
@@ -630,4 +1057,8 @@ const styles = StyleSheet.create({
     marginRight: 6,
     fontSize: 11.5,
   },
+  openTextDisabled: {
+    color: MUTED,
+  },
 });
+}

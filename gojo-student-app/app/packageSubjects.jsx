@@ -6,30 +6,49 @@ import {
   SafeAreaView,
   FlatList,
   TouchableOpacity,
-  ActivityIndicator,
   LayoutAnimation,
   UIManager,
   Platform,
-  StatusBar,
   Modal,
   Animated,
+  Alert,
+  useWindowDimensions,
+  InteractionManager,
 } from "react-native";
-import { useLocalSearchParams, useRouter } from "expo-router";
+import { useFocusEffect, useLocalSearchParams, useRouter } from "expo-router";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { getValue, safeUpdate } from "./lib/dbHelpers";
+import { useAppTheme } from "../hooks/use-app-theme";
+import {
+  deletePracticeExamBundle,
+  downloadPracticeExamBundle,
+  ensurePracticeLives,
+  getQuestionBankQuestionsForPractice,
+  hasPracticeExamBundle,
+  readCompanyExamPackageDetail,
+  readPracticeExamBundle,
+  readPracticeExamProgress,
+  updatePracticeExamProgress,
+  writeCompanyExamPackageDetail,
+  writePracticeLives,
+} from "../lib/practiceExamStore";
+import { readScreenCache, writeScreenCache } from "../lib/appOfflineCache";
+import PageLoadingSkeleton from "../components/ui/page-loading-skeleton";
+import { seedExamCenterWarmRoute } from "../lib/examRouteWarmCache";
 
 if (Platform.OS === "android" && UIManager.setLayoutAnimationEnabledExperimental) {
   UIManager.setLayoutAnimationEnabledExperimental(true);
 }
 
 const PRIMARY = "#0B72FF";
-const BG = "#FFFFFF";
-const TEXT = "#0B2540";
-const MUTED = "#6B78A8";
-const HEART_REFILL_MS = 20 * 60 * 1000;
+const HEART_REFILL_MS = 30 * 60 * 1000;
 const DEFAULT_GLOBAL_MAX_LIVES = 5;
 const HEART_COLOR = "#EF4444";
+const PACKAGE_STATUS_TICK_MS = 15 * 1000;
+const PACKAGE_HEART_TICK_MS = 1000;
+const PACKAGE_ATTEMPT_SYNC_MS = 15 * 1000;
 
 function normalizeGrade(g) {
   if (!g) return null;
@@ -44,28 +63,75 @@ function formatMsToMMSS(ms) {
   const ss = Math.floor(s % 60).toString().padStart(2, "0");
   return `${mm}:${ss}`;
 }
+function normalizeHeartRefillMs(value, fallback = HEART_REFILL_MS) {
+  const parsed = Number(value ?? fallback);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.max(HEART_REFILL_MS, parsed);
+}
+function formatPercentCompact(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return null;
+
+  const rounded = Math.round(parsed * 10) / 10;
+  return Number.isInteger(rounded) ? `Score ${rounded}%` : `Score ${rounded.toFixed(1)}%`;
+}
 function toMsTs(v) {
   const n = Number(v || 0);
   if (!Number.isFinite(n) || n <= 0) return 0;
   return n < 1e12 ? n * 1000 : n;
 }
-function getSubjectVisual(subjectKey, subjectName) {
+
+function isCompetitiveRoundLive(round, now = Date.now()) {
+  if (!round) return false;
+
+  const start = toMsTs(
+    round.startTimestamp ??
+    round.releaseTimestamp ??
+    round.startAt ??
+    round.startsAt ??
+    round.roundMeta?.startTimestamp ??
+    round.roundMeta?.releaseTimestamp ??
+    round.roundMeta?.startAt ??
+    round.roundMeta?.startsAt ??
+    0
+  );
+  const end = toMsTs(
+    round.endTimestamp ??
+    round.endAt ??
+    round.endsAt ??
+    round.roundMeta?.endTimestamp ??
+    round.roundMeta?.endAt ??
+    round.roundMeta?.endsAt ??
+    0
+  );
+  const status = String(round.status || round.roundMeta?.status || "").toLowerCase();
+  const explicitLive = ["live", "active", "open", "ongoing"].includes(status);
+  const beforeStart = !!start && now < start;
+  const afterEnd = !!end && now > end;
+
+  if (explicitLive && !afterEnd) return true;
+  if (!start && !end) return false;
+  if (beforeStart || afterEnd) return false;
+  return true;
+}
+
+function getSubjectVisual(subjectKey, subjectName, colors) {
   const k = `${subjectKey || ""} ${subjectName || ""}`.toLowerCase();
-  if (k.includes("math")) return { icon: "calculator-variant-outline", bg: "#EEF4FF", color: "#0B72FF" };
-  if (k.includes("physics")) return { icon: "atom-variant", bg: "#EFFCF6", color: "#10B981" };
-  if (k.includes("chem")) return { icon: "flask-outline", bg: "#FFF7ED", color: "#F97316" };
-  if (k.includes("bio")) return { icon: "dna", bg: "#F5F3FF", color: "#8B5CF6" };
-  if (k.includes("science")) return { icon: "beaker-outline", bg: "#ECFEFF", color: "#0891B2" };
-  if (k.includes("english")) return { icon: "alphabetical", bg: "#FEF2F2", color: "#EF4444" };
-  if (k.includes("history")) return { icon: "book-open-page-variant-outline", bg: "#FFF7ED", color: "#EA580C" };
-  if (k.includes("geography")) return { icon: "earth", bg: "#ECFDF5", color: "#16A34A" };
-  return { icon: "book-education-outline", bg: "#EEF4FF", color: PRIMARY };
+  if (k.includes("math")) return { icon: "calculator-variant-outline", bg: colors.infoSurface, color: colors.primary };
+  if (k.includes("physics")) return { icon: "atom-variant", bg: colors.successSurface, color: "#10B981" };
+  if (k.includes("chem")) return { icon: "flask-outline", bg: colors.warningSurface, color: "#F97316" };
+  if (k.includes("bio")) return { icon: "dna", bg: colors.soft, color: "#8B5CF6" };
+  if (k.includes("science")) return { icon: "beaker-outline", bg: colors.infoSurface, color: "#0891B2" };
+  if (k.includes("english")) return { icon: "alphabetical", bg: colors.dangerSurface, color: "#EF4444" };
+  if (k.includes("history")) return { icon: "book-open-page-variant-outline", bg: colors.warningSurface, color: "#EA580C" };
+  if (k.includes("geography")) return { icon: "earth", bg: colors.successSurface, color: "#16A34A" };
+  return { icon: "book-education-outline", bg: colors.infoSurface, color: colors.primary };
 }
 function computeRefillState({ currentLives, maxLives, lastConsumedAt, refillMs, now = Date.now() }) {
   const current = Number(currentLives ?? 0);
   const max = Number(maxLives ?? 5);
   const last = Number(lastConsumedAt ?? 0);
-  const interval = Number(refillMs ?? 0);
+  const interval = normalizeHeartRefillMs(refillMs, 0);
 
   if (!interval || interval <= 0) return { currentLives: current, lastConsumedAt: last, recovered: 0, nextInMs: 0 };
   if (current >= max) return { currentLives: current, lastConsumedAt: last, recovered: 0, nextInMs: 0 };
@@ -83,15 +149,30 @@ function computeRefillState({ currentLives, maxLives, lastConsumedAt, refillMs, 
 export default function PackageSubjects() {
   const router = useRouter();
   const params = useLocalSearchParams();
+  const insets = useSafeAreaInsets();
+  const { colors } = useAppTheme();
+  const { width } = useWindowDimensions();
+  const styles = useMemo(() => createStyles(colors), [colors]);
+  const modalStyles = useMemo(() => createModalStyles(colors), [colors]);
+  const isCompactRoundLayout = width < 460;
+
+  const TEXT = colors.text;
+  const MUTED = colors.muted;
 
   const packageId = params.packageId;
   const packageName = params.packageName || "Package";
   const incomingGrade = params.studentGrade;
+  const screenCacheParts = useMemo(
+    () => [String(packageId || "package"), normalizeGrade(incomingGrade) || "all"],
+    [incomingGrade, packageId]
+  );
 
   const [loading, setLoading] = useState(true);
   const [subjects, setSubjects] = useState([]);
   const [expandedId, setExpandedId] = useState(null);
   const [packageType, setPackageType] = useState(null);
+  const isPractice = useMemo(() => String(packageType || "").toLowerCase() !== "competitive", [packageType]);
+  const [downloadProgressMap, setDownloadProgressMap] = useState({});
 
   const [globalLives, setGlobalLives] = useState(null);
   const [globalMaxLives, setGlobalMaxLives] = useState(DEFAULT_GLOBAL_MAX_LIVES);
@@ -101,6 +182,7 @@ export default function PackageSubjects() {
   const [showHeartInfoModal, setShowHeartInfoModal] = useState(false);
   const heartModalAnim = useRef(new Animated.Value(0)).current;
   const [nextHeartInMs, setNextHeartInMs] = useState(0);
+  const loadRunIdRef = useRef(0);
 
   const [notifications, setNotifications] = useState([]);
   const [unreadCount, setUnreadCount] = useState(0);
@@ -115,26 +197,26 @@ export default function PackageSubjects() {
       defaultRefillIntervalMs: HEART_REFILL_MS,
     },
     attempts: {
-      practiceRefillEnabled: true,
-      defaultRefillIntervalMs: 20 * 60 * 1000,
+      practiceRefillEnabled: false,
+      defaultRefillIntervalMs: 0,
       maxCarryRefills: 999,
     },
   });
 
   const [nowTs, setNowTs] = useState(Date.now());
   useEffect(() => {
-    const t = setInterval(() => setNowTs(Date.now()), 1000);
+    const t = setInterval(() => setNowTs(Date.now()), PACKAGE_STATUS_TICK_MS);
     return () => clearInterval(t);
   }, []);
 
   const notifVisual = useCallback((type) => {
     const t = String(type || "").toLowerCase();
-    if (t === "new_package") return { icon: "cube-outline", color: "#2563EB", bg: "#EFF6FF" };
-    if (t === "new_round") return { icon: "layers-outline", color: "#7C3AED", bg: "#F5F3FF" };
-    if (t === "round_live") return { icon: "flash-outline", color: "#EA580C", bg: "#FFF7ED" };
-    if (t === "result_released") return { icon: "trophy-outline", color: "#16A34A", bg: "#ECFDF5" };
-    return { icon: "notifications-outline", color: "#0B72FF", bg: "#EEF4FF" };
-  }, []);
+    if (t === "new_package") return { icon: "cube-outline", color: colors.primary, bg: colors.infoSurface };
+    if (t === "new_round") return { icon: "layers-outline", color: "#7C3AED", bg: colors.soft };
+    if (t === "round_live") return { icon: "flash-outline", color: colors.warningText, bg: colors.warningSurface };
+    if (t === "result_released") return { icon: "trophy-outline", color: colors.success, bg: colors.successSurface };
+    return { icon: "notifications-outline", color: colors.primary, bg: colors.infoSurface };
+  }, [colors]);
 
   const parseDeepLink = useCallback((dl) => {
     const deep = String(dl || "");
@@ -172,6 +254,102 @@ export default function PackageSubjects() {
     return { sid, gradeKey: rawGrade ? `grade${rawGrade}` : null };
   }, []);
 
+  const warmExamCenterRoute = useCallback((round, options = {}) => {
+    if (!round?.roundId || !round?.examId) return;
+
+    const baseRoundMeta = round.roundMeta || {
+      ...(options.roundMeta || {}),
+      id: round.roundId,
+      roundId: round.roundId,
+      examId: round.examId,
+      questionBankId: round.questionBankId || "",
+      name: round.name || options.name || "Round",
+      startTimestamp: Number(round.startTimestamp || 0),
+      endTimestamp: Number(round.endTimestamp || 0),
+      resultReleaseTimestamp: Number(round.resultReleaseTimestamp || 0),
+      status: round.status || "",
+    };
+    const baseExamMeta = round.examMeta || {
+      ...(options.examMeta || {}),
+      id: round.examId,
+      examId: round.examId,
+      name: round.name || options.name || "Exam",
+      questionBankId: round.questionBankId || options.questionBankId || "",
+      totalQuestions: round.totalQuestions,
+      timeLimit: round.timeLimit,
+      difficulty: round.difficulty,
+      maxAttempts: round.maxAttempts,
+      attemptRefillIntervalMs: round.attemptRefillIntervalMs,
+      attemptRefillEnabled: round.attemptRefillEnabled,
+    };
+
+    seedExamCenterWarmRoute({
+      roundId: round.roundId,
+      examId: round.examId,
+      data: {
+        roundMeta: baseRoundMeta,
+        examMeta: baseExamMeta,
+        appExamConfig,
+        isCompetitive: !isPractice,
+      },
+    });
+
+    void (async () => {
+      try {
+        const sid =
+          (await AsyncStorage.getItem("studentNodeKey")) ||
+          (await AsyncStorage.getItem("studentId")) ||
+          (await AsyncStorage.getItem("username")) ||
+          null;
+
+        if (round.practiceOffline && round.downloaded && sid) {
+          const bundle = await readPracticeExamBundle(sid, round.examId);
+          if (Array.isArray(bundle?.questions) && bundle.questions.length) {
+            seedExamCenterWarmRoute({
+              roundId: round.roundId,
+              examId: round.examId,
+              data: {
+                roundMeta: bundle.roundMeta || baseRoundMeta,
+                examMeta: bundle.examMeta || baseExamMeta,
+                appExamConfig: bundle.appExamConfig || appExamConfig,
+                isCompetitive: !!bundle.isCompetitive,
+                questions: bundle.questions,
+              },
+            });
+            return;
+          }
+        }
+
+        const questionBankId =
+          baseExamMeta?.questionBankId ||
+          baseRoundMeta?.questionBankId ||
+          round.questionBankId ||
+          options.questionBankId ||
+          "";
+
+        if (!questionBankId) return;
+
+        const questions = await getQuestionBankQuestionsForPractice(questionBankId);
+        if (!Array.isArray(questions) || !questions.length) return;
+
+        seedExamCenterWarmRoute({
+          roundId: round.roundId,
+          examId: round.examId,
+          data: {
+            roundMeta: baseRoundMeta,
+            examMeta: {
+              ...baseExamMeta,
+              questionBankId,
+            },
+            appExamConfig,
+            isCompetitive: !isPractice,
+            questions,
+          },
+        });
+      } catch {}
+    })();
+  }, [appExamConfig, isPractice]);
+
   const loadNotifications = useCallback(async () => {
     const { sid, gradeKey } = await getStudentIdentity();
     if (!sid || !gradeKey) return;
@@ -190,19 +368,19 @@ export default function PackageSubjects() {
     setUnreadCount(arr.filter((n) => Number(n.createdAt || 0) > lastSeen).length);
   }, [getStudentIdentity]);
 
-  const openNotification = useCallback(async (item) => {
-    const { sid } = await getStudentIdentity();
-    if (sid) {
-      const ts = Math.max(Date.now(), Number(item?.createdAt || 0));
-      await safeUpdate({
-        [`Platform1/usersMeta/${sid}/lastSeenNotificationsAt`]: ts,
-      }).catch(() => {});
-      await loadNotifications();
-    }
-
+  const openNotification = useCallback((item) => {
     setShowNotifModal(false);
 
     if (item?.meta?.roundId && item?.meta?.examId) {
+      warmExamCenterRoute({
+        roundId: item.meta.roundId,
+        examId: item.meta.examId,
+        questionBankId: item.meta.questionBankId || "",
+        name: item?.meta?.roundName || item?.title || "Exam",
+      }, {
+        questionBankId: item.meta.questionBankId || "",
+        name: item?.meta?.roundName || item?.title || "Exam",
+      });
       router.push({
         pathname: "/examCenter",
         params: {
@@ -210,6 +388,11 @@ export default function PackageSubjects() {
           examId: item.meta.examId,
           questionBankId: item.meta.questionBankId || "",
           mode: "start",
+          returnTo: "packageSubjects",
+          returnPackageId: packageId || "",
+          returnPackageName: packageName || "",
+          returnStudentGrade: incomingGrade || "",
+          ...(isPractice ? { practiceOffline: "1" } : {}),
         },
       });
       return;
@@ -217,7 +400,18 @@ export default function PackageSubjects() {
 
     const parsed = parseDeepLink(item?.deepLink);
     if (parsed) router.push({ pathname: parsed.pathname, params: parsed.params });
-  }, [getStudentIdentity, loadNotifications, parseDeepLink, router]);
+
+    void (async () => {
+      const { sid } = await getStudentIdentity();
+      if (!sid) return;
+
+      const ts = Math.max(Date.now(), Number(item?.createdAt || 0));
+      await safeUpdate({
+        [`Platform1/usersMeta/${sid}/lastSeenNotificationsAt`]: ts,
+      }).catch(() => {});
+      await loadNotifications().catch(() => {});
+    })();
+  }, [getStudentIdentity, incomingGrade, isPractice, loadNotifications, packageId, packageName, parseDeepLink, router, warmExamCenterRoute]);
 
   const markAllSeen = useCallback(async () => {
     const { sid } = await getStudentIdentity();
@@ -259,21 +453,368 @@ export default function PackageSubjects() {
       }
     }
 
-    setWhatsNew(items.slice(0, 8));
+    const nextItems = items.slice(0, 8);
+    setWhatsNew(nextItems);
+    return nextItems;
   }, []);
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  const hydrateCachedSnapshot = useCallback(async () => {
+    try {
+      const snapshot = await readScreenCache("package-subjects", screenCacheParts);
+      if (!snapshot || typeof snapshot !== "object") return false;
 
-    const cfg = await getValue([`Platform1/appConfig/exams`, `appConfig/exams`]);
-    if (cfg) {
+      setSubjects(Array.isArray(snapshot.subjects) ? snapshot.subjects : []);
+      setPackageType(snapshot.packageType || null);
+      setGlobalLives(snapshot.globalLives ?? null);
+      setGlobalMaxLives(Number(snapshot.globalMaxLives || DEFAULT_GLOBAL_MAX_LIVES));
+      setGlobalRefillMs(normalizeHeartRefillMs(snapshot.globalRefillMs));
+      setGlobalLastConsumedAt(snapshot.globalLastConsumedAt || null);
+      if (snapshot.appExamConfig) {
+        setAppExamConfig((prev) => ({
+          ...prev,
+          ...snapshot.appExamConfig,
+          lives: { ...prev.lives, ...(snapshot.appExamConfig.lives || {}) },
+          attempts: {
+            ...prev.attempts,
+            ...(snapshot.appExamConfig.attempts || {}),
+            practiceRefillEnabled: false,
+            defaultRefillIntervalMs: 0,
+          },
+        }));
+      }
+      setWhatsNew(Array.isArray(snapshot.whatsNew) ? snapshot.whatsNew : []);
+      setLoading(false);
+      return true;
+    } catch {
+      return false;
+    }
+  }, [screenCacheParts]);
+
+  const buildSubjectsFromPackage = useCallback(async ({ pkg, examMap, sid, isPracticePackage }) => {
+    const subjectsNode = pkg?.subjects || {};
+    return Promise.all(
+      Object.keys(subjectsNode).map(async (subjectKey) => {
+        const subject = subjectsNode[subjectKey] || {};
+        const roundsNode = subject.rounds || {};
+
+        const roundsArr = await Promise.all(
+          Object.keys(roundsNode).map(async (rid) => {
+            const r = roundsNode[rid] || {};
+            const examId = r.examId;
+            const examMeta = examMap?.[examId] || {};
+
+            let progressRaw = null;
+            let downloaded = false;
+            if (sid && rid && examId) {
+              if (isPracticePackage) {
+                const [localProgress, localBundleReady] = await Promise.all([
+                  readPracticeExamProgress(sid, examId),
+                  hasPracticeExamBundle(sid, examId),
+                ]);
+                progressRaw = localProgress;
+                downloaded = !!localBundleReady;
+              } else {
+                progressRaw = await getValue([
+                  `Platform1/studentProgress/${sid}/company/${rid}/${examId}`,
+                  `studentProgress/${sid}/company/${rid}/${examId}`,
+                ]);
+              }
+            }
+
+            const hasSubmittedScore =
+              progressRaw?.lastScorePercent != null ||
+              progressRaw?.bestScorePercent != null ||
+              Number(progressRaw?.lastSubmittedAt || 0) > 0;
+            const attemptsUsedRaw = Math.max(
+              Number(progressRaw?.attemptsUsed || 0),
+              Object.keys(progressRaw?.attempts || {}).length
+            );
+
+            return {
+              id: rid,
+              roundId: rid,
+              examId,
+              questionBankId: examMeta.questionBankId || r.questionBankId || "",
+              name: r.name || rid,
+              chapter: r.chapter || "",
+              totalQuestions: Number(examMeta.totalQuestions || 0),
+              timeLimit: Number(examMeta.timeLimit || 0),
+              difficulty: examMeta.difficulty || "medium",
+              maxAttempts: Number(examMeta.maxAttempts || 1),
+              attemptRefillIntervalMs: Number(examMeta.attemptRefillIntervalMs || 0),
+              attemptRefillEnabled: examMeta.attemptRefillEnabled !== false,
+              attemptsUsedRaw,
+              lastAttemptTsRaw: toMsTs(progressRaw?.lastAttemptTimestamp || progressRaw?.lastSubmittedAt || 0),
+              bestScorePercentRaw: hasSubmittedScore
+                ? Number(progressRaw?.bestScorePercent ?? progressRaw?.lastScorePercent ?? 0)
+                : null,
+              status: r.status || "upcoming",
+              startTimestamp: Number(r.startTimestamp || 0),
+              endTimestamp: Number(r.endTimestamp || 0),
+              resultReleaseTimestamp: Number(r.resultReleaseTimestamp || 0),
+              downloaded,
+              practiceOffline: isPracticePackage,
+              roundMeta: {
+                ...(r || {}),
+                id: rid,
+                roundId: rid,
+                examId,
+                questionBankId: examMeta.questionBankId || r.questionBankId || "",
+              },
+              examMeta: {
+                ...(examMeta || {}),
+                id: examId,
+                examId,
+                questionBankId: examMeta.questionBankId || r.questionBankId || "",
+              },
+            };
+          })
+        );
+
+        return {
+          id: subjectKey,
+          keyName: subjectKey,
+          name: subject.name || subjectKey,
+          chapter: subject.chapter || "",
+          rounds: roundsArr,
+        };
+      })
+    );
+  }, []);
+
+  const load = useCallback(async (options = {}) => {
+    const background = Boolean(options?.background);
+    const runId = ++loadRunIdRef.current;
+    const isStale = () => loadRunIdRef.current !== runId;
+
+    if (!background) {
+      setLoading(true);
+    }
+
+    const [cachedPackageDetail, cfg, sessionPairs, livePkg] = await Promise.all([
+      readCompanyExamPackageDetail(packageId),
+      getValue([`Platform1/appConfig/exams`, `appConfig/exams`]),
+      AsyncStorage.multiGet(["studentNodeKey", "studentId", "username", "studentGrade"]),
+      getValue([
+        `Platform1/companyExams/packages/${packageId}`,
+        `companyExams/packages/${packageId}`,
+      ]),
+    ]);
+    if (isStale()) return;
+
+    const session = Object.fromEntries(sessionPairs || []);
+    const resolvedConfig = cfg || cachedPackageDetail?.appExamConfig || null;
+    if (resolvedConfig) {
       setAppExamConfig((prev) => ({
         ...prev,
-        ...cfg,
-        lives: { ...prev.lives, ...(cfg.lives || {}) },
-        attempts: { ...prev.attempts, ...(cfg.attempts || {}) },
+        ...resolvedConfig,
+        lives: { ...prev.lives, ...(resolvedConfig.lives || {}) },
+        attempts: {
+          ...prev.attempts,
+          ...(resolvedConfig.attempts || {}),
+          practiceRefillEnabled: false,
+          defaultRefillIntervalMs: 0,
+        },
       }));
     }
+
+    const sid = session.studentNodeKey || session.studentId || session.username || null;
+    const gradeStored = normalizeGrade(session.studentGrade);
+    const grade = normalizeGrade(incomingGrade) || gradeStored;
+    const pkg = livePkg || cachedPackageDetail?.pkg || null;
+
+    if (!pkg) {
+      if (isStale()) return;
+      setSubjects([]);
+      setPackageType(null);
+      if (!background) setLoading(false);
+      return;
+    }
+    if (isStale()) return;
+
+    setPackageType(pkg.type || null);
+    const isPracticePackage = String(pkg.type || "").toLowerCase() !== "competitive";
+
+    const defaultRefill = normalizeHeartRefillMs(resolvedConfig?.lives?.defaultRefillIntervalMs);
+    const defaultMax = Number(resolvedConfig?.lives?.defaultMaxLives || DEFAULT_GLOBAL_MAX_LIVES);
+
+    let nextGlobalLives = null;
+    let nextGlobalMaxLives = defaultMax;
+    let nextGlobalRefillMs = defaultRefill;
+    let nextGlobalLastConsumedAt = null;
+
+    const [livesSource, liveExamMap] = await Promise.all([
+      sid
+        ? isPracticePackage
+          ? ensurePracticeLives(sid, resolvedConfig?.lives || {})
+          : getValue([`Platform1/studentLives/${sid}`, `studentLives/${sid}`])
+        : Promise.resolve(null),
+      livePkg ? getValue([`Platform1/companyExams/exams`, `companyExams/exams`]) : Promise.resolve(null),
+    ]);
+    if (isStale()) return;
+
+    if (sid) {
+      if (isPracticePackage) {
+        const localLives = livesSource || {};
+        nextGlobalLives = Number(localLives.currentLives || 0);
+        nextGlobalMaxLives = Number(localLives.maxLives || defaultMax);
+        nextGlobalRefillMs = normalizeHeartRefillMs(localLives.refillIntervalMs, defaultRefill);
+        nextGlobalLastConsumedAt = Number(localLives.lastConsumedAt || 0) || null;
+      } else if (livesSource) {
+        const raw = livesSource;
+        const lives = Number(raw?.currentLives ?? raw?.lives ?? null);
+        const max = Number(raw?.maxLives ?? defaultMax);
+        let refillRaw = raw?.refillIntervalMs ?? raw?.refillInterval ?? null;
+        let refillMs = defaultRefill;
+        if (refillRaw != null) {
+          const num = Number(refillRaw);
+          if (Number.isFinite(num)) refillMs = normalizeHeartRefillMs(num > 1000 ? num : num * 1000, defaultRefill);
+        }
+        nextGlobalLives = Number.isFinite(lives) ? lives : null;
+        nextGlobalMaxLives = Number.isFinite(max) ? max : defaultMax;
+        nextGlobalRefillMs = refillMs;
+        nextGlobalLastConsumedAt = toMsTs(raw?.lastConsumedAt ?? raw?.lastConsumed ?? 0) || null;
+      }
+    }
+
+    if (isStale()) return;
+    setGlobalLives(nextGlobalLives);
+    setGlobalMaxLives(nextGlobalMaxLives);
+    setGlobalRefillMs(nextGlobalRefillMs);
+    setGlobalLastConsumedAt(nextGlobalLastConsumedAt);
+
+    if (grade && pkg.grade && normalizeGrade(pkg.grade) && normalizeGrade(pkg.grade) !== String(grade)) {
+      if (isStale()) return;
+      setSubjects([]);
+      if (!background) setLoading(false);
+      return;
+    }
+
+    const examMap = liveExamMap && Object.keys(liveExamMap).length
+      ? liveExamMap
+      : (cachedPackageDetail?.examMap || {});
+
+    if (livePkg) {
+      void writeCompanyExamPackageDetail(packageId, {
+        pkg: livePkg,
+        examMap,
+        appExamConfig: resolvedConfig,
+      });
+    }
+
+    const out = await buildSubjectsFromPackage({
+      pkg,
+      examMap,
+      sid,
+      isPracticePackage,
+    });
+    if (isStale()) return;
+
+    setSubjects(out);
+    const nextWhatsNew = buildWhatsNew(out);
+
+    if (!isStale()) {
+      writeScreenCache("package-subjects", screenCacheParts, {
+        subjects: out,
+        packageType: pkg.type || null,
+        globalLives: nextGlobalLives,
+        globalMaxLives: nextGlobalMaxLives,
+        globalRefillMs: nextGlobalRefillMs,
+        globalLastConsumedAt: nextGlobalLastConsumedAt,
+        appExamConfig: resolvedConfig,
+        whatsNew: nextWhatsNew,
+      }).catch(() => null);
+    }
+
+    if (!background) {
+      if (isStale()) return;
+      setLoading(false);
+    }
+
+    if (!isStale()) {
+      loadNotifications().catch(() => null);
+    }
+  }, [packageId, incomingGrade, buildWhatsNew, buildSubjectsFromPackage, loadNotifications, screenCacheParts]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let task = null;
+
+    (async () => {
+      const hydrated = await hydrateCachedSnapshot();
+      if (cancelled) return;
+
+      task = InteractionManager.runAfterInteractions(() => {
+        load({ background: hydrated }).catch(() => null);
+      });
+    })();
+
+    return () => {
+      cancelled = true;
+      task?.cancel?.();
+    };
+  }, [hydrateCachedSnapshot, load]);
+
+  useFocusEffect(
+    useCallback(() => {
+      const task = InteractionManager.runAfterInteractions(() => {
+        load({ background: true }).catch(() => null);
+      });
+
+      return () => {
+        task?.cancel?.();
+      };
+    }, [load])
+  );
+
+  const toggle = (id) => {
+    LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+    setExpandedId((prev) => (prev === id ? null : id));
+  };
+
+  const syncRoundState = useCallback((examId, patch) => {
+    if (!examId || !patch || typeof patch !== "object") return;
+    setSubjects((prev) =>
+      (prev || []).map((subject) => ({
+        ...subject,
+        rounds: (subject.rounds || []).map((round) =>
+          String(round.examId || "") === String(examId)
+            ? { ...round, ...patch }
+            : round
+        ),
+      }))
+    );
+  }, []);
+
+  const openRound = useCallback((round) => {
+    if (!round?.roundId || !round?.examId) return;
+    const attemptsLeft = Math.max(0, Number(round.maxAttempts || 1) - Math.max(0, Number(round.attemptsUsedRaw || 0)));
+    if (attemptsLeft <= 0) {
+      Alert.alert("Attempts finished", "You already used all attempts for this exam.");
+      return;
+    }
+    warmExamCenterRoute(round);
+    router.push({
+      pathname: "/examCenter",
+      params: {
+        roundId: round.roundId,
+        examId: round.examId,
+        questionBankId: round.questionBankId,
+        mode: "start",
+        returnTo: "packageSubjects",
+        returnPackageId: packageId || "",
+        returnPackageName: packageName || "",
+        returnStudentGrade: incomingGrade || "",
+        ...(isPractice ? { practiceOffline: "1" } : {}),
+      },
+    });
+  }, [router, packageId, packageName, incomingGrade, isPractice, warmExamCenterRoute]);
+
+  const downloadPracticeRound = useCallback(async (subject, round) => {
+    if (!subject?.id || !round?.examId) return;
+
+    const examKey = String(round.examId || "");
+    if (!examKey || round?.downloaded || Number(downloadProgressMap?.[examKey] || 0) > 0) return;
 
     const sid =
       (await AsyncStorage.getItem("studentNodeKey")) ||
@@ -281,131 +822,67 @@ export default function PackageSubjects() {
       (await AsyncStorage.getItem("username")) ||
       null;
 
-    const gradeStored = normalizeGrade(await AsyncStorage.getItem("studentGrade"));
-    const grade = normalizeGrade(incomingGrade) || gradeStored;
-
-    const pkg = await getValue([
-      `Platform1/companyExams/packages/${packageId}`,
-      `companyExams/packages/${packageId}`,
-    ]);
-
-    if (!pkg) {
-      setSubjects([]);
-      setPackageType(null);
-      setLoading(false);
-      return;
-    }
-    setPackageType(pkg.type || null);
-
-    const defaultRefill = Number(cfg?.lives?.defaultRefillIntervalMs || HEART_REFILL_MS);
-    const defaultMax = Number(cfg?.lives?.defaultMaxLives || DEFAULT_GLOBAL_MAX_LIVES);
-
-    if (sid) {
-      const livesNode = await getValue([`Platform1/studentLives/${sid}`, `studentLives/${sid}`]);
-      if (livesNode) {
-        const raw = livesNode;
-        const lives = Number(raw?.currentLives ?? raw?.lives ?? null);
-        const max = Number(raw?.maxLives ?? defaultMax);
-        let refillRaw = raw?.refillIntervalMs ?? raw?.refillInterval ?? null;
-        let refillMs = defaultRefill;
-        if (refillRaw != null) {
-          const num = Number(refillRaw);
-          if (Number.isFinite(num)) refillMs = num > 1000 ? num : num * 1000;
-        }
-        const last = toMsTs(raw?.lastConsumedAt ?? raw?.lastConsumed ?? 0) || null;
-
-        setGlobalLives(Number.isFinite(lives) ? lives : null);
-        setGlobalMaxLives(Number.isFinite(max) ? max : defaultMax);
-        setGlobalRefillMs(refillMs);
-        setGlobalLastConsumedAt(last);
-      } else {
-        setGlobalLives(null);
-        setGlobalMaxLives(defaultMax);
-        setGlobalRefillMs(defaultRefill);
-        setGlobalLastConsumedAt(null);
-      }
-    } else {
-      setGlobalLives(null);
-      setGlobalMaxLives(defaultMax);
-      setGlobalRefillMs(defaultRefill);
-      setGlobalLastConsumedAt(null);
-    }
-
-    if (grade && pkg.grade && normalizeGrade(pkg.grade) && normalizeGrade(pkg.grade) !== String(grade)) {
-      setSubjects([]);
-      setLoading(false);
+    if (!sid) {
+      Alert.alert("Download unavailable", "Student account was not found on this device.");
       return;
     }
 
-    const examMap = (await getValue([`Platform1/companyExams/exams`, `companyExams/exams`])) || {};
-    const subjectsNode = pkg.subjects || {};
-    const out = [];
+    setDownloadProgressMap((prev) => ({ ...prev, [examKey]: 8 }));
 
-    for (const subjectKey of Object.keys(subjectsNode)) {
-      const subject = subjectsNode[subjectKey] || {};
-      const roundsNode = subject.rounds || {};
-      const roundsArr = [];
-
-      for (const rid of Object.keys(roundsNode)) {
-        const r = roundsNode[rid] || {};
-        const examId = r.examId;
-        const examMeta = examMap?.[examId] || {};
-
-        let progressRaw = null;
-        if (sid && rid && examId) {
-          progressRaw = await getValue([
-            `Platform1/studentProgress/${sid}/company/${rid}/${examId}`,
-            `studentProgress/${sid}/company/${rid}/${examId}`,
-          ]);
-        }
-
-        roundsArr.push({
-          id: rid,
-          roundId: rid,
-          examId,
-          questionBankId: examMeta.questionBankId || "",
-          name: r.name || rid,
-          chapter: r.chapter || "",
-          totalQuestions: Number(examMeta.totalQuestions || 0),
-          timeLimit: Number(examMeta.timeLimit || 0),
-          difficulty: examMeta.difficulty || "medium",
-          maxAttempts: Number(examMeta.maxAttempts || 1),
-          attemptRefillIntervalMs: Number(examMeta.attemptRefillIntervalMs || 0),
-          attemptRefillEnabled: examMeta.attemptRefillEnabled !== false,
-          attemptsUsedRaw: Number(progressRaw?.attemptsUsed || 0),
-          lastAttemptTsRaw: toMsTs(progressRaw?.lastAttemptTimestamp || progressRaw?.lastSubmittedAt || 0),
-          status: r.status || "upcoming",
-          startTimestamp: Number(r.startTimestamp || 0),
-          endTimestamp: Number(r.endTimestamp || 0),
-          resultReleaseTimestamp: Number(r.resultReleaseTimestamp || 0),
-        });
-      }
-
-      out.push({
-        id: subjectKey,
-        keyName: subjectKey,
-        name: subject.name || subjectKey,
-        chapter: subject.chapter || "Subject rounds",
-        rounds: roundsArr,
+    try {
+      setDownloadProgressMap((prev) => ({ ...prev, [examKey]: 36 }));
+      await downloadPracticeExamBundle({
+        studentId: sid,
+        packageId,
+        packageName,
+        subjectId: subject.id,
+        subjectName: subject.name,
+        roundMeta: round.roundMeta || round,
+        examMeta: round.examMeta || {
+          id: round.examId,
+          examId: round.examId,
+          questionBankId: round.questionBankId,
+          name: round.name,
+          totalQuestions: round.totalQuestions,
+          timeLimit: round.timeLimit,
+          difficulty: round.difficulty,
+          maxAttempts: round.maxAttempts,
+          attemptRefillIntervalMs: round.attemptRefillIntervalMs,
+          attemptRefillEnabled: round.attemptRefillEnabled,
+        },
+        appExamConfig,
       });
+      syncRoundState(examKey, { downloaded: true });
+      setDownloadProgressMap((prev) => ({ ...prev, [examKey]: 0 }));
+    } catch (error) {
+      console.warn("packageSubjects: downloadPracticeRound failed", error);
+      setDownloadProgressMap((prev) => ({ ...prev, [examKey]: 0 }));
+      Alert.alert("Download failed", error?.message || "Could not download this practice exam.");
+    }
+  }, [appExamConfig, downloadProgressMap, packageId, packageName, syncRoundState]);
+
+  const deletePracticeRound = useCallback(async (round) => {
+    if (!round?.examId) return;
+
+    const sid =
+      (await AsyncStorage.getItem("studentNodeKey")) ||
+      (await AsyncStorage.getItem("studentId")) ||
+      (await AsyncStorage.getItem("username")) ||
+      null;
+
+    if (!sid) {
+      Alert.alert("Delete unavailable", "Student account was not found on this device.");
+      return;
     }
 
-    setSubjects(out);
-    buildWhatsNew(out);
-    await loadNotifications();
-    setLoading(false);
-  }, [packageId, incomingGrade, buildWhatsNew, loadNotifications]);
+    const removed = await deletePracticeExamBundle(sid, round.examId);
+    if (!removed) {
+      Alert.alert("Delete failed", "The offline copy could not be removed right now.");
+      return;
+    }
 
-  useEffect(() => {
-    load();
-  }, [load]);
-
-  const toggle = (id) => {
-    LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
-    setExpandedId((prev) => (prev === id ? null : id));
-  };
-
-  const isPractice = useMemo(() => String(packageType || "").toLowerCase() !== "competitive", [packageType]);
+    syncRoundState(round.examId, { downloaded: false });
+  }, [syncRoundState]);
 
   useEffect(() => {
     if (showHeartInfoModal) {
@@ -434,19 +911,33 @@ export default function PackageSubjects() {
 
       setNextHeartInMs(state.nextInMs);
 
-      const sid =
-        (await AsyncStorage.getItem("studentNodeKey")) ||
-        (await AsyncStorage.getItem("studentId")) ||
-        (await AsyncStorage.getItem("username")) ||
-        null;
+      if (state.recovered > 0 && !syncing) {
+        const sid =
+          (await AsyncStorage.getItem("studentNodeKey")) ||
+          (await AsyncStorage.getItem("studentId")) ||
+          (await AsyncStorage.getItem("username")) ||
+          null;
 
-      if (state.recovered > 0 && sid && !syncing) {
+        if (!sid) return;
+
         syncing = true;
         try {
-          await safeUpdate({
-            [`Platform1/studentLives/${sid}/currentLives`]: state.currentLives,
-            [`Platform1/studentLives/${sid}/lastConsumedAt`]: state.lastConsumedAt,
-          });
+          if (isPractice) {
+            await writePracticeLives(sid, {
+              currentLives: state.currentLives,
+              maxLives: globalMaxLives,
+              refillIntervalMs: globalRefillMs,
+              lastConsumedAt: state.lastConsumedAt,
+            }, {
+              defaultMaxLives: globalMaxLives,
+              defaultRefillIntervalMs: globalRefillMs,
+            });
+          } else {
+            await safeUpdate({
+              [`Platform1/studentLives/${sid}/currentLives`]: state.currentLives,
+              [`Platform1/studentLives/${sid}/lastConsumedAt`]: state.lastConsumedAt,
+            });
+          }
           setGlobalLives(state.currentLives);
           setGlobalLastConsumedAt(state.lastConsumedAt);
         } catch (e) {
@@ -458,38 +949,15 @@ export default function PackageSubjects() {
     }
 
     tickHeart();
-    timer = setInterval(tickHeart, 1000);
+    timer = setInterval(tickHeart, PACKAGE_HEART_TICK_MS);
     return () => clearInterval(timer);
-  }, [globalLives, globalMaxLives, globalLastConsumedAt, globalRefillMs]);
+  }, [globalLives, globalMaxLives, globalLastConsumedAt, globalRefillMs, isPractice]);
 
-  const deriveAttemptState = useCallback((round, now) => {
+  const deriveAttemptState = useCallback((round) => {
     const maxAttempts = Number(round.maxAttempts || 1);
     const usedRaw = Number(round.attemptsUsedRaw || 0);
-    const lastTs = Number(round.lastAttemptTsRaw || 0);
-
-    if (String(packageType || "").toLowerCase() === "competitive") {
-      return { usedEffective: usedRaw, left: Math.max(0, maxAttempts - usedRaw), nextInMs: 0, refill: false };
-    }
-
-    const enabled = appExamConfig.attempts.practiceRefillEnabled && round.attemptRefillEnabled !== false;
-    const refillMs = Number(round.attemptRefillIntervalMs || appExamConfig.attempts.defaultRefillIntervalMs || 0);
-
-    if (!enabled || !refillMs || !lastTs) {
-      return { usedEffective: usedRaw, left: Math.max(0, maxAttempts - usedRaw), nextInMs: 0, refill: false };
-    }
-
-    const recoveredRaw = Math.floor(Math.max(0, now - lastTs) / refillMs);
-    const maxCarry = Number(appExamConfig.attempts.maxCarryRefills ?? 999);
-    const recovered = Math.min(Math.max(0, recoveredRaw), Math.max(0, maxCarry));
-
-    const usedEffective = Math.max(0, usedRaw - recovered);
-    const left = Math.max(0, maxAttempts - usedEffective);
-
-    const anchor = lastTs + recovered * refillMs;
-    const nextInMs = left >= maxAttempts ? 0 : Math.max(0, refillMs - ((now - anchor) % refillMs));
-
-    return { usedEffective, left, nextInMs, refill: true, recovered, anchor };
-  }, [packageType, appExamConfig]);
+    return { usedEffective: usedRaw, left: Math.max(0, maxAttempts - usedRaw), nextInMs: 0, refill: false };
+  }, []);
 
   const applyAttemptRefillIfNeeded = useCallback(async (sid, round) => {
     if (!sid || !round?.examId || !round?.roundId) return;
@@ -501,11 +969,16 @@ export default function PackageSubjects() {
     const usedNew = Math.max(0, Math.min(maxAttempts, st.usedEffective));
     const anchorTs = Number(st.anchor || Date.now());
 
-    await safeUpdate({
-      [`Platform1/studentProgress/${sid}/company/${round.roundId}/${round.examId}/attemptsUsed`]: usedNew,
-      [`Platform1/studentProgress/${sid}/company/${round.roundId}/${round.examId}/lastAttemptTimestamp`]: anchorTs,
-    }).catch(() => {});
-  }, [deriveAttemptState]);
+    await updatePracticeExamProgress(sid, round.examId, (current) => ({
+      ...current,
+      attemptsUsed: usedNew,
+      lastAttemptTimestamp: anchorTs,
+    })).catch(() => {});
+    syncRoundState(round.examId, {
+      attemptsUsedRaw: usedNew,
+      lastAttemptTsRaw: anchorTs,
+    });
+  }, [deriveAttemptState, syncRoundState]);
 
   useEffect(() => {
     let timer;
@@ -526,7 +999,7 @@ export default function PackageSubjects() {
       }
 
       await tick();
-      timer = setInterval(tick, 5000);
+      timer = setInterval(tick, PACKAGE_ATTEMPT_SYNC_MS);
     })();
 
     return () => clearInterval(timer);
@@ -536,26 +1009,54 @@ export default function PackageSubjects() {
     ? notifications
     : notifications.filter((n) => Number(n.createdAt || 0) > lastSeenNotificationsAt);
 
+  const totalRounds = useMemo(
+    () => (subjects || []).reduce((sum, s) => sum + ((s.rounds || []).length || 0), 0),
+    [subjects]
+  );
+  const heartCountdownLabel = globalLives != null && Number(globalLives || 0) < Number(globalMaxLives || 0) && Number(nextHeartInMs || 0) > 0
+    ? formatMsToMMSS(nextHeartInMs)
+    : null;
+
   if (loading) {
     return (
-      <SafeAreaView style={[styles.screen, styles.center, { paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight || 0) : 0 }]}>
-        <ActivityIndicator color={PRIMARY} />
-      </SafeAreaView>
+      <PageLoadingSkeleton
+        variant="package"
+        style={[styles.screen, { paddingTop: insets.top }]}
+      />
     );
   }
 
   return (
-    <SafeAreaView style={[styles.screen, { paddingTop: Platform.OS === "android" ? (StatusBar.currentHeight || 0) : 0 }]}>
-      <View style={styles.header}>
-        <TouchableOpacity onPress={() => router.back()} style={styles.backBtn}>
+    <SafeAreaView style={styles.screen}>
+      <View style={[styles.header, { paddingTop: insets.top + 8 }]}>
+        <TouchableOpacity
+          onPress={() => router.replace({ pathname: "/dashboard/exam", params: { activeFilter: "gojo" } })}
+          style={styles.backBtn}
+        >
           <Ionicons name="chevron-back" size={22} color={TEXT} />
         </TouchableOpacity>
-        <View style={{ flex: 1 }}>
-          <Text style={styles.title}>{packageName}</Text>
-          <Text style={styles.subtitle}>Choose a subject and start a round</Text>
+        <View style={styles.headerTitleWrap}>
+          <Text numberOfLines={1} ellipsizeMode="tail" style={styles.title}>{isPractice ? "Practice Exam" : "Competitive Exam"}</Text>
+          <Text numberOfLines={1} style={styles.subtitle}>{isPractice ? "Download a round once" : "Choose a subject and start a round"}</Text>
         </View>
 
-        <TouchableOpacity onPress={() => setShowNotifModal(true)} style={{ marginRight: 10 }}>
+        <TouchableOpacity onPress={() => setShowHeartInfoModal(true)} style={styles.headerLivesButton}>
+          <View style={styles.headerLivesRow}>
+            {heartCountdownLabel ? (
+              <Text style={styles.headerLivesTimer}>{heartCountdownLabel}</Text>
+            ) : null}
+            <Ionicons
+              name={globalLives != null && globalLives > 0 ? "heart" : "heart-outline"}
+              size={20}
+              color={globalLives != null && globalLives > 0 ? HEART_COLOR : MUTED}
+            />
+            <Text style={styles.headerLivesCount}>
+              {globalLives != null ? `${globalLives}` : "—"}
+            </Text>
+          </View>
+        </TouchableOpacity>
+
+        <TouchableOpacity onPress={() => setShowNotifModal(true)}>
           <View>
             <Ionicons name="notifications-outline" size={22} color={TEXT} />
             {unreadCount > 0 ? (
@@ -565,24 +1066,11 @@ export default function PackageSubjects() {
             ) : null}
           </View>
         </TouchableOpacity>
-
-        <TouchableOpacity onPress={() => setShowHeartInfoModal(true)} style={{ alignItems: "flex-end", minWidth: 72 }}>
-          <View style={{ flexDirection: "row", alignItems: "center" }}>
-            <Ionicons
-              name={globalLives != null && globalLives > 0 ? "heart" : "heart-outline"}
-              size={20}
-              color={globalLives != null && globalLives > 0 ? HEART_COLOR : MUTED}
-            />
-            <Text style={{ marginLeft: 6, color: PRIMARY, fontWeight: "900" }}>
-              {globalLives != null ? `${globalLives}` : "—"}
-            </Text>
-          </View>
-        </TouchableOpacity>
       </View>
 
       {whatsNew.length > 0 ? (
         <View style={{ paddingHorizontal: 16, paddingBottom: 8 }}>
-          <Text style={{ fontWeight: "900", color: TEXT, marginBottom: 8 }}>What’s New</Text>
+          <Text style={styles.whatsNewTitle}>What’s New</Text>
           <FlatList
             horizontal
             data={whatsNew}
@@ -607,76 +1095,171 @@ export default function PackageSubjects() {
         </View>
       ) : null}
 
+      <View style={styles.heroWrap}>
+        <View style={styles.heroGlowA} />
+        <View style={styles.heroGlowB} />
+        <View style={styles.heroHeadlineRow}>
+          <Text numberOfLines={1} style={styles.heroTitleInline}>{packageName}</Text>
+        </View>
+        <Text style={styles.heroSubtitle}>Master subjects and clear each round.</Text>
+
+        <View style={styles.heroStatsRow}>
+          <View style={styles.heroStatCard}>
+            <Text style={styles.heroStatValue}>{subjects.length}</Text>
+            <Text style={styles.heroStatLabel}>Subjects</Text>
+          </View>
+          <View style={styles.heroStatCard}>
+            <Text style={styles.heroStatValue}>{totalRounds}</Text>
+            <Text style={styles.heroStatLabel}>Rounds</Text>
+          </View>
+          <View style={styles.heroStatCard}>
+            <Text style={styles.heroStatValue}>{globalLives != null ? globalLives : "-"}</Text>
+            <Text style={styles.heroStatLabel}>Lives</Text>
+          </View>
+        </View>
+      </View>
+
       <FlatList
         data={subjects}
         keyExtractor={(s) => s.id}
-        contentContainerStyle={{ padding: 16, paddingBottom: 24 }}
-        ItemSeparatorComponent={() => <View style={{ height: 12 }} />}
+        initialNumToRender={6}
+        maxToRenderPerBatch={6}
+        windowSize={7}
+        removeClippedSubviews={Platform.OS === "android"}
+        contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 24, paddingTop: 8 }}
+        ItemSeparatorComponent={() => <View style={{ height: 14 }} />}
         renderItem={({ item }) => {
           const expanded = expandedId === item.id;
-          const v = getSubjectVisual(item.keyName, item.name);
+          const v = getSubjectVisual(item.keyName, item.name, colors);
+          const liveRoundsCount = !isPractice
+            ? (item.rounds || []).filter((round) => isCompetitiveRoundLive(round, nowTs)).length
+            : 0;
 
           return (
-            <View style={styles.subjectCard}>
-              <TouchableOpacity style={styles.subjectTop} activeOpacity={0.9} onPress={() => toggle(item.id)}>
+            <View style={[styles.subjectCard, expanded && styles.subjectCardExpanded]}>
+              <TouchableOpacity
+                style={[styles.subjectTop, expanded && styles.subjectTopExpanded]}
+                activeOpacity={0.92}
+                onPress={() => toggle(item.id)}
+              >
+                <View style={styles.subjectTopLeft}>
                 <View style={[styles.subjectIconWrap, { backgroundColor: v.bg }]}>
                   <MaterialCommunityIcons name={v.icon} size={24} color={v.color} />
                 </View>
 
-                <View style={{ flex: 1, marginLeft: 12 }}>
+                  <View style={styles.subjectTextWrap}>
                   <Text style={styles.subjectName}>{titleize(item.name)}</Text>
-                  <Text style={styles.subjectChapter}>{item.chapter}</Text>
-                  <Text style={styles.roundCount}>{(item.rounds || []).length} rounds</Text>
+                  {item.chapter ? <Text style={styles.subjectChapter}>{item.chapter}</Text> : null}
+                    <View style={styles.subjectMetaRow}>
+                      <Text style={styles.subjectMetaChip}>{(item.rounds || []).length} rounds</Text>
+                      {liveRoundsCount > 0 ? <Text style={[styles.subjectMetaChip, styles.subjectMetaChipLive]}>LIVE</Text> : null}
+                    </View>
+                  </View>
                 </View>
-
-                <Ionicons name={expanded ? "chevron-up" : "chevron-down"} size={20} color={MUTED} />
               </TouchableOpacity>
 
               {expanded && (
                 <View style={styles.expandArea}>
-                  {(item.rounds || []).map((r) => {
+                  {(item.rounds || []).map((r, idx) => {
                     const attemptState = deriveAttemptState(r, nowTs);
                     const disabledByAttempts = attemptState.left <= 0;
                     const disabledByLives = isPractice && globalLives === 0;
-                    const disabled = disabledByAttempts || disabledByLives;
+                    const downloadPct = Number(downloadProgressMap[String(r.examId || "")] || 0);
+                    const isDownloading = downloadPct > 0;
+                    const needsDownload = isPractice && !r.downloaded;
+                    const disabled = disabledByAttempts || disabledByLives || needsDownload || isDownloading;
+                    const lastScoreText = formatPercentCompact(r.bestScorePercentRaw);
 
                     return (
                       <View key={`${r.roundId}_${r.examId}`} style={{ marginBottom: 10 }}>
-                        <View style={styles.roundRow}>
-                          <View style={{ flex: 1 }}>
-                            <Text style={styles.roundName}>{r.name}</Text>
-                            <Text style={styles.roundMeta}>
-                              {(r.totalQuestions || 0)} Qs • {Math.round((r.timeLimit || 0) / 60)} min • {r.difficulty}
-                            </Text>
-                          </View>
-
-                          <TouchableOpacity
-                            disabled={disabled}
-                            style={[styles.startBtn, disabled ? styles.startBtnDisabled : null]}
-                            onPress={() =>
-                              router.push({
-                                pathname: "/examCenter",
-                                params: {
-                                  roundId: r.roundId,
-                                  examId: r.examId,
-                                  questionBankId: r.questionBankId,
-                                  mode: "start",
-                                },
-                              })
-                            }
+                        <View style={[styles.roundRow, isCompactRoundLayout ? styles.roundRowCompact : null]}>
+                          <View
+                            style={[
+                              styles.roundMain,
+                              isCompactRoundLayout ? styles.roundMainCompact : null,
+                              disabled ? styles.roundMainDisabled : null,
+                            ]}
                           >
-                            <Text style={styles.startBtnText}>{disabled ? "Locked" : "Start"}</Text>
-                          </TouchableOpacity>
+                            <TouchableOpacity activeOpacity={0.82} disabled={disabled} onPress={() => openRound(r)}>
+                              <View style={styles.roundOrderBadge}>
+                                <Text style={styles.roundOrderText}>{idx + 1}</Text>
+                              </View>
+                            </TouchableOpacity>
+                            <View style={[styles.roundTextWrap, isCompactRoundLayout ? styles.roundTextWrapCompact : null]}>
+                              <TouchableOpacity
+                                activeOpacity={0.82}
+                                disabled={disabled}
+                                onPress={() => openRound(r)}
+                                style={styles.roundTitleRow}
+                              >
+                                <Text style={styles.roundName} numberOfLines={1}>{r.name}</Text>
+                                {lastScoreText ? <Text style={styles.roundLastScoreText}>{lastScoreText}</Text> : null}
+                              </TouchableOpacity>
+
+                              <View style={styles.roundMetaRow}>
+                                <TouchableOpacity
+                                  activeOpacity={0.82}
+                                  disabled={disabled}
+                                  style={styles.roundMetaPressable}
+                                  onPress={() => openRound(r)}
+                                >
+                                  <Text style={styles.roundMeta} numberOfLines={1}>
+                                    {(r.totalQuestions || 0)} Qs • {Math.round((r.timeLimit || 0) / 60)} min • {r.difficulty}
+                                  </Text>
+                                </TouchableOpacity>
+
+                                {isPractice ? (
+                                  <TouchableOpacity
+                                    disabled={isDownloading}
+                                    style={[
+                                      styles.downloadBtn,
+                                      styles.downloadBtnInline,
+                                      r.downloaded && styles.downloadBtnDelete,
+                                      isDownloading && styles.downloadBtnBusy,
+                                    ]}
+                                    onPress={() => {
+                                      if (r.downloaded) {
+                                        Alert.alert(
+                                          "Remove download?",
+                                          "This removes the offline copy from this device. Download it again to use this exam offline.",
+                                          [
+                                            { text: "Cancel", style: "cancel" },
+                                            {
+                                              text: "Delete",
+                                              style: "destructive",
+                                              onPress: () => {
+                                                void deletePracticeRound(r);
+                                              },
+                                            },
+                                          ]
+                                        );
+                                        return;
+                                      }
+
+                                      void downloadPracticeRound(item, r);
+                                    }}
+                                  >
+                                    {isDownloading ? (
+                                      <Text style={styles.downloadBtnText}>{Math.round(downloadPct)}%</Text>
+                                    ) : (
+                                      <Ionicons
+                                        name={r.downloaded ? "trash-outline" : "cloud-download-outline"}
+                                        size={16}
+                                        color={r.downloaded ? colors.danger : PRIMARY}
+                                      />
+                                    )}
+                                  </TouchableOpacity>
+                                ) : null}
+                              </View>
+                            </View>
+                          </View>
                         </View>
 
-                        {disabled ? (
+                        {disabledByAttempts || disabledByLives ? (
                           <View style={styles.lockInfo}>
                             {disabledByAttempts ? (
                               <>
                                 <Text style={styles.noHeartText}>No attempts left for this exam.</Text>
-                                {attemptState.refill && attemptState.nextInMs > 0 ? (
-                                  <Text style={styles.refillText}>Next attempt in {formatMsToMMSS(attemptState.nextInMs)}</Text>
-                                ) : null}
                               </>
                             ) : null}
 
@@ -749,10 +1332,10 @@ export default function PackageSubjects() {
         <View style={modalStyles.overlay}>
           <Animated.View style={[modalStyles.card, { transform: [{ scale: heartModalAnim.interpolate({ inputRange: [0, 1], outputRange: [0.9, 1] }) }], opacity: heartModalAnim }]}>
             <Text style={modalStyles.title}>Lives & refill</Text>
-            <Text style={modalStyles.text}>Lives are global and configured by backend appConfig / studentLives.</Text>
+            <Text style={modalStyles.text}>Lives are shared across all practice exams and refill automatically over time.</Text>
             <View style={{ marginTop: 12, alignItems: "center" }}>
               <Ionicons name={globalLives != null && globalLives > 0 ? "heart" : "heart-outline"} size={32} color={globalLives != null && globalLives > 0 ? HEART_COLOR : MUTED} />
-              <Text style={{ fontWeight: "900", marginTop: 8, fontSize: 18 }}>{globalLives != null ? `${globalLives} / ${globalMaxLives}` : `— / ${globalMaxLives}`}</Text>
+              <Text style={styles.heartCountText}>{globalLives != null ? `${globalLives} / ${globalMaxLives}` : `— / ${globalMaxLives}`}</Text>
               <Text style={{ marginTop: 8, color: MUTED }}>
                 {globalLives != null && globalLives >= globalMaxLives ? "Lives full" : `Next life in: ${formatMsToMMSS(nextHeartInMs)}`}
               </Text>
@@ -770,13 +1353,16 @@ export default function PackageSubjects() {
   );
 }
 
-const styles = StyleSheet.create({
-  screen: { flex: 1, backgroundColor: BG },
+function createStyles(colors) {
+  const TEXT = colors.text;
+  const MUTED = colors.muted;
+
+  return StyleSheet.create({
+  screen: { flex: 1, backgroundColor: colors.background },
   center: { alignItems: "center", justifyContent: "center" },
 
   header: {
     paddingHorizontal: 16,
-    paddingTop: 8,
     paddingBottom: 8,
     flexDirection: "row",
     alignItems: "center",
@@ -788,10 +1374,15 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
     marginRight: 10,
-    backgroundColor: "#F7F9FF",
+    backgroundColor: colors.inputBackground,
   },
-  title: { fontSize: 21, fontWeight: "900", color: TEXT },
+  headerTitleWrap: { flex: 1, minWidth: 0, marginRight: 8 },
+  title: { fontSize: 21, fontWeight: "900", color: TEXT, flexShrink: 1 },
   subtitle: { marginTop: 2, color: MUTED, fontSize: 12 },
+  headerLivesButton: { alignItems: "flex-end", minWidth: 72, marginRight: 10 },
+  headerLivesRow: { flexDirection: "row", alignItems: "center" },
+  headerLivesTimer: { marginRight: 8, color: colors.primary, fontWeight: "800", fontSize: 12 },
+  headerLivesCount: { marginLeft: 6, color: colors.primary, fontWeight: "900" },
 
   badge: {
     position: "absolute",
@@ -806,12 +1397,14 @@ const styles = StyleSheet.create({
     paddingHorizontal: 4,
   },
   badgeTxt: { color: "#fff", fontSize: 10, fontWeight: "900" },
+  whatsNewTitle: { fontWeight: "900", color: TEXT, marginBottom: 8 },
+  heartCountText: { fontWeight: "900", marginTop: 8, fontSize: 18, color: TEXT },
 
   newCard: {
     width: 230,
-    backgroundColor: "#F8FAFF",
+    backgroundColor: colors.card,
     borderWidth: 1,
-    borderColor: "#EAF0FF",
+    borderColor: colors.border,
     borderRadius: 12,
     padding: 10,
   },
@@ -826,68 +1419,316 @@ const styles = StyleSheet.create({
   newTitle: { color: TEXT, fontWeight: "800", fontSize: 12, flex: 1 },
   newSub: { color: MUTED, marginTop: 6, fontSize: 11 },
 
-  subjectCard: {
-    backgroundColor: "#fff",
-    borderRadius: 16,
+  heroWrap: {
+    marginHorizontal: 16,
+    marginTop: 6,
+    marginBottom: 10,
+    borderRadius: 22,
     borderWidth: 1,
-    borderColor: "#EAF0FF",
-    padding: 12,
-    shadowColor: "#000",
-    shadowOpacity: 0.04,
-    shadowRadius: 8,
+    borderColor: colors.border,
+    backgroundColor: colors.panel,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    overflow: "hidden",
+  },
+  heroGlowA: {
+    position: "absolute",
+    width: 150,
+    height: 150,
+    borderRadius: 75,
+    backgroundColor: "rgba(11,114,255,0.12)",
+    top: -70,
+    right: -32,
+  },
+  heroGlowB: {
+    position: "absolute",
+    width: 120,
+    height: 120,
+    borderRadius: 60,
+    backgroundColor: "rgba(59,130,246,0.09)",
+    bottom: -55,
+    left: -22,
+  },
+  heroHeadlineRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    minWidth: 0,
+  },
+  heroTitleInline: {
+    flex: 1,
+    minWidth: 0,
+    color: TEXT,
+    fontSize: 18,
+    fontWeight: "900",
+  },
+  heroSubtitle: {
+    marginTop: 6,
+    color: MUTED,
+    fontSize: 12,
+    lineHeight: 16,
+  },
+  heroStatsRow: {
+    marginTop: 8,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+  },
+  heroStatCard: {
+    flex: 1,
+    backgroundColor: colors.card,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 14,
+    paddingVertical: 7,
+    alignItems: "center",
+  },
+  heroStatValue: {
+    color: PRIMARY,
+    fontSize: 16,
+    fontWeight: "900",
+  },
+  heroStatLabel: {
+    marginTop: 2,
+    color: MUTED,
+    fontSize: 11,
+    fontWeight: "700",
+  },
+
+  subjectCard: {
+    backgroundColor: colors.card,
+    borderRadius: 22,
+    borderWidth: 1,
+    borderColor: colors.border,
+    overflow: "hidden",
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.025,
+    shadowRadius: 10,
+    elevation: 1,
+  },
+  subjectCardExpanded: {
+    borderColor: colors.primary,
+    shadowColor: PRIMARY,
+    shadowOpacity: 0.05,
     elevation: 2,
   },
-  subjectTop: { flexDirection: "row", alignItems: "center" },
+  subjectTop: {
+    paddingHorizontal: 16,
+    paddingVertical: 15,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  subjectTopExpanded: {
+    backgroundColor: colors.inputBackground,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.border,
+  },
+  subjectTopLeft: {
+    flexDirection: "row",
+    alignItems: "center",
+    flex: 1,
+  },
   subjectIconWrap: {
-    width: 48,
-    height: 48,
+    width: 56,
+    height: 74,
     borderRadius: 14,
+    justifyContent: "center",
+    alignItems: "center",
+    backgroundColor: colors.surfaceMuted,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  subjectTextWrap: {
+    marginLeft: 12,
+    flex: 1,
+  },
+  subjectName: {
+    fontWeight: "900",
+    fontSize: 17,
+    color: TEXT,
+  },
+  subjectChapter: {
+    color: MUTED,
+    marginTop: 4,
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  subjectMetaRow: {
+    flexDirection: "row",
+    marginTop: 6,
+    flexWrap: "wrap",
+  },
+  subjectMetaChip: {
+    marginRight: 6,
+    marginBottom: 6,
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+    borderRadius: 999,
+    backgroundColor: colors.inputBackground,
+    borderWidth: 1,
+    borderColor: colors.border,
+    color: PRIMARY,
+    fontSize: 11,
+    fontWeight: "700",
+    overflow: "hidden",
+  },
+  subjectMetaChipLive: {
+    borderColor: colors.warningBorder,
+    backgroundColor: colors.warningSurface,
+    color: colors.warningText,
+  },
+
+  expandArea: {
+    paddingHorizontal: 14,
+    paddingTop: 12,
+    paddingBottom: 14,
+    backgroundColor: colors.inputBackground,
+  },
+  roundRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingVertical: 12,
+    paddingHorizontal: 10,
+    marginTop: 8,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 16,
+    backgroundColor: colors.card,
+    shadowColor: "#0F172A",
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.018,
+    shadowRadius: 6,
+    elevation: 0,
+  },
+  roundRowCompact: {
+    flexDirection: "column",
+    alignItems: "stretch",
+  },
+  roundMain: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    marginRight: 10,
+    minWidth: 0,
+  },
+  roundMainCompact: {
+    width: "100%",
+    marginRight: 0,
+  },
+  roundMainDisabled: {
+    opacity: 0.68,
+  },
+  roundOrderBadge: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    backgroundColor: colors.soft,
     alignItems: "center",
     justifyContent: "center",
   },
-  subjectName: { color: TEXT, fontWeight: "900", fontSize: 16 },
-  subjectChapter: { marginTop: 2, color: MUTED, fontSize: 12 },
-  roundCount: { marginTop: 5, color: PRIMARY, fontWeight: "700", fontSize: 12 },
-
-  expandArea: {
-    marginTop: 10,
-    borderTopWidth: 1,
-    borderTopColor: "#EEF4FF",
-    paddingTop: 10,
+  roundOrderText: {
+    color: PRIMARY,
+    fontSize: 12,
+    fontWeight: "800",
   },
-
-  roundRow: {
-    backgroundColor: "#FBFCFF",
-    borderWidth: 1,
-    borderColor: "#EEF4FF",
-    borderRadius: 12,
-    paddingHorizontal: 10,
-    paddingVertical: 10,
+  roundTextWrap: {
+    flex: 1,
+    marginLeft: 10,
+    paddingRight: 10,
+    minWidth: 0,
+    flexShrink: 1,
+  },
+  roundTextWrapCompact: {
+    paddingRight: 0,
+  },
+  roundTitleRow: {
     flexDirection: "row",
     alignItems: "center",
+    minWidth: 0,
   },
-  roundName: { color: TEXT, fontWeight: "800", fontSize: 14 },
-  roundMeta: { marginTop: 3, color: MUTED, fontSize: 12 },
+  roundName: {
+    flex: 1,
+    minWidth: 0,
+    fontSize: 14,
+    fontWeight: "800",
+    color: colors.text,
+    marginRight: 6,
+  },
+  roundMetaRow: {
+    marginTop: 3,
+    flexDirection: "row",
+    alignItems: "center",
+    minWidth: 0,
+  },
+  roundMetaPressable: {
+    flex: 1,
+    minWidth: 0,
+    paddingRight: 8,
+  },
+  roundMeta: { color: MUTED, fontSize: 12 },
+  roundLastScoreText: {
+    color: PRIMARY,
+    fontSize: 11,
+    fontWeight: "800",
+    flexShrink: 0,
+  },
 
-  startBtn: {
-    backgroundColor: PRIMARY,
-    paddingHorizontal: 14,
-    paddingVertical: 8,
+  roundActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    flexShrink: 0,
+  },
+  roundActionsCompact: {
+    width: "100%",
+    justifyContent: "flex-end",
+    marginTop: 10,
+    paddingLeft: 40,
+  },
+
+  downloadBtn: {
+    width: 40,
+    height: 40,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: colors.primary,
+    backgroundColor: colors.infoSurface,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  downloadBtnInline: {
+    width: 34,
+    height: 30,
     borderRadius: 10,
   },
-  startBtnDisabled: { backgroundColor: "#DDE8FF" },
-  startBtnText: { color: "#fff", fontWeight: "800", fontSize: 12 },
+  downloadBtnDelete: {
+    borderWidth: 0,
+    borderColor: "transparent",
+    backgroundColor: colors.dangerSurface,
+  },
+  downloadBtnBusy: {
+    borderColor: colors.primary,
+    backgroundColor: colors.soft,
+  },
+  downloadBtnText: {
+    color: PRIMARY,
+    fontWeight: "900",
+    fontSize: 11,
+  },
 
   lockInfo: {
     marginTop: 6,
     marginLeft: 2,
     borderWidth: 1,
-    borderColor: "#FED7AA",
-    backgroundColor: "#FFF7ED",
+    borderColor: colors.border,
+    backgroundColor: colors.inputBackground,
     borderRadius: 10,
     padding: 8,
   },
-  noHeartText: { color: "#B54708", fontWeight: "800", fontSize: 12 },
+  noHeartText: { color: colors.danger, fontWeight: "800", fontSize: 12 },
   refillText: { marginTop: 2, color: MUTED, fontSize: 12, fontWeight: "700" },
 
   notifHeaderRow: {
@@ -897,11 +1738,11 @@ const styles = StyleSheet.create({
   },
   filterBtn: {
     borderWidth: 1,
-    borderColor: "#EAF0FF",
+    borderColor: colors.border,
     borderRadius: 999,
     paddingHorizontal: 10,
     paddingVertical: 5,
-    backgroundColor: "#F8FAFF",
+    backgroundColor: colors.inputBackground,
   },
   filterBtnTxt: { color: TEXT, fontWeight: "800", fontSize: 12 },
 
@@ -914,12 +1755,12 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   notifUnread: {
-    borderColor: "#BFDBFE",
-    backgroundColor: "#F8FBFF",
+    borderColor: colors.primary,
+    backgroundColor: colors.inputBackground,
   },
   notifRead: {
-    borderColor: "#E5E7EB",
-    backgroundColor: "#FAFAFA",
+    borderColor: colors.border,
+    backgroundColor: colors.card,
   },
   notifIconWrap: {
     width: 34,
@@ -933,17 +1774,22 @@ const styles = StyleSheet.create({
     width: 8,
     height: 8,
     borderRadius: 4,
-    backgroundColor: "#2563EB",
+    backgroundColor: colors.primary,
     marginLeft: 8,
   },
   notifTitle: { color: TEXT, fontWeight: "800", fontSize: 13 },
   notifBody: { color: MUTED, marginTop: 4, fontSize: 12 },
 });
+}
 
-const modalStyles = StyleSheet.create({
+function createModalStyles(colors) {
+  const TEXT = colors.text;
+  const MUTED = colors.muted;
+
+  return StyleSheet.create({
   overlay: {
     flex: 1,
-    backgroundColor: "rgba(0,0,0,0.45)",
+    backgroundColor: colors.overlay,
     justifyContent: "center",
     alignItems: "center",
     padding: 20,
@@ -951,7 +1797,9 @@ const modalStyles = StyleSheet.create({
   card: {
     width: "100%",
     maxWidth: 420,
-    backgroundColor: "#fff",
+    backgroundColor: colors.card,
+    borderWidth: 1,
+    borderColor: colors.border,
     borderRadius: 14,
     padding: 18,
     alignItems: "center",
@@ -961,3 +1809,4 @@ const modalStyles = StyleSheet.create({
   closeBtnPrimary: { marginTop: 18, backgroundColor: PRIMARY, paddingVertical: 10, borderRadius: 10, alignItems: "center", width: "100%" },
   closeBtnTextPrimary: { color: "#fff", fontWeight: "900" },
 });
+}

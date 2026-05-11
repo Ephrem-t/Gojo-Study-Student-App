@@ -3,8 +3,8 @@
     "name": "gojo-student-app",
     "slug": "gojo-student-app",
     "version": "1.0.0",
-    "orientation": "portrait",
-    "icon": "./assets/images/icon.png",
+    "orientation": "default",
+    "icon": "./assets/images/app-icon.png",
     "scheme": "gojostudentapp",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
@@ -13,14 +13,24 @@
     },
     "android": {
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
-        "foregroundImage": "./assets/images/android-icon-foreground.png",
+        "backgroundColor": "#EAF4FF",
         "backgroundImage": "./assets/images/android-icon-background.png",
+        "foregroundImage": "./assets/images/app-icon-foreground.png",
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
-      "package": "com.bemni_12.gojostudentapp"
+      "package": "com.bemni_12.gojostudentapp",
+      "permissions": [
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.DOWNLOAD_WITHOUT_NOTIFICATION",
+        "android.permission.ACCESS_NETWORK_STATE",
+        "android.permission.READ_MEDIA_VISUAL_USER_SELECTED",
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.READ_MEDIA_VIDEO",
+        "android.permission.READ_MEDIA_AUDIO"
+      ]
     },
     "web": {
       "output": "static",
@@ -28,15 +38,24 @@
     },
     "plugins": [
       "expo-router",
+      "@config-plugins/react-native-blob-util",
+      "@config-plugins/react-native-pdf",
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Allow Gojo Student App to access your photos.",
+          "savePhotosPermission": "Allow Gojo Student App to save images to your gallery."
+        }
+      ]
+    ,
       [
         "expo-splash-screen",
         {
-          "image": "./assets/images/splash-icon.png",
-          "imageWidth": 200,
-          "resizeMode": "contain",
-          "backgroundColor": "#ffffff",
+          "image": "./assets/images/splash-students.png",
+          "imageWidth": 1,
+          "backgroundColor": "#F2F8FF",
           "dark": {
-            "backgroundColor": "#000000"
+            "backgroundColor": "#07111B"
           }
         }
       ]
@@ -48,8 +67,9 @@
     "extra": {
       "router": {},
       "eas": {
-        "projectId": "574773e5-40a7-4aaa-8b8d-113c0cba5bec"
+        "projectId": "4981456b-2748-48c1-a3f9-83e382fa9168"
       }
-    }
+    },
+    "owner": "eramota3"
   }
 }
